@@ -201,7 +201,7 @@ function calculatePrice(input) {
   // Áp dụng cho mọi loại giá (Giờ, Ngày, Đêm...)
   if (diffMin <= tolerance) {
     breakdown.push({
-      label: `Mới ${Math.max(0, Math.floor(diffMin))} Phút (Linh hoạt ${tolerance}p — miễn phí)`,
+      label: `Mới ${Math.max(0, Math.floor(diffMin))} Phút (Linh hoạt ${tolerance} Phút — Miễn Phí)`,
       amount: 0,
       type:   'base',
       meta:   { freeGracePeriod: true, tolerance, diffMinutes: diffMin },
