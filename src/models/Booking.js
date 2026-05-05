@@ -136,10 +136,45 @@ const bookingSchema = new mongoose.Schema({
     by:             { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     _id: false,
   }],
+
+  // ⭐ NEW: Mã đặt phòng — format BK_XXXXXX (6 ký tự alphanumeric uppercase, random)
+  //   Auto-generate ở pre-save hook nếu chưa có. Unique + sparse (cho phép null tạm thời).
+  bookingCode:     { type: String, unique: true, sparse: true, index: true },
 }, { timestamps: true });
 
 bookingSchema.index({ status: 1, branchId: 1 });
 bookingSchema.index({ customerId: 1 });
 bookingSchema.index({ roomId: 1 });
+
+// ⭐ Pre-save hook: tự sinh bookingCode nếu chưa có
+//   Format: BK_XXXXXX (6 ký tự alphanumeric uppercase)
+//   Loại bỏ các ký tự dễ nhầm lẫn: 0/O, 1/I/L để tránh nhầm khi đọc/nhập
+const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'   // bỏ I, L, O, 0, 1
+const generateBookingCode = () => {
+  let code = 'BK_'
+  for (let i = 0; i < 6; i++) {
+    code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
+  }
+  return code
+}
+
+bookingSchema.pre('save', async function () {
+  if (this.isNew && !this.bookingCode) {
+    // Loop để tránh trùng (rất hiếm với 31^6 ≈ 887 triệu tổ hợp)
+    const Booking = this.constructor
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const candidate = generateBookingCode()
+      const exists = await Booking.findOne({ bookingCode: candidate }).select('_id').lean()
+      if (!exists) {
+        this.bookingCode = candidate
+        break
+      }
+    }
+    // Nếu sau 10 lần vẫn trùng (rất bất thường) → fallback timestamp
+    if (!this.bookingCode) {
+      this.bookingCode = `BK_${Date.now().toString(36).toUpperCase().slice(-6)}`
+    }
+  }
+})
 
 module.exports = mongoose.model('Booking', bookingSchema);

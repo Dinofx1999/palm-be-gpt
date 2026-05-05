@@ -34,6 +34,21 @@ const branchSchema = new mongoose.Schema({
   autoConvertPriceType: { type: Boolean, default: true },
 
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+  // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
+  // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
+  // (Giờ check-in/out + phụ thu vượt người được lấy từ PricePolicy của từng loại phòng)
+  quotePolicy: {
+    cancellationPolicy: { type: String, default: '' },
+    requiredDocuments:  { type: String, default: '' },
+    hotelRules:         { type: String, default: '' },
+    includedServices: [{
+      icon:        { type: String, default: '✓' },
+      name:        { type: String, required: true },
+      description: { type: String, default: '' },
+      isFree:      { type: Boolean, default: true },
+      price:       { type: Number, default: 0 },
+    }],
+  },
 }, { timestamps: true });
 
 branchSchema.index({ status: 1 });

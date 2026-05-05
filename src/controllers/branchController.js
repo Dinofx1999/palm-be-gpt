@@ -29,43 +29,24 @@ const create = async (req, res, next) => {
 
 const update = async (req, res, next) => {
   try {
-    // ⭐ Đầy đủ các field config — trước đây thiếu sẽ bị strip ra khỏi payload
     const allowed = [
-      'name', 'address', 'city', 'phone', 'email', 'managerId', 'status',
+      'name', 'address', 'city', 'phone', 'email',
       'checkInTime', 'checkOutTime',
-      'toleranceMinutes',
-      'hourToDayThreshold',
-      'dayEquivalentHours',
-      'earlyCheckinUntil',         // ⭐ NEW
+      'toleranceMinutes', 'hourToDayThreshold',
+      'dayEquivalentHours', 'earlyCheckinUntil',
       'autoConvertPriceType',
-    ];
-    const payload = {};
-    allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k]; });
+      'quotePolicy',                              // ⭐ THÊM dòng này
+    ]
+    const payload = {}
+    allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })
 
-    for (const field of ['checkInTime','checkOutTime']) {
-      if (payload[field] && !/^\d{2}:\d{2}$/.test(payload[field]))
-        return res.status(400).json({ success: false, message: `${field} phải có định dạng HH:mm` });
-    }
-
-    // ⭐ Validate range cho config Number
-    if (payload.toleranceMinutes !== undefined && (payload.toleranceMinutes < 0 || payload.toleranceMinutes > 120)) {
-      return res.status(400).json({ success: false, message: 'toleranceMinutes phải trong khoảng 0–120' });
-    }
-    if (payload.hourToDayThreshold !== undefined && (payload.hourToDayThreshold < 1 || payload.hourToDayThreshold > 24)) {
-      return res.status(400).json({ success: false, message: 'hourToDayThreshold phải trong khoảng 1–24' });
-    }
-    if (payload.dayEquivalentHours !== undefined && (payload.dayEquivalentHours < 0 || payload.dayEquivalentHours > 23)) {
-      return res.status(400).json({ success: false, message: 'dayEquivalentHours phải trong khoảng 0–23' });
-    }
-    if (payload.earlyCheckinUntil !== undefined && (payload.earlyCheckinUntil < 0 || payload.earlyCheckinUntil > 11)) {
-      return res.status(400).json({ success: false, message: 'earlyCheckinUntil phải trong khoảng 0–11' });
-    }
-
-    const branch = await Branch.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
-    if (!branch) return res.status(404).json({ success: false, message: 'Không tìm thấy chi nhánh' });
-    res.json({ success: true, message: 'Cập nhật thành công', data: { branch } });
-  } catch (err) { next(err); }
-};
+    const branch = await Branch.findByIdAndUpdate(
+      req.params.id, payload, { new: true, runValidators: true }
+    )
+    if (!branch) return res.status(404).json({ success: false, message: 'Không tìm thấy' })
+    res.json({ success: true, message: 'Cập nhật thành công', data: { branch } })
+  } catch (err) { next(err) }
+}
 
 const toggle = async (req, res, next) => {
   try {

@@ -4,7 +4,7 @@ const cors        = require('cors');
 const helmet      = require('helmet');
 const morgan      = require('morgan');
 const compression = require('compression');
-
+const path = require('path');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 const { connect } = require('./config/database');
@@ -46,6 +46,16 @@ app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/amenities',       require('./routes/amenities'));
 app.use('/api/price-policies',  require('./routes/pricePolicies'));
 app.use('/api/audit-logs',      require('./routes/auditLogs'));   // ⭐ NEW
+app.use('/api/quotes', require('./routes/quotes'));
+// ⭐ THÊM: Static serve folder uploads
+app.use('/uploads', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  next();
+}, express.static(path.join(__dirname, '../uploads')));
+
+// ⭐ THÊM: Route upload
+app.use('/api/upload', require('./routes/upload'));
 
 // ── Error handling ─────────────────────────────────────
 const { errorHandler, notFound } = require('./middleware/helpers');
