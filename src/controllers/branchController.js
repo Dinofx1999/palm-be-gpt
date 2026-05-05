@@ -35,7 +35,7 @@ const update = async (req, res, next) => {
       'toleranceMinutes', 'hourToDayThreshold',
       'dayEquivalentHours', 'earlyCheckinUntil',
       'autoConvertPriceType',
-      'quotePolicy',                              // ⭐ THÊM dòng này
+      'quotePolicy','hourBookingCutoffEnabled','hourBookingCutoffStart','hourBookingCutoffEnd',                              // ⭐ THÊM dòng này
     ]
     const payload = {}
     allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })

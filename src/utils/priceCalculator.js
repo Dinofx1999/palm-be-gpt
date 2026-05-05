@@ -55,6 +55,8 @@ const calcNights = (checkIn, checkOut) => {
  * - Hỗ trợ nhiều tên field: time, hours, duration (defensive)
  * - Nếu hours khớp slot (slot.time <= hours): chọn slot LỚN NHẤT vẫn ≤ hours
  * - Nếu hours nhỏ hơn slot nhỏ nhất: chọn slot NHỎ NHẤT (minimum charge)
+ * - Nếu hours vượt slot lớn nhất: vẫn chọn slot LỚN NHẤT (capped)
+ *   Vd: hours=25, slots=[1,3,5] → chọn slot 5h (không cộng dồn)
  *
  * slots: [{ time: '1', price: 50000 }, { time: '3', price: 100000 }]
  */
@@ -62,7 +64,16 @@ const getSlotHours = (s) => {
   // Hỗ trợ multiple field names
   const v = s?.time ?? s?.hours ?? s?.duration ?? s?.h ?? null
   if (v === null || v === undefined) return null
-  const n = parseInt(v, 10)
+  // ⭐ Hỗ trợ cả 2 format:
+  //   - Số (vd: 2, "2", "2.5") → giờ
+  //   - "HH:mm" (vd: "02:00", "02:30") → giờ.phút (lấy hours, ignore minutes)
+  //     Lưu ý: "02:30" được làm tròn xuống 2h vì slot không tính lẻ phút
+  const str = String(v).trim()
+  if (str.includes(':')) {
+    const [h] = str.split(':').map(Number)
+    return Number.isFinite(h) ? h : null
+  }
+  const n = parseInt(str, 10)
   return Number.isFinite(n) ? n : null
 }
 
@@ -95,6 +106,7 @@ const pickSlot = (slots, hours) => {
   }
 
   // Bình thường: lấy slot LỚN NHẤT vẫn ≤ hours
+  // ⭐ Khi hours vượt slot lớn nhất (vd 25h, slots [1,3,5]) → vẫn lấy slot 5h
   return sorted
     .filter(s => s.time <= hours)
     .sort((a, b) => b.time - a.time)[0] ?? null
@@ -149,41 +161,28 @@ function calculatePrice(input) {
 
   // ──────────────────────────────────────────────────
   // ⭐ AUTO-CONVERT priceType
+  //   - Case 1: day → hour (ở ngắn) — VẪN GIỮ
+  //   - Case 2 (hour → day vượt 23:00): ĐÃ TẮT theo yêu cầu
+  //   - Case 3 (hour → day qua đêm):    ĐÃ TẮT theo yêu cầu
+  //   Lý do tắt: khách chọn Giờ thì tính theo slot Giờ thoải mái,
+  //   ở bao nhiêu giờ tính bấy nhiêu giờ. pickSlot() sẽ lấy slot
+  //   lớn nhất ≤ hours (vd ở 25h, slots [1,3,5] → lấy slot 5h).
   // ──────────────────────────────────────────────────
   let finalType = requestedType
   let converted = false
   let notice    = ''
 
   if (autoConvert && policy) {
-    // Case 1: User chọn 'day' nhưng ở ngắn (cùng ngày + < threshold giờ)
-    //   → chuyển sang 'hour'
-    if (requestedType === 'day' && sameDay && hoursRounded < hourToDayThresh && policy.hourEnabled) {
-      finalType = 'hour'
-      converted = true
-      notice = `Tự chuyển sang Giá Giờ vì khách ở ${hoursRounded}h (ngắn hơn ${hourToDayThresh} tiếng).`
-    }
-
-    // Case 2: User chọn 'hour' nhưng checkout VƯỢT mốc dayEquivalentHours (vd 23:00) trong cùng ngày
-    //   → auto chuyển 'day'
-    //   Vd: dayEquivalentHours = 23 → nghỉ giờ vượt 23:00 cùng ngày → tính giá ngày
-    else if (requestedType === 'hour' && sameDay && policy.dayEnabled) {
-      const coHourMin = co.getHours() * 60 + co.getMinutes()
-      const dayEquivThresholdMin = dayEquivHours * 60   // 23:00 = 23 × 60 = 1380 phút
-      if (coHourMin >= dayEquivThresholdMin) {
-        finalType = 'day'
-        converted = true
-        const coHourStr = `${String(co.getHours()).padStart(2,'0')}:${String(co.getMinutes()).padStart(2,'0')}`
-        const equivHourStr = `${String(dayEquivHours).padStart(2,'0')}:00`
-        notice = `Tự chuyển sang Giá Ngày vì khách trả phòng lúc ${coHourStr} (vượt mốc ${equivHourStr}).`
-      }
-    }
-
-    // Case 3: User chọn 'hour' nhưng qua đêm — auto chuyển 'day'
-    else if (requestedType === 'hour' && !sameDay && policy.dayEnabled) {
-      finalType = 'day'
-      converted = true
-      notice = `Tự chuyển sang Giá Ngày vì khách ở qua đêm.`
-    }
+    // ⭐ ĐÃ TẮT TOÀN BỘ AUTO-CONVERT theo yêu cầu:
+    //   - Case 1 (day → hour khi ở ngắn): TẮT
+    //   - Case 2 (hour → day khi vượt 23:00): TẮT
+    //   - Case 3 (hour → day khi qua đêm): TẮT
+    //
+    //   Lý do: User đã chọn loại giá rõ ràng (Giờ/Ngày), BE không nên tự chuyển.
+    //   Nếu chọn loại không hợp lệ → trả 400 PRICE_TYPE_NOT_ENABLED (xem block validation bên dưới).
+    //
+    //   Block này giữ lại như placeholder cho future cases (vd: chỉ convert khi user
+    //   set flag confirmConvert=true).
   }
 
   // ──────────────────────────────────────────────────
@@ -212,6 +211,97 @@ function calculatePrice(input) {
       finalPriceType: finalType,
       originalPriceType: requestedType,
       converted, notice, breakdown,
+    }
+  }
+
+  // ⭐ VALIDATION: Đảm bảo policy có enable đúng loại finalType
+  //   Nếu user chọn priceType mà policy KHÔNG enable loại đó (vd: priceType='day'
+  //   nhưng dayEnabled=false) → trả về error để controller chuyển 400 BAD_REQUEST.
+  //   Tránh trường hợp im lặng trả 0đ làm user khó hiểu.
+  const enableMap = {
+    hour:  policy.hourEnabled,
+    day:   policy.dayEnabled,
+    night: policy.nightEnabled,
+    week:  policy.weekEnabled,
+    month: policy.monthEnabled,
+  }
+  const typeLabelMap = {
+    hour: 'Giá Giờ', day: 'Giá Ngày', night: 'Giá Đêm', week: 'Giá Tuần', month: 'Giá Tháng',
+  }
+  if (enableMap[finalType] !== true) {
+    // Liệt kê các loại giá mà policy CÓ enable để gợi ý cho FE/user
+    const enabledTypes = Object.entries(enableMap)
+      .filter(([_, v]) => v === true)
+      .map(([k]) => k)
+    return {
+      roomAmount: 0,
+      nights,
+      finalPriceType: finalType,
+      originalPriceType: requestedType,
+      converted, notice,
+      breakdown: [],
+      error: {
+        code:    'PRICE_TYPE_NOT_ENABLED',
+        message: `Chính sách giá "${policy.name ?? ''}" không có cấu hình ${typeLabelMap[finalType] ?? finalType}. Vui lòng chọn loại giá khác.`,
+        finalPriceType:   finalType,
+        availableTypes:   enabledTypes,           // ['hour', 'night', ...]
+        availableLabels:  enabledTypes.map(t => typeLabelMap[t]),
+      },
+    }
+  }
+
+  // ⭐ NEW: VALIDATION CUTOFF GIÁ GIỜ (RANGE)
+  //   Khi branch.hourBookingCutoffEnabled = true, không cho đặt phòng giá giờ
+  //   nếu CI nằm trong khoảng [hourBookingCutoffStart, hourBookingCutoffEnd).
+  //   Hỗ trợ cross-midnight: vd start=20:00, end=06:00 → cấm từ 20:00 hôm nay đến 05:59 hôm sau.
+  //   - Chỉ áp dụng cho finalType === 'hour'
+  //   - Logic check theo CI (giờ trong ngày) — không quan tâm ngày calendar
+  if (
+    finalType === 'hour' &&
+    branch?.hourBookingCutoffEnabled === true
+  ) {
+    const startStr = branch.hourBookingCutoffStart ?? '20:00'
+    const endStr   = branch.hourBookingCutoffEnd   ?? '06:00'
+    const startMin = toMinutes(startStr)
+    const endMin   = toMinutes(endStr)
+    const ciMin    = ci.getHours() * 60 + ci.getMinutes()
+
+    // Edge case: start === end → coi như cutoff cả ngày (block toàn bộ)
+    // start > end → cross-midnight (vd 20:00 → 06:00): block khi ciMin >= start HOẶC ciMin < end
+    // start < end → cùng ngày (vd 12:00 → 14:00): block khi ciMin >= start VÀ ciMin < end
+    let isInBlock = false
+    if (startMin === endMin) {
+      isInBlock = true   // cấm toàn bộ — admin cố ý cấu hình kì lạ
+    } else if (startMin > endMin) {
+      isInBlock = ciMin >= startMin || ciMin < endMin
+    } else {
+      isInBlock = ciMin >= startMin && ciMin < endMin
+    }
+
+    if (isInBlock) {
+      return {
+        roomAmount: 0,
+        nights,
+        finalPriceType: finalType,
+        originalPriceType: requestedType,
+        converted, notice,
+        breakdown: [],
+        error: {
+          code:    'HOUR_BOOKING_CUTOFF',
+          message: `Không thể đặt phòng giá giờ trong khoảng ${startStr} - ${endStr}. Vui lòng chọn loại giá khác (Giá Ngày/Đêm).`,
+          finalPriceType: finalType,
+          cutoffStart:    startStr,
+          cutoffEnd:      endStr,
+          checkInTime:    `${pad(ci.getHours())}:${pad(ci.getMinutes())}`,
+          // Gợi ý các loại giá còn lại (không phải hour)
+          availableTypes:  Object.entries(enableMap)
+            .filter(([k, v]) => v === true && k !== 'hour')
+            .map(([k]) => k),
+          availableLabels: Object.entries(enableMap)
+            .filter(([k, v]) => v === true && k !== 'hour')
+            .map(([k]) => typeLabelMap[k]),
+        },
+      }
     }
   }
 

@@ -32,6 +32,10 @@ const branchSchema = new mongoose.Schema({
 
   // ⭐ Bật/tắt tính năng auto-convert
   autoConvertPriceType: { type: Boolean, default: true },
+  // ⭐ NEW: Cấu hình cutoff giá giờ
+hourBookingCutoffEnabled: { type: Boolean, default: false },
+hourBookingCutoffStart:   { type: String,  default: '20:00' },   // giờ bắt đầu cấm
+hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết thúc cấm (exclusive)
 
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
   // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
