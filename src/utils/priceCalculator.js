@@ -201,7 +201,7 @@ function calculatePrice(input) {
   // Áp dụng cho mọi loại giá (Giờ, Ngày, Đêm...)
   if (diffMin <= tolerance) {
     breakdown.push({
-      label: `Mới ${Math.max(0, Math.floor(diffMin))} phút (trong ${tolerance}p ân huệ — miễn phí)`,
+      label: `Mới ${Math.max(0, Math.floor(diffMin))} Phút (Linh hoạt ${tolerance}p — miễn phí)`,
       amount: 0,
       type:   'base',
       meta:   { freeGracePeriod: true, tolerance, diffMinutes: diffMin },
@@ -230,8 +230,8 @@ function calculatePrice(input) {
       const slot = pickSlot(policy.hourSlots, hoursRounded)
       if (slot) {
         const label = slot._isMinimum
-          ? `Giá giờ tối thiểu (slot ${slot.time}h, mới ở ${hoursRounded}h)`
-          : `Giá giờ (slot ${slot.time}h, ở ${hoursRounded}h)`
+          ? `Giá giờ tối thiểu (Khung ${slot.time}h, mới ở ${hoursRounded}h)`
+          : `Giá giờ (Khung ${slot.time}h, ở ${hoursRounded}h)`
         breakdown.push({ label, amount: slot.price, type: 'base' })
         roomAmount += slot.price
       } else {
