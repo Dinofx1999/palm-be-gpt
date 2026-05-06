@@ -141,6 +141,18 @@ const create = async (req, res, next) => {
       requiredDocuments:  branch?.quotePolicy?.requiredDocuments  ?? '',
       hotelRules:         branch?.quotePolicy?.hotelRules         ?? '',
       includedServices:   branch?.quotePolicy?.includedServices   ?? [],
+
+      // ⭐ NEW: Snapshot contact info từ Branch — báo giá có kênh liên hệ rõ ràng
+      //   Đây là snapshot tại thời điểm tạo quote: nếu sau này branch đổi SĐT,
+      //   quote cũ vẫn giữ thông tin liên hệ tại lúc gửi cho khách (đúng tinh thần proposal)
+      contact: {
+        phone:   branch?.phone   ?? '',
+        email:   branch?.email   ?? '',
+        address: branch?.address ?? '',
+        city:    branch?.city    ?? '',
+        // Zalo dùng chung số phone (chỉ giữ digits) → FE tự build link zalo.me/<digits>
+        zalo:    branch?.phone ? String(branch.phone).replace(/\D/g, '') : '',
+      },
     };
 
     // ⭐ NEW: Trong mode 'by_type', merge các line cùng typeId thành 1 line duy nhất

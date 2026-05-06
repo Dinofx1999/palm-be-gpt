@@ -1753,34 +1753,86 @@ const checkout = async (req, res, next) => {
           const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
           const maxChildren = room?.typeId?.maxChildren ?? 0
 
-          const subPriceResult = calculatePrice({
-            checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
-            checkOut:  actualCO,
-            priceType: sub.priceType ?? booking.priceType,
-            policy, branch,
-            adults:    sub.adults   ?? booking.adults,
-            children:  sub.children ?? booking.children,
-            maxAdults, maxChildren,
-          })
+          // ⭐ FIX: Detect xem sub-room đã từng chuyển phòng chưa
+          //   Nếu có seg1 (segment=1) → preserve seg1, chỉ recalc seg2 với filter
+          //   Nếu không → recalc bình thường từ actualCheckIn
+          const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
+          const seg1Items = []
+          let splitFromTime = null
+          for (const b of existingItems) {
+            const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
+            const isSeg1 = item?.meta?.segment === 1 ||
+                           (item?.meta?.roomNumber && String(item.meta.roomNumber) !== String(sub.roomNumber))
+            if (isSeg1) {
+              seg1Items.push(item)
+              if (item?.meta?.endTime) splitFromTime = item.meta.endTime
+            }
+          }
 
-          if (subPriceResult.error) {
-            console.warn(`[checkout][group] Recalc skipped for room ${sub.roomNumber}:`, subPriceResult.error.message)
-            groupRoomTotal += sub.roomAmount ?? 0
-            continue
+          let subPriceResult
+          if (seg1Items.length > 0) {
+            // Phòng đã chuyển — preserve seg1, recalc seg2 từ splitAt → actualCO
+            const splitAt = splitFromTime ? new Date(splitFromTime) : (sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn)
+            const seg2Result = calculatePrice({
+              checkIn:   splitAt,
+              checkOut:  actualCO,
+              priceType: sub.priceType ?? booking.priceType,
+              policy, branch,
+              adults:    sub.adults   ?? booking.adults,
+              children:  sub.children ?? booking.children,
+              maxAdults, maxChildren,
+            })
+            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2
+            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
+              const label = String(b.label || '')
+              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
+            })
+            const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
+            const seg2Amount = filteredSeg2.reduce((s, b) => s + Number(b.amount ?? 0), 0)
+
+            subPriceResult = {
+              roomAmount: seg1Amount + seg2Amount,
+              nights:     seg2Result.nights ?? sub.nights,
+              breakdown:  [
+                ...seg1Items,
+                ...filteredSeg2.map(b => ({
+                  ...b,
+                  meta: { ...(b.meta || {}), segment: 2, roomNumber: sub.roomNumber },
+                })),
+              ],
+            }
+            console.log(`[checkout][group][moved] room ${sub.roomNumber}: seg1=${seg1Amount} + seg2=${seg2Amount} = ${subPriceResult.roomAmount}`)
+          } else {
+            // Phòng bình thường (không chuyển) — recalc full
+            subPriceResult = calculatePrice({
+              checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
+              checkOut:  actualCO,
+              priceType: sub.priceType ?? booking.priceType,
+              policy, branch,
+              adults:    sub.adults   ?? booking.adults,
+              children:  sub.children ?? booking.children,
+              maxAdults, maxChildren,
+            })
+
+            if (subPriceResult.error) {
+              console.warn(`[checkout][group] Recalc skipped for room ${sub.roomNumber}:`, subPriceResult.error.message)
+              groupRoomTotal += sub.roomAmount ?? 0
+              continue
+            }
           }
 
           // Update sub-room
           sub.roomAmount     = subPriceResult.roomAmount
           sub.nights         = subPriceResult.nights
-          sub.priceBreakdown = (subPriceResult.breakdown ?? []).map(b => ({
-            label:  String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, ''),
-            amount: Number(b.amount ?? 0),
-            type:   b.type === 'surcharge' ? 'surcharge' : 'base',
-            meta:   { ...(b.meta || {}), roomNumber: sub.roomNumber },
-          })).map(item => ({
-            ...item,
-            label: `[${sub.roomNumber}] ${item.label}`,
-          }))
+          sub.priceBreakdown = (subPriceResult.breakdown ?? []).map(b => {
+            const labelStr = String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, '')
+            return {
+              label:  `[${sub.roomNumber}] ${labelStr}`,
+              amount: Number(b.amount ?? 0),
+              type:   b.type === 'surcharge' ? 'surcharge' : 'base',
+              meta:   { ...(b.meta || {}), roomNumber: sub.roomNumber },
+            }
+          })
 
           groupRoomTotal += sub.roomAmount
 
@@ -2045,8 +2097,15 @@ const checkoutRoom = async (req, res, next) => {
               children:  sub.children ?? booking.children,
               maxAdults, maxChildren,
             })
+            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
+            //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
+            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
+              const label = String(b.label || '')
+              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
+            })
             const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
-            const seg2Items  = (seg2Result.breakdown ?? []).map(b => ({
+            const seg2Amount = filteredSeg2.reduce((s, b) => s + Number(b.amount ?? 0), 0)
+            const seg2Items  = filteredSeg2.map(b => ({
               label:  String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, ''),
               amount: Number(b.amount ?? 0),
               type:   b.type === 'surcharge' ? 'surcharge' : 'base',
@@ -2056,10 +2115,10 @@ const checkoutRoom = async (req, res, next) => {
               label: `[${sub.roomNumber}] ${item.label}`,
             }))
 
-            sub.roomAmount     = seg1Amount + (seg2Result.roomAmount ?? 0)
+            sub.roomAmount     = seg1Amount + seg2Amount
             sub.priceBreakdown = [...seg1Items, ...seg2Items]
             console.log('[checkoutRoom] preserved seg1:', seg1Items.length, 'items, seg1Amount=', seg1Amount,
-                        '| seg2 amount=', seg2Result.roomAmount, '| total=', sub.roomAmount)
+                        '| seg2 amount=', seg2Amount, '| total=', sub.roomAmount)
           } else {
             sub.roomAmount      = priceResult.roomAmount
             sub.priceBreakdown  = (priceResult.breakdown ?? []).map(b => ({
@@ -2585,13 +2644,22 @@ const calculateBill = async (req, res, next) => {
               children:  sr.children ?? booking.children,
               maxAdults, maxChildren,
             })
-            const seg2Items = (seg2Result.breakdown ?? []).map(b => ({
+            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
+            //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
+            //   Bug: khi splitAt < dayCheckInTime (vd 11:56 < 14:00), priceCalculator
+            //   tự cộng phụ thu "Nhận phòng sớm" mặc dù khách đã ở từ trước.
+            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
+              const label = String(b.label || '')
+              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
+            })
+            const seg2Amount = filteredSeg2.reduce((s, b) => s + (b.amount ?? 0), 0)
+            const seg2Items = filteredSeg2.map(b => ({
               ...b,
               meta: { ...(b.meta || {}), segment: 2, roomNumber: sr.roomNumber },
             }))
 
             subPriceResult = {
-              roomAmount: seg1Amount + (seg2Result.roomAmount ?? 0),
+              roomAmount: seg1Amount + seg2Amount,
               breakdown:  [...seg1Items, ...seg2Items],
             }
           } else if (hasMoveSegments && mode === 'checkout') {
@@ -2891,14 +2959,23 @@ const calculateBill = async (req, res, next) => {
           children:  booking.children,
           maxAdults, maxChildren,
         })
-        const seg2Items = (seg2Result.breakdown ?? []).map(b => ({
+        // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
+        //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
+        //   Bug: khi lastTransferAt < dayCheckInTime (vd 11:56 < 14:00), priceCalculator
+        //   tự cộng phụ thu "Nhận phòng sớm" mặc dù khách đã ở từ trước.
+        const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
+          const label = String(b.label || '')
+          return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
+        })
+        const seg2Amount = filteredSeg2.reduce((s, b) => s + (b.amount ?? 0), 0)
+        const seg2Items = filteredSeg2.map(b => ({
           ...b,
           label: `[${booking.roomNumber}] ${b.label}`,
           meta:  { ...(b.meta || {}), segment: 2, roomNumber: booking.roomNumber },
         }))
 
         priceResult = {
-          roomAmount:       oldSegmentsAmount + (seg2Result.roomAmount ?? 0),
+          roomAmount:       oldSegmentsAmount + seg2Amount,
           nights:           booking.nights,
           breakdown:        [...oldSegments, ...seg2Items],
           finalPriceType:   booking.priceType,
