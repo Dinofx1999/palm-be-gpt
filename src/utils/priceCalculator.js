@@ -123,7 +123,9 @@ const pickSlot = (slots, hours) => {
  * @param {Object} input.branch           - Branch doc (lấy giờ chuẩn + tolerance)
  * @param {number} input.adults
  * @param {number} input.children
- * @param {number} input.capacity         - Sức chứa loại phòng
+ * @param {number} [input.maxAdults]      - Số NL tối đa loại phòng (default: capacity hoặc 2)
+ * @param {number} [input.maxChildren]    - Số TE tối đa loại phòng (default: 0)
+ * @param {number} [input.capacity]       - DEPRECATED: dùng maxAdults+maxChildren (backward compat)
  *
  * @returns {Object} {
  *   roomAmount,        // Tổng tiền phòng (đã gồm phụ thu)
@@ -138,8 +140,17 @@ const pickSlot = (slots, hours) => {
 function calculatePrice(input) {
   const {
     checkIn, checkOut, priceType: requestedType = 'day',
-    policy, branch, adults = 2, children = 0, capacity = 2,
+    policy, branch, adults = 2, children = 0,
+    capacity,        // ⭐ DEPRECATED — fallback cho code cũ
+    maxAdults,       // ⭐ NEW
+    maxChildren,     // ⭐ NEW
   } = input
+
+  // ⭐ Resolve maxAdults / maxChildren từ input
+  //   Ưu tiên: maxAdults/maxChildren > capacity (legacy) > default (2 NL, 0 TE)
+  //   Nếu chỉ có capacity → coi tất cả là NL (maxAdults=capacity, maxChildren=0)
+  const resolvedMaxAdults   = maxAdults   ?? capacity ?? 2
+  const resolvedMaxChildren = maxChildren ?? 0
 
   const ci = new Date(checkIn)
   const co = new Date(checkOut)
@@ -367,6 +378,31 @@ function calculatePrice(input) {
       effectiveNights = nights + 1
     }
 
+    // ⭐ Tính phụ thu MỖI ĐÊM trước (vì sẽ push xen kẽ với từng giá ngày)
+    //
+    // Logic mới (maxAdults + maxChildren tách riêng):
+    //   - Phụ thu NL: nếu adults > maxAdults (ƯU TIÊN — luôn áp dụng)
+    //   - Phụ thu TE: chỉ khi tổng (adults+children) > (maxAdults+maxChildren),
+    //                 trừ phần NL đã phụ thu (tránh double count)
+    //
+    // Test cases (maxA=2, maxC=1, tổng cap=3):
+    //   A=1, C=2 → 0 NL, 0 TE (tổng=3 ≤ 3, NL ≤ 2) — không phụ thu
+    //   A=3, C=0 → 1 NL, 0 TE (NL > maxA, dù tổng=3 ≤ 3)
+    //   A=2, C=2 → 0 NL, 1 TE (NL OK, tổng=4 > 3 → 1 TE phụ thu)
+    //   A=3, C=2 → 1 NL, 1 TE (NL > maxA → 1 NL; tổng vượt 2, đã 1 NL → còn 1 TE)
+    //   A=4, C=0 → 2 NL, 0 TE (NL > maxA → 2 NL, ưu tiên rule này)
+    const extraAdults = Math.max(0, adults - resolvedMaxAdults)
+    const totalCapacity = resolvedMaxAdults + resolvedMaxChildren
+    const totalExtra    = Math.max(0, (adults + children) - totalCapacity)
+    const extraChildren = Math.max(0, totalExtra - extraAdults)
+
+    const adultSurchargePerNight = extraAdults > 0
+      ? (policy.dayAdultSurcharge ?? 0) * extraAdults
+      : 0
+    const childSurchargePerNight = extraChildren > 0
+      ? (policy.dayChildSurcharge ?? 0) * extraChildren
+      : 0
+
     // ⭐ Tách thành từng "ngày ở" với khoảng thời gian cụ thể
     // Mỗi đêm = từ check-in time → check-out time của ngày hôm sau
     // Đêm đầu: ci thực tế → coStandard ngày hôm sau (hoặc co thực tế nếu sameDay)
@@ -375,12 +411,28 @@ function calculatePrice(input) {
     //
     // Để đơn giản & match UI ezCloud: hiển thị 'Giá ngày (DD/MM HH:mm - DD/MM HH:mm)'
     // mỗi đêm 1 dòng, dùng giờ chuẩn cho các đêm giữa
+    // ⭐ Phụ thu của từng đêm cũng được push ngay sau giá ngày của đêm đó (xen kẽ)
     for (let i = 0; i < effectiveNights; i++) {
       let segStart, segEnd
       if (effectiveNights === 1) {
         // 1 đêm duy nhất: dùng giờ thực tế cả 2 đầu
         segStart = ci
-        segEnd   = co
+        // ⭐ FIX: Nếu co > coStandard (overstay) → đêm này dừng ở coStandard,
+        //   phần overstay tách ra surcharge "Trả phòng muộn" — tránh double counting
+        const [coStdH1, coStdM1] = coStandard.split(':').map(Number)
+        const coStdMin1 = coStdH1 * 60 + coStdM1
+        const coMin1    = co.getHours() * 60 + co.getMinutes()
+        // Chỉ apply nếu co và coStandard ở cùng ngày (đêm 1 duy nhất kéo dài qua nhiều ngày = không apply)
+        const sameDayCo = co.getFullYear() === ci.getFullYear()
+                       && co.getMonth() === ci.getMonth()
+                       && co.getDate()  === ci.getDate() + (sameDay ? 0 : 1)
+        if (sameDayCo && coMin1 > coStdMin1 && (finalType === 'day' || finalType === 'night')) {
+          const tmpEnd = new Date(co)
+          tmpEnd.setHours(coStdH1, coStdM1, 0, 0)
+          segEnd = tmpEnd
+        } else {
+          segEnd = co
+        }
       } else if (i === 0) {
         // Đêm đầu: ci thực → coStandard ngày hôm sau (HOẶC sameDay early CI → coStandard cùng ngày)
         segStart = ci
@@ -412,7 +464,21 @@ function calculatePrice(input) {
           tmp.setHours(h, m, 0, 0)
           segStart = tmp
         }
-        segEnd   = co
+        // ⭐ FIX: Nếu co thực > coStandard (overstay) → label đêm cuối DỪNG ở coStandard
+        //   thay vì kéo đến co. Lý do: phần [coStandard → co] sẽ được tính
+        //   riêng thành "Trả phòng muộn (X giờ)" → tránh double counting.
+        //   Nếu co <= coStandard (đúng giờ hoặc trả sớm) → giữ nguyên co.
+        const [coStdH, coStdM] = coStandard.split(':').map(Number)
+        const coStdMin = coStdH * 60 + coStdM
+        const coMin    = co.getHours() * 60 + co.getMinutes()
+        if (coMin > coStdMin && (finalType === 'day' || finalType === 'night')) {
+          // Đêm cuối tới giờ trả chuẩn — phần overstay sẽ vào surcharge "Trả phòng muộn"
+          const tmpEnd = new Date(co)
+          tmpEnd.setHours(coStdH, coStdM, 0, 0)
+          segEnd = tmpEnd
+        } else {
+          segEnd = co
+        }
       } else {
         // Đêm giữa
         const a = new Date(ci); a.setDate(a.getDate() + i)
@@ -439,6 +505,28 @@ function calculatePrice(input) {
         },
       })
       roomAmount += dayPrice
+
+      // ⭐ Phụ thu NL của đêm này — push ngay sau giá ngày
+      if (adultSurchargePerNight > 0) {
+        breakdown.push({
+          label: `Phụ thu ${extraAdults} người lớn (vượt ${resolvedMaxAdults} NL)`,
+          amount: adultSurchargePerNight,
+          type: 'surcharge',
+          meta: { nightIndex: i },
+        })
+        roomAmount += adultSurchargePerNight
+      }
+      // ⭐ Phụ thu TE của đêm này — push ngay sau phụ thu NL
+      //   Chỉ tính phần TE vượt (extraChildren), không phải tất cả TE
+      if (childSurchargePerNight > 0) {
+        breakdown.push({
+          label: `Phụ thu ${extraChildren} trẻ em (vượt ${resolvedMaxChildren} TE)`,
+          amount: childSurchargePerNight,
+          type: 'surcharge',
+          meta: { nightIndex: i },
+        })
+        roomAmount += childSurchargePerNight
+      }
     }
 
     // ⭐ Override nights để return — đếm đúng số đêm tính giá
@@ -447,18 +535,7 @@ function calculatePrice(input) {
       // (Không reassign biến `nights` const ở trên — dùng biến mới qua return)
     }
 
-    // Phụ thu vượt capacity
-    const extraAdults = Math.max(0, adults - capacity)
-    if (extraAdults > 0) {
-      const amt = (policy.dayAdultSurcharge ?? 0) * extraAdults
-      breakdown.push({ label: `Phụ thu ${extraAdults} người lớn (vượt ${capacity} người)`, amount: amt, type: 'surcharge' })
-      roomAmount += amt
-    }
-    if (children > 0) {
-      const amt = (policy.dayChildSurcharge ?? 0) * children
-      breakdown.push({ label: `Phụ thu ${children} trẻ em`, amount: amt, type: 'surcharge' })
-      roomAmount += amt
-    }
+    // (Phụ thu đã được tính xen kẽ trong loop trên, không cần block tổng nữa)
 
     // ⭐ Lưu effectiveNights để return + cho late-checkout block bên dưới biết
     // (truyền qua closure - sẽ đọc lại bằng cách check breakdown)

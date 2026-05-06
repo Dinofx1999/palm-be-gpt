@@ -2,7 +2,6 @@ const Invoice = require('../models/Invoice');
 const Booking = require('../models/Booking');
 const User    = require('../models/User');
 
-// ⭐ Try import logAction — nếu không có cũng không crash
 let logAction = async () => {};
 try {
   logAction = require('../utils/auditLogger').logAction;
@@ -10,16 +9,96 @@ try {
   console.warn('[invoiceController] auditLogger not found — skipping audit logs');
 }
 
-/**
- * ⭐ Phân bổ payment cho các sub-room theo thứ tự ưu tiên.
- *
- * Thứ tự ưu tiên:
- *  1. Phòng `targetRoomId` (nếu có) — phân bổ TRƯỚC
- *  2. Phòng còn lại theo thứ tự index trong rooms[]
- *
- * Mutate booking.rooms[i].paidAmount. Caller phải gọi await booking.save().
- * Returns: { allocations: [{roomId, roomNumber, amount}], remaining: 0 }
- */
+// ⭐ NEW: Helper compute totals từ booking (xử lý cả single + group)
+//   Group booking: tổng từ booking.rooms[] (chỉ active rooms, bỏ cancelled)
+//   Single booking: dùng booking.roomAmount/servicesAmount/discount cấp top
+//   Trả về: { roomAmount, servicesAmount, discount, totalAmount, items, roomNumber, isGroup, activeRooms }
+const computeBookingTotals = (booking) => {
+  const isGroup = Array.isArray(booking.rooms) && booking.rooms.length > 0
+  if (!isGroup) {
+    // Single booking
+    const safeNights = Math.max(1, Number(booking.nights) || 1)
+    const roomAmount = Number(booking.roomAmount) || 0
+    const servicesAmount = Number(booking.servicesAmount) || 0
+    const discount = Number(booking.discount) || 0
+    const totalAmount = Math.max(0, roomAmount + servicesAmount - discount)
+
+    return {
+      roomAmount, servicesAmount, discount, totalAmount,
+      items: [{
+        description: `Phòng ${booking.roomNumber || '?'} – ${booking.roomType || 'Phòng'} × ${safeNights} đêm`,
+        quantity:    safeNights,
+        unitPrice:   Math.round(roomAmount / safeNights) || 0,
+        amount:      roomAmount,
+      }],
+      roomNumber: booking.roomNumber || '',
+      isGroup: false,
+      activeRooms: [],
+    }
+  }
+
+  // ⭐ Group booking: tính tổng từ booking.rooms[] — KHÔNG dùng booking.roomAmount cấp top
+  //   Bỏ qua phòng cancelled
+  const activeRooms = booking.rooms.filter(r => r.status !== 'cancelled')
+
+  let roomAmount = 0
+  let servicesAmount = 0
+  let discount = 0
+  const items = []
+
+  for (const sr of activeRooms) {
+    const subRoom = Number(sr.roomAmount) || 0
+    const subServ = Number(sr.servicesAmount) || 0
+    const subDisc = Number(sr.discountAmount) || 0
+    const subNights = Math.max(1, Number(sr.nights) || Number(booking.nights) || 1)
+
+    roomAmount += subRoom
+    servicesAmount += subServ
+    discount += subDisc
+
+    items.push({
+      description: `Phòng ${sr.roomNumber || '?'} – ${sr.roomType || 'Phòng'} × ${subNights} đêm`,
+      quantity:    subNights,
+      unitPrice:   Math.round(subRoom / subNights) || 0,
+      amount:      subRoom,
+    })
+
+    // Nếu phòng có dịch vụ — thêm line riêng
+    if (subServ > 0) {
+      items.push({
+        description: `Dịch vụ phòng ${sr.roomNumber || '?'}`,
+        quantity:    1,
+        unitPrice:   subServ,
+        amount:      subServ,
+      })
+    }
+  }
+
+  // Cộng thêm dịch vụ + discount cấp top (nếu có — cho group dùng chung)
+  servicesAmount += Number(booking.servicesAmount) || 0
+  if (Number(booking.servicesAmount) > 0) {
+    items.push({
+      description: 'Dịch vụ chung của đoàn',
+      quantity:    1,
+      unitPrice:   Number(booking.servicesAmount),
+      amount:      Number(booking.servicesAmount),
+    })
+  }
+
+  // Discount cấp booking (chiết khấu chung)
+  discount += Number(booking.discount) || 0
+
+  const totalAmount = Math.max(0, roomAmount + servicesAmount - discount)
+
+  // Room number cho hiển thị: nếu đoàn → ghép "203, 204, 401"
+  const roomNumber = activeRooms.map(r => r.roomNumber).filter(Boolean).join(', ')
+
+  return {
+    roomAmount, servicesAmount, discount, totalAmount,
+    items, roomNumber, isGroup: true, activeRooms,
+  }
+}
+
 const allocatePaymentToRoomsHelper = (booking, amount, targetRoomId = null) => {
   if (!Array.isArray(booking.rooms) || booking.rooms.length === 0) {
     return { allocations: [], remaining: amount }
@@ -66,10 +145,6 @@ const allocatePaymentToRoomsHelper = (booking, amount, targetRoomId = null) => {
   return { allocations, remaining }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: wrap mọi handler với try/catch + log + response
-// → KHÔNG BAO GIỜ throw next is not a function
-// ═══════════════════════════════════════════════════════════════
 const safe = (fn, label) => async (req, res, next) => {
   try {
     await fn(req, res, next)
@@ -118,7 +193,6 @@ const safe = (fn, label) => async (req, res, next) => {
   }
 }
 
-// ── Helper: enrich invoice với thông tin user trong payments ──
 const enrichInvoice = async (invoice) => {
   if (!invoice) return invoice
   const obj = invoice.toObject ? invoice.toObject() : invoice
@@ -144,10 +218,16 @@ const enrichInvoice = async (invoice) => {
 
   if (obj.bookingId) {
     try {
-      const booking = await Booking.findById(obj.bookingId).select('roomNumber roomType')
+      const booking = await Booking.findById(obj.bookingId).select('roomNumber roomType rooms')
       if (booking) {
-        obj.roomNumber = obj.roomNumber || booking.roomNumber
-        obj.roomType   = booking.roomType
+        // Với group: ghép roomNumber từ rooms[]
+        if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
+          const activeRooms = booking.rooms.filter(r => r.status !== 'cancelled')
+          obj.roomNumber = obj.roomNumber || activeRooms.map(r => r.roomNumber).filter(Boolean).join(', ')
+        } else {
+          obj.roomNumber = obj.roomNumber || booking.roomNumber
+          obj.roomType   = booking.roomType
+        }
       }
     } catch (_) {}
   }
@@ -156,20 +236,84 @@ const enrichInvoice = async (invoice) => {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// CONTROLLERS
-// ═══════════════════════════════════════════════════════════════
 
+// ⭐ FIX: getAll thêm filter branchId + customerName search
 const getAll = safe(async (req, res) => {
-  const { customerId, paymentStatus, page = 1, limit = 20 } = req.query
-  const filter = {}
-  if (customerId)    filter.customerId    = customerId
-  if (paymentStatus) filter.paymentStatus = paymentStatus
+  const { customerId, paymentStatus, branchId, search, page = 1, limit = 20 } = req.query
 
-  const total = await Invoice.countDocuments(filter)
-  const data  = await Invoice.find(filter)
-    .sort({ createdAt: -1 })
-    .skip((+page - 1) * +limit)
-    .limit(+limit)
+  // ⭐ FIX: Dùng aggregate pipeline để filter theo branchId
+  //   Lý do: invoice cũ trong DB CHƯA có field branchId (chỉ invoice mới mới có).
+  //   Solution: $lookup vào bookings để lấy branchId từ booking nếu invoice không có.
+  //   → Filter được cả invoice cũ lẫn mới mà KHÔNG cần migration.
+
+  const matchStage = {}
+  if (customerId)    matchStage.customerId    = new (require('mongoose').Types.ObjectId)(customerId)
+  if (paymentStatus) matchStage.paymentStatus = paymentStatus
+  if (search) {
+    matchStage.$or = [
+      { customerName: { $regex: search, $options: 'i' } },
+      { invoiceCode:  { $regex: search, $options: 'i' } },
+      { roomNumber:   { $regex: search, $options: 'i' } },
+    ]
+  }
+
+  // ⭐ Pipeline:
+  //   1. Match các filter cơ bản (customerId, paymentStatus, search)
+  //   2. Lookup booking để có branch info
+  //   3. Add field effectiveBranchId = invoice.branchId ?? booking.branchId
+  //   4. Match theo effectiveBranchId nếu user truyền branchId
+  //   5. Sort + paginate
+  const pipeline = [
+    { $match: matchStage },
+    {
+      $lookup: {
+        from:         'bookings',
+        localField:   'bookingId',
+        foreignField: '_id',
+        as:           '_booking',
+        pipeline:     [{ $project: { branchId: 1 } }],
+      },
+    },
+    {
+      $addFields: {
+        // Ưu tiên invoice.branchId, fallback sang booking.branchId
+        effectiveBranchId: {
+          $ifNull: ['$branchId', { $arrayElemAt: ['$_booking.branchId', 0] }],
+        },
+      },
+    },
+  ]
+
+  // ⭐ Filter theo branch (sau khi đã có effectiveBranchId)
+  if (branchId) {
+    pipeline.push({
+      $match: {
+        effectiveBranchId: new (require('mongoose').Types.ObjectId)(branchId),
+      },
+    })
+  }
+
+  // Sort newest first
+  pipeline.push({ $sort: { createdAt: -1 } })
+
+  // Count tổng (clone pipeline trước khi limit)
+  const countPipeline = [...pipeline, { $count: 'total' }]
+  const totalResult = await Invoice.aggregate(countPipeline)
+  const total = totalResult[0]?.total ?? 0
+
+  // Pagination
+  pipeline.push({ $skip: (+page - 1) * +limit })
+  pipeline.push({ $limit: +limit })
+
+  // Cleanup field tạm trước khi return cho FE (giữ effectiveBranchId là branchId chính)
+  pipeline.push({
+    $addFields: { branchId: '$effectiveBranchId' },
+  })
+  pipeline.push({
+    $project: { _booking: 0, effectiveBranchId: 0 },
+  })
+
+  const data = await Invoice.aggregate(pipeline)
 
   res.json({ success: true, data: { data, total, page: +page, limit: +limit } })
 }, 'getAll')
@@ -181,6 +325,7 @@ const getOne = safe(async (req, res) => {
   res.json({ success: true, data: { invoice: enriched } })
 }, 'getOne')
 
+// ⭐ FIX: getOrCreateForBooking dùng computeBookingTotals
 const getOrCreateForBooking = safe(async (req, res) => {
   const { bookingId } = req.params
 
@@ -191,15 +336,14 @@ const getOrCreateForBooking = safe(async (req, res) => {
   const booking = await Booking.findById(bookingId)
   if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
-  let invoice = await Invoice.findOne({ bookingId: booking._id })
-  if (!invoice) {
-    const safeNights = Math.max(1, Number(booking.nights) || 1)
-    const safeRoom   = Number(booking.roomAmount)     || 0
-    const safeServ   = Number(booking.servicesAmount) || 0
-    const safeDisc   = Number(booking.discount)       || 0
-    const safeTotal  = Math.max(0, Number(booking.totalAmount) || (safeRoom + safeServ - safeDisc))
-    const customerName = booking.customerName || booking.customerPhone || 'Khách'
+  // ⭐ Compute totals từ booking (xử lý cả single + group)
+  const totals = computeBookingTotals(booking)
+  const customerName = booking.customerName || booking.customerPhone || 'Khách'
 
+  let invoice = await Invoice.findOne({ bookingId: booking._id })
+
+  if (!invoice) {
+    // CREATE
     let attempts = 0
     let lastErr  = null
     while (attempts < 3 && !invoice) {
@@ -208,21 +352,18 @@ const getOrCreateForBooking = safe(async (req, res) => {
           bookingId:       booking._id,
           customerId:      booking.customerId ?? null,
           customerName,
-          roomNumber:      booking.roomNumber || '',
-          roomAmount:      safeRoom,
-          servicesAmount:  safeServ,
-          discount:        safeDisc,
-          totalAmount:     safeTotal,
+          roomNumber:      totals.roomNumber,
+          roomAmount:      totals.roomAmount,
+          servicesAmount:  totals.servicesAmount,
+          discount:        totals.discount,
+          totalAmount:     totals.totalAmount,
           paidAmount:      0,
-          remainingAmount: safeTotal,
+          remainingAmount: totals.totalAmount,
           paymentStatus:   'unpaid',
+          // ⭐ NEW: branchId từ booking
+          branchId:        booking.branchId ?? null,
           issuedBy:        req.user?.id ?? req.user?._id ?? null,
-          items: [{
-            description: `Phòng ${booking.roomNumber || '?'} – ${booking.roomType || 'Phòng'} × ${safeNights} đêm`,
-            quantity:    safeNights,
-            unitPrice:   Math.round(safeRoom / safeNights) || 0,
-            amount:      safeRoom,
-          }],
+          items:           totals.items,
         })
       } catch (createErr) {
         lastErr = createErr
@@ -237,16 +378,39 @@ const getOrCreateForBooking = safe(async (req, res) => {
 
     if (!invoice) throw lastErr ?? new Error('Không tạo được invoice')
   } else {
-    const totalAmount = (booking.roomAmount ?? 0) + (booking.servicesAmount ?? 0) - (booking.discount ?? 0)
-    const remaining   = totalAmount - (invoice.paidAmount ?? 0)
-    if (invoice.totalAmount !== totalAmount || invoice.remainingAmount !== remaining) {
-      invoice.roomAmount      = booking.roomAmount
-      invoice.servicesAmount  = booking.servicesAmount ?? 0
-      invoice.discount        = booking.discount ?? 0
-      invoice.totalAmount     = totalAmount
-      invoice.remainingAmount = Math.max(0, remaining)
-      invoice.paymentStatus   = invoice.paidAmount >= totalAmount ? 'paid' :
-                                invoice.paidAmount > 0 ? 'partial' : 'unpaid'
+    // ⭐ UPDATE: ALWAYS recalc từ totals (trước đây chỉ check khác mới update)
+    //   Bug cũ: nếu booking đoàn add thêm phòng, totalAmount cũ giữ nguyên 1 phòng
+    //   Fix: luôn ghi đè từ totals tính lại
+    const needRecalc =
+      invoice.totalAmount     !== totals.totalAmount ||
+      invoice.roomAmount      !== totals.roomAmount ||
+      invoice.servicesAmount  !== totals.servicesAmount ||
+      invoice.discount        !== totals.discount ||
+      (invoice.items ?? []).length !== totals.items.length
+
+    if (needRecalc) {
+      console.log(`[invoice recalc] booking=${booking._id}`, {
+        old: { total: invoice.totalAmount, rooms: invoice.roomAmount, items: (invoice.items ?? []).length },
+        new: { total: totals.totalAmount,  rooms: totals.roomAmount,  items: totals.items.length },
+      })
+
+      invoice.roomAmount      = totals.roomAmount
+      invoice.servicesAmount  = totals.servicesAmount
+      invoice.discount        = totals.discount
+      invoice.totalAmount     = totals.totalAmount
+      invoice.roomNumber      = totals.roomNumber
+      invoice.items           = totals.items
+      invoice.remainingAmount = Math.max(0, totals.totalAmount - (invoice.paidAmount ?? 0))
+      invoice.paymentStatus   =
+        (invoice.paidAmount ?? 0) >= totals.totalAmount ? 'paid'
+        : (invoice.paidAmount ?? 0) > 0                 ? 'partial'
+        :                                                 'unpaid'
+
+      // ⭐ Nếu invoice cũ chưa có branchId — backfill từ booking
+      if (!invoice.branchId && booking.branchId) {
+        invoice.branchId = booking.branchId
+      }
+
       await invoice.save()
     }
   }
@@ -280,7 +444,6 @@ const addPayment = safe(async (req, res) => {
     type,
     paidAt: new Date(),
     createdBy: req.user?.id ?? req.user?._id ?? null,
-    // ⭐ Lưu targetRoomId để có thể trace allocation nếu cần
     targetRoomId: targetRoomId ?? null,
   })
 
@@ -292,15 +455,11 @@ const addPayment = safe(async (req, res) => {
   invoice.paymentMethod   = method ?? invoice.paymentMethod
   await invoice.save()
 
-  // ⭐ NEW: Phân bổ payment cho từng sub-room nếu là booking đoàn
-  // - targetRoomId: phòng được ưu tiên (FE pass khi user thanh toán cho 1 phòng cụ thể)
-  // - Thừa sẽ tự động credit sang phòng tiếp theo (FIFO)
   let allocations = []
   if (invoice.bookingId && type === 'payment') {
     try {
       const booking = await Booking.findById(invoice.bookingId)
       if (booking && Array.isArray(booking.rooms) && booking.rooms.length > 1) {
-        // Chỉ allocate cho booking ĐOÀN (>= 2 phòng)
         const result = allocatePaymentToRoomsHelper(booking, Math.abs(amount), targetRoomId)
         allocations = result.allocations
         await booking.save()
@@ -309,15 +468,11 @@ const addPayment = safe(async (req, res) => {
       console.error('[addPayment] allocate to sub-rooms failed (non-fatal):', allocErr.message)
     }
   } else if (invoice.bookingId && type === 'refund') {
-    // ⭐ Refund: ưu tiên trừ từ targetRoomId trước, sau đó LIFO các phòng khác
-    //   Lý do: nếu user mode single-in-group refund "phòng 204" → trừ đúng 204,
-    //   để khi pay lại 204 alloc đúng vào 204 (không bị FIFO sang phòng đầu)
     try {
       const booking = await Booking.findById(invoice.bookingId)
       if (booking && Array.isArray(booking.rooms) && booking.rooms.length > 1) {
         let toRefund = Math.abs(amount)
 
-        // Build ordered: targetRoomId trước, sau đó LIFO
         const ordered = []
         if (targetRoomId) {
           const targetIdx = booking.rooms.findIndex(sr =>
@@ -325,7 +480,6 @@ const addPayment = safe(async (req, res) => {
           )
           if (targetIdx >= 0) ordered.push(targetIdx)
         }
-        // Các phòng khác theo LIFO (cuối → đầu)
         for (let i = booking.rooms.length - 1; i >= 0; i--) {
           if (!ordered.includes(i)) ordered.push(i)
         }

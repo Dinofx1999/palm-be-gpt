@@ -9,6 +9,8 @@ const userSchema = new mongoose.Schema({
   phone:      { type: String, default: '' },
   role:       { type: String, enum: ['Admin', 'Manager', 'Receptionist', 'Staff'], required: true },
   branchId:   { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', default: null },
+  // ⭐ branchName là CACHE để tránh phải populate mỗi lần — auto-sync qua pre-save hook
+  //   KHÔNG dùng field này ở route /auth/login (nơi cần data chuẩn) → luôn populate
   branchName: { type: String, default: '' },
   isActive:   { type: Boolean, default: true },
 }, { timestamps: true });
@@ -17,6 +19,46 @@ const userSchema = new mongoose.Schema({
 userSchema.pre('save', async function () {
   if (!this.isModified('password')) return;
   this.password = await bcrypt.hash(this.password, 10);
+});
+
+// ⭐ NEW: Auto-sync branchName mỗi khi branchId thay đổi
+//   Tránh data lệch giữa branchId (ref) và branchName (cache string)
+userSchema.pre('save', async function () {
+  if (!this.isModified('branchId')) return;
+  if (!this.branchId) {
+    this.branchName = '';
+    return;
+  }
+  try {
+    const Branch = mongoose.model('Branch');
+    const branch = await Branch.findById(this.branchId).select('name').lean();
+    this.branchName = branch?.name ?? '';
+  } catch (err) {
+    console.error('[User pre-save] failed to sync branchName:', err.message);
+  }
+});
+
+// ⭐ NEW: Cũng auto-sync branchName khi update qua findOneAndUpdate / updateOne
+userSchema.pre(['findOneAndUpdate', 'updateOne'], async function () {
+  const update = this.getUpdate();
+  if (!update) return;
+  // Hỗ trợ cả $set và direct fields
+  const $set = update.$set ?? update;
+  if (!('branchId' in $set)) return;
+
+  if (!$set.branchId) {
+    $set.branchName = '';
+    if (update.$set) update.$set = $set;
+    return;
+  }
+  try {
+    const Branch = mongoose.model('Branch');
+    const branch = await Branch.findById($set.branchId).select('name').lean();
+    $set.branchName = branch?.name ?? '';
+    if (update.$set) update.$set = $set;
+  } catch (err) {
+    console.error('[User pre-update] failed to sync branchName:', err.message);
+  }
 });
 
 userSchema.methods.comparePassword = async function (plain) {

@@ -16,8 +16,14 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
   const effectiveStatus = subRoom?.status ?? activeBooking.status
 
   if (effectiveStatus === 'checked_in') {
+    // ⭐ Ưu tiên dates per-room (sub-room) — fallback booking root
+    const refCheckOut = subRoom?.checkOut ?? activeBooking.checkOut
     const now = new Date()
-    if (now >= new Date(activeBooking.checkOut)) return 'checkout'
+    if (refCheckOut && now >= new Date(refCheckOut)) return 'occupied'
+    // ⭐ NOTE: trả 'occupied' luôn (không trả 'checkout') — FE sẽ tự classify
+    //   thành 'overdue' (Chưa đi) khi now > checkOut.
+    //   Lý do: trạng thái phòng vẫn là "Có khách" / "Đang ở", chỉ là quá giờ.
+    //   FE extStatus() phân biệt: occupied + now>checkOut → 'overdue'
     return 'occupied'
   }
 
@@ -67,14 +73,27 @@ const getAll = async (req, res, next) => {
     const roomIds = rooms.map(r => r._id)
     const now     = new Date()
 
-    // ⭐ Query CẢ root roomId + rooms[].roomId
+    // ⭐ FIX: Query 2 nhóm booking riêng để xử lý đúng overstay/overdue
+    //   1) checked_in: KHÔNG filter checkOut (để hiển thị "Chưa đi" khi quá giờ)
+    //   2) reserved/confirmed: filter checkOut >= now (để ẩn booking quá hạn không tới)
     const activeBookings = await Booking.find({
       $or: [
         { roomId:         { $in: roomIds } },
         { 'rooms.roomId': { $in: roomIds } },
       ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkOut: { $gte: now },
+      $and: [
+        {
+          $or: [
+            // Nhóm 1: đang ở (lấy hết, không cần checkOut filter)
+            { status: 'checked_in' },
+            // Nhóm 2: chưa nhận phòng (chỉ lấy booking chưa hết hạn)
+            {
+              status:   { $in: ['confirmed', 'reserved'] },
+              checkOut: { $gte: now },
+            },
+          ],
+        },
+      ],
     })
 
     // ⭐ Build map: roomId → { booking, subRoom }
@@ -180,14 +199,23 @@ const getOne = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy phòng' })
 
     const now = new Date()
-    // ⭐ Tìm booking trong cả root + rooms[]
+    // ⭐ FIX: Query giống getAll — checked_in không filter checkOut
     const activeBooking = await Booking.findOne({
       $or: [
         { roomId: room._id },
         { 'rooms.roomId': room._id },
       ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkOut: { $gte: now },
+      $and: [
+        {
+          $or: [
+            { status: 'checked_in' },
+            {
+              status:   { $in: ['confirmed', 'reserved'] },
+              checkOut: { $gte: now },
+            },
+          ],
+        },
+      ],
     }).sort({ status: -1, checkIn: 1 })
 
     let subRoom = null
@@ -249,15 +277,24 @@ const getAvailable = async (req, res, next) => {
       return res.json({ success: true, data: { data: available, total: available.length } })
     }
 
-    // Không có date → check tất cả booking active
+    // ⭐ FIX: Không có date → check booking active (checked_in lấy hết, reserved/confirmed lấy chưa hết hạn)
     const now = new Date()
     const activeBookings = await Booking.find({
       $or: [
         { roomId:         { $in: roomIds } },
         { 'rooms.roomId': { $in: roomIds } },
       ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkOut: { $gte: now },
+      $and: [
+        {
+          $or: [
+            { status: 'checked_in' },
+            {
+              status:   { $in: ['confirmed', 'reserved'] },
+              checkOut: { $gte: now },
+            },
+          ],
+        },
+      ],
     })
 
     const occupiedIds = new Set()

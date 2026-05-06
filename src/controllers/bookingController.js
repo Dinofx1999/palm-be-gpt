@@ -4,9 +4,108 @@ const Customer     = require('../models/Customer');
 const Invoice      = require('../models/Invoice');
 const Branch       = require('../models/Branch');
 const PricePolicy  = require('../models/PricePolicy');
+const AuditLog     = require('../models/AuditLog');
 const { calculatePrice } = require('../utils/priceCalculator');
 const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
+
+// ⭐ NEW: Role guard cho undo check-in/check-out
+//   Chỉ Admin + Manager mới được phép hoàn tác
+//   Defense in depth: dù FE đã ẩn button, BE vẫn validate
+//   ⭐ Role names theo Mongoose User schema enum: 'Admin' | 'Manager' | 'Receptionist' | 'Staff'
+const ALLOWED_UNDO_ROLES = ['Admin', 'Manager']
+
+// ⭐ NEW: Roles được phép set atTime/actualCheckOut quá khứ với BẤT KỲ phòng nào
+//   Roles khác chỉ được phép nếu phòng ĐÃ TỪNG checkout (audit log có action 'checkout' / 'checkout_room')
+const PRIVILEGED_PAST_ROLES = ['Admin', 'Manager']
+
+const checkUndoPermission = (user) => {
+  if (!user) {
+    return {
+      ok: false,
+      status: 401,
+      code: 'UNAUTHENTICATED',
+      message: 'Cần đăng nhập để hoàn tác',
+    }
+  }
+  if (!ALLOWED_UNDO_ROLES.includes(user.role)) {
+    return {
+      ok: false,
+      status: 403,
+      code: 'FORBIDDEN_ROLE',
+      message: `Chỉ Admin/Manager mới được quyền hoàn tác (vai trò hiện tại: ${user.role || 'unknown'})`,
+    }
+  }
+  return { ok: true }
+}
+
+// ⭐ NEW: Lấy log checkout gần nhất của 1 booking (qua audit log)
+//   - Nếu có roomNumber: chỉ check phòng đó (cho per-room trong đoàn)
+//   - Nếu không: check booking đơn (action='checkout')
+//   Trả về log object hoặc null
+//   Dùng cho phân quyền + lấy giờ actualCheckOut cũ để hiển thị read-only cho Receptionist
+const getLastCheckoutLog = async (bookingId, roomNumber = null) => {
+  try {
+    const filter = {
+      entityType: 'Booking',
+      entityId:   bookingId,
+      action:     { $in: ['checkout', 'checkout_room'] },
+    }
+    // Nếu là per-room → match metadata.roomNumber chính xác
+    if (roomNumber) {
+      filter['metadata.roomNumber'] = String(roomNumber)
+    }
+    // Lấy log mới nhất (createdAt desc)
+    const log = await AuditLog.findOne(filter)
+      .sort({ createdAt: -1 })
+      .select('_id createdAt action metadata')
+      .lean()
+    return log ?? null
+  } catch (err) {
+    console.error('[getLastCheckoutLog] error:', err.message)
+    // Lỗi DB → fail-safe: trả null (không cho set quá khứ nếu không verify được)
+    return null
+  }
+}
+
+// Wrapper giữ API cũ — true nếu có log
+const hasBookingBeenCheckedOut = async (bookingId, roomNumber = null) => {
+  const log = await getLastCheckoutLog(bookingId, roomNumber)
+  return !!log
+}
+
+// ⭐ NEW: Tổng hợp logic phân quyền "set giờ quá khứ"
+//   Trả về { canSetPast, reason, lastCheckoutAt }
+//   - reason: chỉ có khi canSetPast = false
+//   - lastCheckoutAt: giờ actualCheckOut cũ (lấy từ audit log) — dùng cho Receptionist read-only
+const canSetPastTime = async (user, bookingId, roomNumber = null) => {
+  if (!user) {
+    return { canSetPast: false, reason: 'Cần đăng nhập', lastCheckoutAt: null }
+  }
+  // Admin/Manager: luôn được
+  if (PRIVILEGED_PAST_ROLES.includes(user.role)) {
+    // Vẫn lấy lastCheckoutAt nếu có — FE có thể dùng làm hint (default value)
+    const log = await getLastCheckoutLog(bookingId, roomNumber)
+    return {
+      canSetPast: true,
+      lastCheckoutAt: log?.metadata?.actualCheckOut ?? null,
+    }
+  }
+  // Khác: chỉ được nếu phòng đã từng checkout
+  const log = await getLastCheckoutLog(bookingId, roomNumber)
+  if (log) {
+    return {
+      canSetPast: true,
+      // ⭐ Lấy giờ actualCheckOut cũ để FE fill vào DateTimePicker (read-only cho Receptionist)
+      lastCheckoutAt: log.metadata?.actualCheckOut ?? null,
+    }
+  }
+  return {
+    canSetPast: false,
+    reason: 'Chỉ Admin/Manager được phép set giờ trả phòng quá khứ. Nhân viên chỉ được sửa nếu phòng đã từng trả phòng (đã từng checkout).',
+    lastCheckoutAt: null,
+  }
+}
 
 // ── GET ALL ───────────────────────────────────────────
 const getAll = async (req, res, next) => {
@@ -27,6 +126,78 @@ const getAll = async (req, res, next) => {
 
     res.json({ success: true, data: { data, total, page: +page, limit: +limit } })
   } catch (err) { next(err) }
+}
+
+// ⭐ NEW: Helper build invoice items từ priceBreakdown thực tế.
+//   - Single booking: lấy từ booking.priceBreakdown
+//   - Group: gộp tất cả booking.rooms[].priceBreakdown (bỏ phòng cancelled)
+//   Mỗi segment trong breakdown = 1 dòng item trong invoice → đúng nhất với giờ checkout thực tế.
+//   Format: 'Phòng {roomNumber} – {label segment}' (vd: 'Phòng 201 – Giá ngày (06/05 21:17 - 07/05 12:00)')
+const buildInvoiceItemsFromBooking = (booking) => {
+  const items = []
+  const isGroup = Array.isArray(booking.rooms) && booking.rooms.length > 0
+
+  if (isGroup) {
+    // Group: gộp breakdown từ tất cả sub-rooms (bỏ cancelled)
+    for (const sub of booking.rooms) {
+      if (sub.status === 'cancelled') continue
+      const subBd = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
+      for (const b of subBd) {
+        const seg = (b && typeof b.toObject === 'function') ? b.toObject() : b
+        // Label đã có "[201] ..." prefix → chuẩn hoá lại
+        const rawLabel = String(seg.label ?? '').trim()
+        const cleanLabel = rawLabel.replace(/^\[[^\]]+\]\s*/, '') // bỏ prefix [201]
+        items.push({
+          description: `Phòng ${sub.roomNumber} – ${cleanLabel}`,
+          quantity:    1,
+          unitPrice:   Number(seg.amount ?? 0),
+          amount:      Number(seg.amount ?? 0),
+        })
+      }
+      // Services của sub-room (nếu có)
+      if ((sub.servicesAmount ?? 0) > 0) {
+        items.push({
+          description: `Phòng ${sub.roomNumber} – Dịch vụ`,
+          quantity:    1,
+          unitPrice:   Number(sub.servicesAmount ?? 0),
+          amount:      Number(sub.servicesAmount ?? 0),
+        })
+      }
+    }
+  } else {
+    // Single booking
+    const bd = Array.isArray(booking.priceBreakdown) ? booking.priceBreakdown : []
+    for (const b of bd) {
+      const seg = (b && typeof b.toObject === 'function') ? b.toObject() : b
+      items.push({
+        description: `Phòng ${booking.roomNumber} – ${String(seg.label ?? '').trim()}`,
+        quantity:    1,
+        unitPrice:   Number(seg.amount ?? 0),
+        amount:      Number(seg.amount ?? 0),
+      })
+    }
+    // Services
+    if ((booking.servicesAmount ?? 0) > 0) {
+      items.push({
+        description: `Dịch vụ`,
+        quantity:    1,
+        unitPrice:   Number(booking.servicesAmount ?? 0),
+        amount:      Number(booking.servicesAmount ?? 0),
+      })
+    }
+  }
+
+  // Fallback nếu không có breakdown (booking cũ): 1 dòng tổng
+  if (items.length === 0) {
+    items.push({
+      description: `Phòng ${booking.roomNumber} – ${booking.roomType ?? ''} × ${booking.nights ?? 1} đêm`,
+      quantity:    booking.nights ?? 1,
+      unitPrice:   Math.round((booking.roomAmount ?? 0) / Math.max(1, booking.nights ?? 1)),
+      amount:      booking.roomAmount ?? 0,
+    })
+  }
+
+  return items
 }
 
 const getOne = async (req, res, next) => {
@@ -57,39 +228,40 @@ const previewPrice = async (req, res, next) => {
     let policy = policyId ? await PricePolicy.findById(policyId) : null
     if (!policy) policy = await PricePolicy.findOne({ roomTypeId: room.typeId, branchId: room.branchId, isActive: true })
 
-    const capacity = room.typeId?.capacity ?? 2
+    const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
+
+    const maxChildren = room.typeId?.maxChildren ?? 0
 
     const result = calculatePrice({
-  checkIn:  new Date(checkIn),
-  checkOut: new Date(checkOut),
-  priceType, policy, branch, adults, children, capacity,
-})
+      checkIn:  new Date(checkIn),
+      checkOut: new Date(checkOut),
+      priceType, policy, branch, adults, children, maxAdults, maxChildren,
+    })
 
-// ⭐ NEW: Trả 400 nếu policy không enable loại giá user yêu cầu
-if (result.error) {
-  console.log('⚠️ Returning 400 BAD_REQUEST due to PRICE_TYPE_NOT_ENABLED')
-  return res.status(400).json({
-    success: false,
-    code:    result.error.code,
-    message: result.error.message,
-    data: {
-      finalPriceType:  result.error.finalPriceType,
-      availableTypes:  result.error.availableTypes,
-      availableLabels: result.error.availableLabels,
-      policyName:      policy?.name ?? '',
-    },
-  })
-}
+    // ⭐ NEW: Trả 400 nếu policy không enable loại giá user yêu cầu
+    if (result.error) {
+      return res.status(400).json({
+        success: false,
+        code:    result.error.code,
+        message: result.error.message,
+        data: {
+          finalPriceType:  result.error.finalPriceType,
+          availableTypes:  result.error.availableTypes,
+          availableLabels: result.error.availableLabels,
+          policyName:      policy?.name ?? '',
+        },
+      })
+    }
 
-res.json({
-  success: true,
-  data: {
-    ...result,
-    totalAmount: result.roomAmount,
-    policyId:    policy?._id ?? null,
-    policyName:  policy?.name ?? '',
-  },
-})
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        totalAmount: result.roomAmount,   // alias cho FE dễ dùng
+        policyId:    policy?._id ?? null,
+        policyName:  policy?.name ?? '',
+      },
+    })
   } catch (err) { next(err) }
 }
 
@@ -150,13 +322,15 @@ const create = async (req, res, next) => {
     let policy = policyId ? await PricePolicy.findById(policyId) : null
     if (!policy) policy = await PricePolicy.findOne({ roomTypeId: room.typeId, branchId: room.branchId, isActive: true })
 
-    const capacity = room.typeId?.capacity ?? 2
+    const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
+
+    const maxChildren = room.typeId?.maxChildren ?? 0
 
     // ⭐ Tính giá qua helper
     const priceResult = calculatePrice({
       checkIn:  checkInFinal,
       checkOut: checkOutFinal,
-      priceType, policy, branch, adults, children, capacity,
+      priceType, policy, branch, adults, children, maxAdults, maxChildren,
     })
 
     // ⭐ NEW: Trả 400 nếu policy không enable loại giá user yêu cầu
@@ -347,12 +521,13 @@ const changeDates = async (req, res, next) => {
     const room   = await Room.findById(booking.roomId).populate('typeId')
     const branch = await Branch.findById(booking.branchId)
     const policy = booking.policyId ? await PricePolicy.findById(booking.policyId) : null
-    const capacity = room?.typeId?.capacity ?? 2
+    const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+    const maxChildren = room?.typeId?.maxChildren ?? 0
 
     const priceResult = calculatePrice({
       checkIn: newCheckIn, checkOut: newCheckOut,
       priceType: booking.priceType, policy, branch,
-      adults: booking.adults, children: booking.children, capacity,
+      adults: booking.adults, children: booking.children, maxAdults, maxChildren,
     })
 
     // ⭐ NEW: Trả 400 nếu policy không enable loại giá
@@ -476,7 +651,8 @@ const changeDatesRoom = async (req, res, next) => {
     const policy = subRoom.policyId ? await PricePolicy.findById(subRoom.policyId)
                   : booking.policyId ? await PricePolicy.findById(booking.policyId)
                   : null
-    const capacity = room?.typeId?.capacity ?? 2
+    const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+    const maxChildren = room?.typeId?.maxChildren ?? 0
 
     const priceResult = calculatePrice({
       checkIn:   newCheckIn,
@@ -485,7 +661,7 @@ const changeDatesRoom = async (req, res, next) => {
       policy, branch,
       adults:    subRoom.adults    ?? booking.adults,
       children:  subRoom.children  ?? booking.children,
-      capacity,
+      maxAdults, maxChildren,
     })
 
     // ⭐ NEW: Trả 400 nếu policy không enable loại giá
@@ -701,7 +877,8 @@ const moveRoom = async (req, res, next) => {
 
       const branch      = await Branch.findById(booking.branchId)
       const splitAt     = transferAt ? new Date(transferAt) : new Date()
-      const newCapacity = newRoom.typeId?.capacity ?? 2
+      const newMaxAdults   = newRoom.typeId?.maxAdults   ?? newRoom.typeId?.capacity ?? 2
+      const newMaxChildren = newRoom.typeId?.maxChildren ?? 0
 
       let oldPolicy = null
       const snap = sourcePolicySnapshot
@@ -718,7 +895,8 @@ const moveRoom = async (req, res, next) => {
         console.log('[moveRoom] ⚠️ seg1 no oldPolicy → pro-rata fallback')
       }
 
-      const oldCapacity = snap?.capacity ?? oldRoom?.typeId?.capacity ?? 2
+      const oldMaxAdults   = snap?.maxAdults   ?? oldRoom?.typeId?.maxAdults   ?? snap?.capacity ?? oldRoom?.typeId?.capacity ?? 2
+      const oldMaxChildren = snap?.maxChildren ?? oldRoom?.typeId?.maxChildren ?? 0
 
       let resultAmount = 0
       let resultBreakdown = []
@@ -732,7 +910,7 @@ const moveRoom = async (req, res, next) => {
           policy:    newPolicy, branch,
           adults:    sourceAdults,
           children:  sourceChildren,
-          capacity:  newCapacity,
+          maxAdults: newMaxAdults, maxChildren: newMaxChildren,
         })
         resultAmount    = result.roomAmount
         resultBreakdown = (result.breakdown ?? []).map(b => ({
@@ -755,7 +933,7 @@ const moveRoom = async (req, res, next) => {
             policy:    oldPolicy, branch,
             adults:    sourceAdults,
             children:  sourceChildren,
-            capacity:  oldCapacity,
+            maxAdults: oldMaxAdults, maxChildren: oldMaxChildren,
           })
           const filteredBreakdown = (seg1Result.breakdown ?? []).filter(b => {
             const label = String(b.label || '')
@@ -801,7 +979,7 @@ const moveRoom = async (req, res, next) => {
           policy:    newPolicy, branch,
           adults:    sourceAdults,
           children:  sourceChildren,
-          capacity:  newCapacity,
+          maxAdults: newMaxAdults, maxChildren: newMaxChildren,
         })
         const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
           const label = String(b.label || '')
@@ -823,7 +1001,8 @@ const moveRoom = async (req, res, next) => {
         priceBreakdown: resultBreakdown,
         usedSplit,
         newPolicy,
-        newCapacity,
+        newMaxAdults,
+        newMaxChildren,
       }
     }
 
@@ -1021,7 +1200,8 @@ const moveRoom = async (req, res, next) => {
       usedTransferAt    = recalc.usedSplit
       booking.policyId       = recalc.newPolicy._id
       booking.policyName     = recalc.newPolicy.name
-      booking.policySnapshot = buildPolicySnapshot(recalc.newPolicy, recalc.newCapacity)
+      // ⭐ Snapshot dùng total = maxAdults + maxChildren cho backward compat
+      booking.policySnapshot = buildPolicySnapshot(recalc.newPolicy, (recalc.newMaxAdults ?? 0) + (recalc.newMaxChildren ?? 0))
       policyChanged          = true
     }
 
@@ -1161,7 +1341,8 @@ const changePolicy = async (req, res, next) => {
       if (!policy) return res.status(404).json({ success: false, message: 'Không tìm thấy chính sách giá' })
       const room    = await Room.findById(booking.roomId).populate('typeId')
       const branch  = await Branch.findById(booking.branchId)
-      const capacity = room?.typeId?.capacity ?? 2
+      const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+      const maxChildren = room?.typeId?.maxChildren ?? 0
 
       const result = calculatePrice({
         checkIn:   booking.checkIn,
@@ -1170,7 +1351,7 @@ const changePolicy = async (req, res, next) => {
         policy, branch,
         adults:    booking.adults,
         children:  booking.children,
-        capacity,
+        maxAdults, maxChildren,
       })
 
       // ⭐ NEW: Trả 400 nếu policy mới không enable loại giá hiện tại của booking
@@ -1370,6 +1551,23 @@ const checkout = async (req, res, next) => {
 
     const actualCO = actualCheckOut ? new Date(actualCheckOut) : new Date()
 
+    // ⭐ NEW: Guard quyền checkout với giờ quá khứ
+    //   Admin/Manager bypass; user khác chỉ cho nếu booking đã từng checkout
+    if (actualCheckOut) {
+      const now = new Date()
+      if (actualCO.getTime() < now.getTime() - 60000) {
+        const perm = await canSetPastTime(req.user, booking._id, null)
+        if (!perm.canSetPast) {
+          return res.status(403).json({
+            success: false,
+            code:    'FORBIDDEN_PAST_CHECKOUT',
+            message: perm.reason,
+            data: { userRole: req.user?.role ?? null, actualCheckOut },
+          })
+        }
+      }
+    }
+
     const refCheckIn = booking.actualCheckIn ?? booking.checkIn
     if (refCheckIn && actualCO < new Date(refCheckIn)) {
       return res.status(400).json({
@@ -1494,7 +1692,8 @@ const checkout = async (req, res, next) => {
         const room   = await Room.findById(booking.roomId).populate('typeId')
         const branch = await Branch.findById(booking.branchId)
         const policy = booking.policyId ? await PricePolicy.findById(booking.policyId) : null
-        const capacity = room?.typeId?.capacity ?? 2
+        const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+        const maxChildren = room?.typeId?.maxChildren ?? 0
 
         const priceResult = calculatePrice({
           checkIn:   booking.actualCheckIn ?? booking.checkIn,
@@ -1503,7 +1702,7 @@ const checkout = async (req, res, next) => {
           policy, branch,
           adults:    booking.adults,
           children:  booking.children,
-          capacity,
+          maxAdults, maxChildren,
         })
 
         // ⭐ NOTE: KHÔNG block checkout vì priceResult.error
@@ -1532,6 +1731,73 @@ const checkout = async (req, res, next) => {
       }
     }
 
+    // ⭐ NEW: Recalc TẤT CẢ sub-rooms (group booking) theo giờ checkout thực tế
+    //   Lý do: nếu là đoàn, mỗi sub-room phải recalc riêng với giờ checkout = actualCO
+    //   để priceBreakdown reflect đúng thực tế. Sau đó booking.roomAmount = sum(rooms.roomAmount).
+    if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
+      try {
+        const branch = await Branch.findById(booking.branchId)
+        let groupRoomTotal = 0
+
+        for (const sub of booking.rooms) {
+          // Bỏ qua phòng đã checkout trước đó (giữ nguyên priceBreakdown đã chốt)
+          // và phòng cancelled
+          if (sub.status === 'checked_out' || sub.status === 'cancelled') {
+            groupRoomTotal += sub.roomAmount ?? 0
+            continue
+          }
+
+          // Recalc cho sub-room đang ở (sẽ checkout cùng lúc)
+          const room   = await Room.findById(sub.roomId).populate('typeId')
+          const policy = sub.policyId ? await PricePolicy.findById(sub.policyId) : null
+          const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+          const maxChildren = room?.typeId?.maxChildren ?? 0
+
+          const subPriceResult = calculatePrice({
+            checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
+            checkOut:  actualCO,
+            priceType: sub.priceType ?? booking.priceType,
+            policy, branch,
+            adults:    sub.adults   ?? booking.adults,
+            children:  sub.children ?? booking.children,
+            maxAdults, maxChildren,
+          })
+
+          if (subPriceResult.error) {
+            console.warn(`[checkout][group] Recalc skipped for room ${sub.roomNumber}:`, subPriceResult.error.message)
+            groupRoomTotal += sub.roomAmount ?? 0
+            continue
+          }
+
+          // Update sub-room
+          sub.roomAmount     = subPriceResult.roomAmount
+          sub.nights         = subPriceResult.nights
+          sub.priceBreakdown = (subPriceResult.breakdown ?? []).map(b => ({
+            label:  String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, ''),
+            amount: Number(b.amount ?? 0),
+            type:   b.type === 'surcharge' ? 'surcharge' : 'base',
+            meta:   { ...(b.meta || {}), roomNumber: sub.roomNumber },
+          })).map(item => ({
+            ...item,
+            label: `[${sub.roomNumber}] ${item.label}`,
+          }))
+
+          groupRoomTotal += sub.roomAmount
+
+          console.log(`[checkout][group] Recalc room ${sub.roomNumber}: ${sub.nights} đêm = ${sub.roomAmount}đ`)
+        }
+
+        // Recalc booking.totalAmount cho group
+        booking.roomAmount = groupRoomTotal
+        const subtotal = groupRoomTotal + (booking.servicesAmount ?? 0)
+        const pctDisc  = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
+        booking.discount    = pctDisc + (booking.discountAmount ?? 0)
+        booking.totalAmount = Math.max(0, subtotal - booking.discount)
+      } catch (groupErr) {
+        console.error('[checkout][group] Recalc failed:', groupErr)
+      }
+    }
+
     const existingInvoice = await Invoice.findOne({ bookingId: booking._id })
     const newTotal = booking.totalAmount ?? 0
     const invPaid  = existingInvoice?.paidAmount ?? 0
@@ -1556,6 +1822,15 @@ const checkout = async (req, res, next) => {
         }
       }
     }
+
+    // ⭐ NEW: Sync booking.paymentStatus với invoice (booking-list hiển thị field này)
+    {
+      const invForStatus = await Invoice.findOne({ bookingId: booking._id })
+      const paid = invForStatus?.paidAmount ?? 0
+      booking.paymentStatus = paid >= booking.totalAmount ? 'paid' :
+                              paid > 0 ? 'partial' : 'unpaid'
+    }
+
     await booking.save()
 
     const roomIdsToCleaning = []
@@ -1582,6 +1857,9 @@ const checkout = async (req, res, next) => {
     }
 
     let invoice = await Invoice.findOne({ bookingId: booking._id })
+    // ⭐ NEW: Rebuild items từ priceBreakdown thực tế (mỗi segment 1 dòng)
+    const newItems = buildInvoiceItemsFromBooking(booking)
+
     if (!invoice) {
       invoice = await Invoice.create({
         bookingId:       booking._id,
@@ -1594,12 +1872,8 @@ const checkout = async (req, res, next) => {
         totalAmount:     booking.totalAmount,
         remainingAmount: booking.totalAmount,
         issuedBy:        req.user?.id,
-        items: [{
-          description: `Phòng ${booking.roomNumber} – ${booking.roomType} × ${booking.nights} đêm`,
-          quantity:    booking.nights,
-          unitPrice:   Math.round(booking.roomAmount / Math.max(1, booking.nights)),
-          amount:      booking.roomAmount,
-        }],
+        items:           newItems,
+        branchId:        booking.branchId,
       })
     } else {
       invoice.roomAmount      = booking.roomAmount
@@ -1609,6 +1883,10 @@ const checkout = async (req, res, next) => {
       invoice.remainingAmount = Math.max(0, booking.totalAmount - (invoice.paidAmount ?? 0))
       invoice.paymentStatus   = invoice.paidAmount >= booking.totalAmount ? 'paid' :
                                 invoice.paidAmount > 0 ? 'partial' : 'unpaid'
+      // ⭐ NEW: Cập nhật items theo breakdown thực tế
+      invoice.items   = newItems
+      // ⭐ NEW: Backfill branchId nếu invoice cũ chưa có
+      if (!invoice.branchId && booking.branchId) invoice.branchId = booking.branchId
       await invoice.save()
     }
 
@@ -1652,6 +1930,27 @@ const checkoutRoom = async (req, res, next) => {
 
     const actualCO = actualCheckOut ? new Date(actualCheckOut) : new Date()
     console.log(`[checkoutRoom] booking=${booking._id} room=${sub.roomNumber} body.actualCheckOut=${actualCheckOut} → actualCO=${actualCO.toISOString()}`)
+
+    // ⭐ NEW: Guard quyền checkout với giờ quá khứ (per-room)
+    //   Admin/Manager bypass; user khác chỉ cho nếu phòng này đã từng checkout
+    if (actualCheckOut) {
+      const now = new Date()
+      if (actualCO.getTime() < now.getTime() - 60000) {
+        const perm = await canSetPastTime(req.user, booking._id, sub.roomNumber)
+        if (!perm.canSetPast) {
+          return res.status(403).json({
+            success: false,
+            code:    'FORBIDDEN_PAST_CHECKOUT',
+            message: perm.reason,
+            data: {
+              userRole: req.user?.role ?? null,
+              actualCheckOut,
+              roomNumber: sub.roomNumber,
+            },
+          })
+        }
+      }
+    }
 
     const refCheckIn = sub.actualCheckIn ?? sub.checkIn ?? booking.actualCheckIn ?? booking.checkIn
     if (refCheckIn && actualCO < new Date(refCheckIn)) {
@@ -1705,7 +2004,8 @@ const checkoutRoom = async (req, res, next) => {
         const room   = await Room.findById(sub.roomId).populate('typeId')
         const branch = await Branch.findById(booking.branchId)
         const policy = sub.policyId ? await PricePolicy.findById(sub.policyId) : null
-        const capacity = room?.typeId?.capacity ?? 2
+        const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+        const maxChildren = room?.typeId?.maxChildren ?? 0
 
         const priceResult = calculatePrice({
           checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
@@ -1714,7 +2014,7 @@ const checkoutRoom = async (req, res, next) => {
           policy, branch,
           adults:    sub.adults   ?? booking.adults,
           children:  sub.children ?? booking.children,
-          capacity,
+          maxAdults, maxChildren,
         })
 
         // ⭐ NOTE: KHÔNG block checkout vì priceResult.error (tương tự checkout đơn)
@@ -1743,7 +2043,7 @@ const checkoutRoom = async (req, res, next) => {
               policy, branch,
               adults:    sub.adults   ?? booking.adults,
               children:  sub.children ?? booking.children,
-              capacity,
+              maxAdults, maxChildren,
             })
             const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
             const seg2Items  = (seg2Result.breakdown ?? []).map(b => ({
@@ -1852,6 +2152,10 @@ const checkoutRoom = async (req, res, next) => {
       booking.actualCheckOut = actualCO
     }
 
+    // ⭐ NEW: Sync booking.paymentStatus (booking-list hiển thị field này, KHÔNG phải invoice.paymentStatus)
+    booking.paymentStatus = paidAmount >= booking.totalAmount ? 'paid' :
+                            paidAmount > 0 ? 'partial' : 'unpaid'
+
     await booking.save()
 
     if (invoice) {
@@ -1862,6 +2166,10 @@ const checkoutRoom = async (req, res, next) => {
       invoice.remainingAmount = Math.max(0, booking.totalAmount - paidAmount)
       invoice.paymentStatus   = paidAmount >= booking.totalAmount ? 'paid' :
                                 paidAmount > 0 ? 'partial' : 'unpaid'
+      // ⭐ NEW: Rebuild items từ all sub-rooms breakdown (gộp các phòng đã + đang checkout)
+      invoice.items   = buildInvoiceItemsFromBooking(booking)
+      // ⭐ NEW: Backfill branchId nếu invoice cũ chưa có
+      if (!invoice.branchId && booking.branchId) invoice.branchId = booking.branchId
       await invoice.save()
     } else if (allCheckedOut) {
       invoice = await Invoice.create({
@@ -1876,6 +2184,8 @@ const checkoutRoom = async (req, res, next) => {
         remainingAmount: Math.max(0, booking.totalAmount - paidAmount),
         paidAmount:      paidAmount,
         issuedBy:        req.user?.id,
+        items:           buildInvoiceItemsFromBooking(booking),
+        branchId:        booking.branchId,
       })
     }
 
@@ -1938,6 +2248,16 @@ const cancel = async (req, res, next) => {
 
 const undo = async (req, res, next) => {
   try {
+    // ⭐ Role guard — chỉ admin/manager được hoàn tác
+    const perm = checkUndoPermission(req.user)
+    if (!perm.ok) {
+      return res.status(perm.status).json({
+        success: false,
+        code:    perm.code,
+        message: perm.message,
+      })
+    }
+
     const { reason } = req.body
     if (!reason) return res.status(400).json({ success: false, message: 'Cần nhập lý do hoàn tác' })
 
@@ -1972,7 +2292,11 @@ const undo = async (req, res, next) => {
       action: 'undo',
       description: `Hoàn tác (${reason})`,
       user: req.user, branchId: booking.branchId,
-      metadata: { reason, newStatus, roomNumber: booking.roomNumber },
+      metadata: {
+        reason, newStatus, roomNumber: booking.roomNumber,
+        // ⭐ NEW: log thêm role để trace ai làm action này
+        actorRole: req.user.role,
+      },
     })
 
     res.json({ success: true, message: 'Hoàn tác thành công', data: { booking } })
@@ -1981,6 +2305,16 @@ const undo = async (req, res, next) => {
 
 const undoRoom = async (req, res, next) => {
   try {
+    // ⭐ Role guard — chỉ admin/manager được hoàn tác
+    const perm = checkUndoPermission(req.user)
+    if (!perm.ok) {
+      return res.status(perm.status).json({
+        success: false,
+        code:    perm.code,
+        message: perm.message,
+      })
+    }
+
     const { roomId, reason } = req.body
     if (!reason) return res.status(400).json({ success: false, message: 'Cần nhập lý do hoàn tác' })
     if (!roomId)  return res.status(400).json({ success: false, message: 'Thiếu roomId' })
@@ -2036,7 +2370,11 @@ const undoRoom = async (req, res, next) => {
       action: 'undo',
       description: `Hoàn tác phòng ${sub.roomNumber}: ${prevStatus} → ${newSubStatus} (${reason})`,
       user: req.user, branchId: booking.branchId,
-      metadata: { reason, roomId, roomNumber: sub.roomNumber, prevStatus, newSubStatus, bookingId: booking._id },
+      metadata: {
+        reason, roomId, roomNumber: sub.roomNumber, prevStatus, newSubStatus, bookingId: booking._id,
+        // ⭐ NEW: log thêm role để trace ai làm action này
+        actorRole: req.user.role,
+      },
     })
 
     res.json({ success: true, message: `Đã hoàn tác phòng ${sub.roomNumber}`, data: { booking } })
@@ -2146,6 +2484,38 @@ const calculateBill = async (req, res, next) => {
     const booking = await Booking.findById(req.params.id)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
+    // ⭐ NEW: Guard quyền set atTime quá khứ
+    //   - Admin/Manager: bypass
+    //   - Khác: chỉ cho nếu phòng đã từng checkout (qua audit log)
+    if (atTime) {
+      const atTimeDate = new Date(atTime)
+      const now = new Date()
+      // Cho phép sai số 1 phút (avoid race condition khi user click ngay)
+      if (atTimeDate.getTime() < now.getTime() - 60000) {
+        // Lấy roomNumber để check audit per-room (nếu là phòng đoàn được filter)
+        let roomNumberForAudit = null
+        if (filterRoomId) {
+          const sub = (booking.rooms ?? []).find(r =>
+            String(r.roomId?._id ?? r.roomId) === String(filterRoomId)
+          )
+          if (sub) roomNumberForAudit = sub.roomNumber
+        }
+        const perm = await canSetPastTime(req.user, booking._id, roomNumberForAudit)
+        if (!perm.canSetPast) {
+          return res.status(403).json({
+            success: false,
+            code:    'FORBIDDEN_PAST_CHECKOUT',
+            message: perm.reason,
+            data: {
+              userRole:   req.user?.role ?? null,
+              atTime,
+              roomNumber: roomNumberForAudit,
+            },
+          })
+        }
+      }
+    }
+
     const branch = await Branch.findById(booking.branchId)
 
     const effectiveCheckIn = booking.actualCheckIn ?? booking.checkIn
@@ -2173,7 +2543,8 @@ const calculateBill = async (req, res, next) => {
 
         const room   = await Room.findById(sr.roomId).populate('typeId')
         const policy = sr.policyId ? await PricePolicy.findById(sr.policyId) : null
-        const capacity = room?.typeId?.capacity ?? 2
+        const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+        const maxChildren = room?.typeId?.maxChildren ?? 0
 
         let subPriceResult
         if (sr.status === 'checked_out') {
@@ -2212,7 +2583,7 @@ const calculateBill = async (req, res, next) => {
               policy, branch,
               adults:    sr.adults   ?? booking.adults,
               children:  sr.children ?? booking.children,
-              capacity,
+              maxAdults, maxChildren,
             })
             const seg2Items = (seg2Result.breakdown ?? []).map(b => ({
               ...b,
@@ -2244,7 +2615,7 @@ const calculateBill = async (req, res, next) => {
               policy, branch,
               adults:    sr.adults   ?? booking.adults,
               children:  sr.children ?? booking.children,
-              capacity,
+              maxAdults, maxChildren,
             })
           }
         }
@@ -2394,7 +2765,8 @@ const calculateBill = async (req, res, next) => {
 
     const room   = await Room.findById(booking.roomId).populate('typeId')
     const policy = booking.policyId ? await PricePolicy.findById(booking.policyId) : null
-    const capacity = room?.typeId?.capacity ?? 2
+    const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+    const maxChildren = room?.typeId?.maxChildren ?? 0
 
     const hasCustomPrice = (booking.priceBreakdown ?? []).some(b => b.meta?.customPrice === true)
 
@@ -2502,7 +2874,7 @@ const calculateBill = async (req, res, next) => {
           policy, branch,
           adults:    booking.adults,
           children:  booking.children,
-          capacity,
+          maxAdults, maxChildren,
         })
       } else {
         const lastTransferAt = new Date(lastTransfer.transferAt)
@@ -2517,7 +2889,7 @@ const calculateBill = async (req, res, next) => {
           policy, branch,
           adults:    booking.adults,
           children:  booking.children,
-          capacity,
+          maxAdults, maxChildren,
         })
         const seg2Items = (seg2Result.breakdown ?? []).map(b => ({
           ...b,
@@ -2542,7 +2914,7 @@ const calculateBill = async (req, res, next) => {
         policy, branch,
         adults:    booking.adults,
         children:  booking.children,
-        capacity,
+        maxAdults, maxChildren,
       })
     }
 
@@ -2688,12 +3060,13 @@ const getAvailableByType = async (req, res, next) => {
     allRooms.forEach(room => {
       const typeId   = String(room.typeId?._id ?? '')
       const typeName = room.typeId?.name ?? room.typeName ?? '—'
-      const capacity = room.typeId?.capacity ?? 2
+      const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
+      const maxChildren = room.typeId?.maxChildren ?? 0
       const isAvailable = !bookedRoomIds.has(String(room._id))
 
       if (!typeMap.has(typeId)) {
         typeMap.set(typeId, {
-          typeId, typeName, capacity,
+          typeId, typeName, maxAdults, maxChildren,
           totalRooms:     0,
           availableRooms: 0,
           rooms: [],
@@ -2707,7 +3080,7 @@ const getAvailableByType = async (req, res, next) => {
         number:    room.number,
         typeName,
         typeId,
-        capacity,
+        maxAdults, maxChildren,
         available: isAvailable,
       })
     })
@@ -2746,7 +3119,8 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
       policy, branch,
       adults:    r.adults ?? 2,
       children:  r.children ?? 0,
-      capacity:  room.typeId?.capacity ?? 2,
+      maxAdults:   room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2,
+      maxChildren: room.typeId?.maxChildren ?? 0,
     })
 
     // ⭐ NEW: Throw error nếu policy không enable loại giá user yêu cầu
@@ -2770,7 +3144,8 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
       roomNumber:       room.number,
       typeId:           room.typeId?._id ?? null,
       typeName:         room.typeName ?? room.typeId?.name ?? '',
-      capacity:         room.typeId?.capacity ?? 2,
+      maxAdults:   room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2,
+      maxChildren: room.typeId?.maxChildren ?? 0,
       adults:           r.adults ?? 2,
       children:         r.children ?? 0,
       policyId:         policy?._id ?? null,
@@ -2792,11 +3167,13 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
     const key = String(line.typeId ?? '_unknown')
     if (!byType.has(key)) {
       byType.set(key, {
-        typeId:     line.typeId,
-        typeName:   line.typeName,
-        capacity:   line.capacity,
-        rooms:      [],
-        subTotal:   0,
+        typeId:      line.typeId,
+        typeName:    line.typeName,
+        capacity:    line.capacity,           // legacy
+        maxAdults:   line.maxAdults,
+        maxChildren: line.maxChildren,
+        rooms:       [],
+        subTotal:    0,
       })
     }
     const entry = byType.get(key)
@@ -3030,6 +3407,49 @@ const createGroup = async (req, res, next) => {
   }
 }
 
+// ⭐ NEW: GET /bookings/:id/can-set-past?roomId=xxx
+//   Trả về quyền set giờ trả phòng quá khứ
+//   - Admin/Manager: luôn cho phép
+//   - Khác: chỉ cho phép nếu phòng đã từng checkout (qua audit log)
+//   FE dùng để ẩn/hiện checkbox "Cho phép trả phòng trong quá khứ"
+const getCanSetPast = async (req, res, next) => {
+  try {
+    const { roomId = null } = req.query
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+    }
+
+    // Nếu có roomId → tìm roomNumber tương ứng (cho per-room check)
+    let roomNumberForAudit = null
+    if (roomId && Array.isArray(booking.rooms)) {
+      const sub = booking.rooms.find(r =>
+        String(r.roomId?._id ?? r.roomId) === String(roomId)
+      )
+      if (sub) roomNumberForAudit = sub.roomNumber
+    }
+
+    const perm = await canSetPastTime(req.user, booking._id, roomNumberForAudit)
+    res.json({
+      success: true,
+      data: {
+        canSetPast: perm.canSetPast,
+        reason:     perm.reason ?? null,
+        userRole:   req.user?.role ?? null,
+        // Cho FE biết logic phía sau (debug)
+        isPrivilegedRole:  PRIVILEGED_PAST_ROLES.includes(req.user?.role),
+        roomNumber: roomNumberForAudit,
+        // ⭐ NEW: Giờ checkout cũ (lấy từ audit log) — FE dùng làm default value cho DateTimePicker
+        //         Receptionist sẽ thấy DateTimePicker disabled với giờ này
+        lastCheckoutAt: perm.lastCheckoutAt ?? null,
+      },
+    })
+  } catch (err) {
+    console.error('[getCanSetPast] error:', err)
+    next(err)
+  }
+}
+
 module.exports = {
   getAll, getOne, create, update,
   previewPrice, changeDates, changeDatesRoom, moveRoom,
@@ -3046,4 +3466,6 @@ module.exports = {
   checkinRoom,
   checkoutRoom,
   undoRoom,
+  // ⭐ NEW (permission check)
+  getCanSetPast,
 }

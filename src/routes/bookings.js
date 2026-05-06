@@ -13,11 +13,16 @@ const {
   checkinRoom,         // ⭐ NEW
   checkoutRoom,        // ⭐ NEW
   undoRoom,            // ⭐ NEW: undo 1 phòng trong đoàn
+  getCanSetPast,       // ⭐ NEW: check quyền set giờ trả phòng quá khứ
 } = require('../controllers/bookingController');
 
 router.get('/available-rooms',     authenticate, getAvailableByDate);
 router.get('/available-by-type',   authenticate, getAvailableByType);
 router.get('/',                    authenticate, getAll);
+
+// ⭐ NEW: Đặt TRƯỚC '/:id' để tránh conflict với getOne
+router.get('/:id/can-set-past',    authenticate, getCanSetPast);
+
 router.get('/:id',                 authenticate, getOne);
 router.post('/preview-price',      authenticate, previewPrice);
 router.post('/preview-group',      authenticate, previewGroup);
@@ -37,5 +42,4 @@ router.patch('/:id/checkout-room', authenticate, checkoutRoom);     // ⭐ NEW: 
 router.patch('/:id/cancel',        authenticate, cancel);
 router.patch('/:id/undo',          authenticate, authorize('Admin', 'Manager'), undo);
 router.patch('/:id/undo-room',     authenticate, authorize('Admin', 'Manager'), undoRoom);   // ⭐ NEW: undo 1 phòng trong đoàn
-
 module.exports = router;

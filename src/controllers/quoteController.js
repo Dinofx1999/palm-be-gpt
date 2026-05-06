@@ -29,6 +29,10 @@ const create = async (req, res, next) => {
         extraAdults: 0, extraChildren: 0,
       };
       let alternativeRooms = [];
+      // ⭐ NEW: Aggregated images cho mode 'by_type' (gộp ảnh từ tất cả phòng cùng loại)
+      let aggregatedImages = [];
+      // ⭐ NEW: Display mode cho line này (default: 'selected')
+      const displayMode = line.displayMode ?? 'selected';
 
       try {
         const roomDoc = await Room.findById(line.roomId).lean();
@@ -57,33 +61,76 @@ const create = async (req, res, next) => {
           }
         }
 
+        // ⭐ Mode 'with_alternatives' OR 'by_type' đều cần fetch phòng từ alternativeRoomIds
+        //   Khác biệt: mode 'with_alternatives' liệt kê ds phòng (cho khách thấy số),
+        //   mode 'by_type' chỉ gộp ảnh (KHÔNG liệt kê số phòng)
         if (Array.isArray(line.alternativeRoomIds) && line.alternativeRoomIds.length > 0) {
           const altRoomDocs = await Room.find({
             _id: { $in: line.alternativeRoomIds },
           }).lean();
 
-          const floorIds = [...new Set(altRoomDocs.map(r => String(r.floorId)).filter(Boolean))];
-          const floorDocs = await Floor.find({ _id: { $in: floorIds } }).lean();
-          const floorMap = new Map(floorDocs.map(f => [String(f._id), f.name]));
+          if (displayMode === 'by_type') {
+            // ⭐ Mode by_type: gộp ảnh từ phòng đã chọn + tất cả phòng cùng loại còn trống
+            //   (line.images đã có ảnh phòng đã chọn, em gộp thêm ảnh từ phòng khác)
+            const allImagesSet = new Set();
+            // Ảnh phòng đã chọn (line.roomId)
+            for (const img of (images ?? [])) {
+              if (img) allImagesSet.add(img);
+            }
+            // Ảnh từ các phòng cùng loại
+            for (const r of altRoomDocs) {
+              for (const img of (r.images ?? [])) {
+                if (img) allImagesSet.add(img);
+              }
+            }
+            aggregatedImages = Array.from(allImagesSet);
+            // KHÔNG set alternativeRooms (giữ rỗng để FE không hiển thị số phòng)
+            alternativeRooms = [];
+          } else {
+            // ⭐ Mode with_alternatives (như cũ): liệt kê chi tiết các phòng cùng loại
+            const floorIds = [...new Set(altRoomDocs.map(r => String(r.floorId)).filter(Boolean))];
+            const floorDocs = await Floor.find({ _id: { $in: floorIds } }).lean();
+            const floorMap = new Map(floorDocs.map(f => [String(f._id), f.name]));
 
-          alternativeRooms = altRoomDocs.map(r => ({
-            roomId:     r._id,
-            roomNumber: r.number,
-            floorName:  floorMap.get(String(r.floorId)) ?? '',
-            images:     r.images ?? [],
-          }));
+            alternativeRooms = altRoomDocs.map(r => ({
+              roomId:     r._id,
+              roomNumber: r.number,
+              floorName:  floorMap.get(String(r.floorId)) ?? '',
+              images:     r.images ?? [],
+            }));
+          }
         }
       } catch (e) {
         console.warn('[create quote] enrich error:', e.message);
       }
 
-      const { alternativeRoomIds, ...lineWithoutIds } = line;
+      const { alternativeRoomIds, displayMode: _, ...lineWithoutInternals } = line;
 
+      // ⭐ NEW: Trong mode 'by_type', ẩn roomNumber khỏi line (không hiển thị "Phòng 201")
+      //   Giữ lại typeId/typeName để render nhóm theo loại
+      if (displayMode === 'by_type') {
+        return {
+          ...lineWithoutInternals,
+          // ⭐ Override roomNumber & roomId → null/empty để FE biết không hiển thị số phòng
+          roomNumber: '',
+          roomId:     null,
+          // Ảnh dùng aggregatedImages thay vì images đơn lẻ
+          images:     aggregatedImages,
+          amenities, description,
+          policyInfo,
+          alternativeRooms: [], // empty
+          aggregatedImages,     // also stored separately for clarity
+          displayMode,          // ⭐ persist mode để renderer (PDF/HTML) biết cách hiển thị
+        };
+      }
+
+      // Mode 'selected' và 'with_alternatives' giữ nguyên hành vi cũ
       return {
-        ...lineWithoutIds,
+        ...lineWithoutInternals,
         images, amenities, description,
         policyInfo,
         alternativeRooms,
+        displayMode, // ⭐ vẫn persist để FE/renderer biết
       };
     }));
 
@@ -96,6 +143,33 @@ const create = async (req, res, next) => {
       includedServices:   branch?.quotePolicy?.includedServices   ?? [],
     };
 
+    // ⭐ NEW: Trong mode 'by_type', merge các line cùng typeId thành 1 line duy nhất
+    //   Lý do: nếu user chọn 3 phòng cùng loại 201/301/401 với mode by_type,
+    //   không cần render 3 dòng giống hệt nhau → gộp thành 1 dòng "Standard City View Room × 3 phòng"
+    let finalRooms = enrichedRooms;
+    const isAllByType = enrichedRooms.every(r => r.displayMode === 'by_type');
+    if (isAllByType) {
+      const groupedByType = new Map();
+      for (const line of enrichedRooms) {
+        const key = String(line.typeId);
+        if (!groupedByType.has(key)) {
+          groupedByType.set(key, { ...line, _quantity: 1, _totalRoomAmount: line.roomAmount ?? 0 });
+        } else {
+          const existing = groupedByType.get(key);
+          existing._quantity += 1;
+          existing._totalRoomAmount += (line.roomAmount ?? 0);
+        }
+      }
+      finalRooms = Array.from(groupedByType.values()).map(line => ({
+        ...line,
+        // Giá hiển thị = giá per-room (giữ nguyên), thêm field quantity để FE hiển thị "× N phòng"
+        quantity:   line._quantity,
+        roomAmount: line._totalRoomAmount, // tổng theo loại = đơn giá × số phòng
+        _quantity: undefined,
+        _totalRoomAmount: undefined,
+      }));
+    }
+
     const quote = await Quote.create({
       branchId,
       branchName: branch?.name ?? '',
@@ -104,10 +178,14 @@ const create = async (req, res, next) => {
       groupName: groupName ?? '',
       checkIn, checkOut,
       nights: nights ?? 1,
-      rooms: enrichedRooms,
+      rooms: finalRooms,
       totalAmount: totalAmount ?? 0,
       notes: notes ?? '',
       branchPolicies,
+      // ⭐ NEW: persist top-level mode flag để frontend public quote render đúng cách
+      displayMode: isAllByType ? 'by_type'
+                  : enrichedRooms.some(r => r.displayMode === 'with_alternatives') ? 'with_alternatives'
+                  : 'selected',
       createdBy: req.user?.id ?? null,
     });
 
