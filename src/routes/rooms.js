@@ -9,7 +9,7 @@ router.get('/available',     authenticate, getAvailable);
 router.get('/',              authenticate, getAll);
 router.get('/:id',           authenticate, getOne);
 router.post('/',             authenticate, authorize('Admin', 'Manager'), create);
-router.put('/:id',           authenticate, authorize('Admin', 'Manager'), update);
+router.put('/:id',           authenticate, update);
 router.patch('/:id/status',  authenticate, updateStatus);
 router.delete('/:id',        authenticate, authorize('Admin'), remove);
 
