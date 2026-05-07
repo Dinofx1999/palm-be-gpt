@@ -90,22 +90,40 @@ const canSetPastTime = async (user, bookingId, roomNumber = null) => {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// ⭐ FIX TRIỆT ĐỂ: Tìm booking conflict THẬT SỰ trên 1 phòng cụ thể
+// ⭐ FIX 07/05/2026 v2: Phân biệt CHECK-IN vs ĐẶT PHÒNG khi khách cũ chưa trả
 //
-// VẤN ĐỀ CŨ:
-// - Query include status 'checked_out' → match cả booking đã trả rồi
-// - So sánh dùng checkIn/checkOut DỰ KIẾN cấp booking
-//   → 2 booking liên tiếp trong cùng ngày bị xem là conflict dù thực tế không overlap
+// LOGIC ĐÚNG BUSINESS:
+//   - actionType='checkin' (đang muốn nhận phòng / chiếm phòng VẬT LÝ ngay):
+//     + Candidate `checked_in` chưa trả → end = +∞ → BLOCK
+//     + Candidate `reserved`/`confirmed` → end = checkOut dự kiến (cho phép đặt
+//       chồng nếu không overlap khoảng đặt)
 //
-// LOGIC MỚI:
-// 1. Chỉ status active: confirmed/reserved/checked_in (BỎ checked_out)
-// 2. Resolve interval THỰC TẾ của candidate:
-//    [actualCheckIn ?? checkIn, actualCheckOut ?? checkOut]
-// 3. Bỏ qua sub-room đã checked_out trong booking đoàn
-// 4. So sánh overlap chuẩn: a < d && c < b
+//   - actionType='reserve' (chỉ đặt trước, chưa nhận phòng ngay):
+//     + DÙNG checkOut DỰ KIẾN → cho phép đặt phòng tương lai dù A chưa trả
+//     + Khi B đến giờ check-in mà A vẫn chưa trả → ở bước check-in mới block
+//
+// VÍ DỤ:
+//   - 301 (A) checked_in 21:29-21:29 chưa trả thực tế
+//   - B đặt 22:00 → 08/05 12:00 (status=reserved) → CHO PHÉP ✅
+//   - B đến 22:00 muốn check-in mà A vẫn chưa trả → BLOCK ✅
+//   - A bấm trả 21:55 → B check-in 22:00 OK ✅
 // ════════════════════════════════════════════════════════════════════════════
+
+const FAR_FUTURE = new Date('9999-12-31T23:59:59.999Z')
+
+// Helper: end thực tế của candidate (booking đang giữ phòng)
+//   - Đã trả: dùng actualCheckOut
+//   - Đang checked_in chưa trả + actionType='checkin': dùng FAR_FUTURE → block
+//   - Còn lại: dùng checkOut dự kiến
+const resolveCandidateEnd = (candStatus, actualCheckOut, scheduledCheckOut, actionType = 'checkin') => {
+  if (actualCheckOut) return new Date(actualCheckOut)
+  if (candStatus === 'checked_in' && actionType === 'checkin') return FAR_FUTURE
+  return scheduledCheckOut ? new Date(scheduledCheckOut) : null
+}
+
 const findActiveConflictForRoom = async ({
   bookingId, roomId, intervalStart, intervalEnd,
+  actionType = 'checkin',  // ⭐ 'checkin' | 'reserve'
 }) => {
   const candidates = await Booking.find({
     _id:    { $ne: bookingId },
@@ -113,7 +131,6 @@ const findActiveConflictForRoom = async ({
       { roomId },
       { 'rooms.roomId': roomId },
     ],
-    // ⭐ CHỈ status đang active — bỏ checked_out (phòng đã trống)
     status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
   }).sort({ checkIn: 1 })
 
@@ -122,28 +139,32 @@ const findActiveConflictForRoom = async ({
     let candStatus  = cand.status
     let candStart   = null
     let candEnd     = null
+    let isStillCheckedIn = false
 
     if (Array.isArray(cand.rooms) && cand.rooms.length > 0) {
-      // Booking đoàn → tìm sub-room match roomId
       candRoom = cand.rooms.find(r =>
         String(r.roomId?._id ?? r.roomId) === String(roomId)
       )
       if (!candRoom) continue
-      // Bỏ qua sub-room đã trả/cancel (phòng đã giải phóng)
       if (['checked_out', 'cancelled'].includes(candRoom.status)) continue
       candStatus = candRoom.status
       candStart  = candRoom.actualCheckIn  ?? candRoom.checkIn  ?? cand.checkIn
-      candEnd    = candRoom.actualCheckOut ?? candRoom.checkOut ?? cand.checkOut
+      candEnd    = resolveCandidateEnd(
+        candStatus,
+        candRoom.actualCheckOut,
+        candRoom.checkOut ?? cand.checkOut,
+        actionType,
+      )
+      isStillCheckedIn = candStatus === 'checked_in' && !candRoom.actualCheckOut
     } else {
-      // Booking đơn — match qua cand.roomId
       if (String(cand.roomId) !== String(roomId)) continue
       candStart = cand.actualCheckIn  ?? cand.checkIn
-      candEnd   = cand.actualCheckOut ?? cand.checkOut
+      candEnd   = resolveCandidateEnd(candStatus, cand.actualCheckOut, cand.checkOut, actionType)
+      isStillCheckedIn = candStatus === 'checked_in' && !cand.actualCheckOut
     }
 
     if (!candStart || !candEnd) continue
 
-    // ⭐ Overlap check chuẩn: [a,b] vs [c,d] overlap khi a < d && c < b
     const overlap = new Date(intervalStart) < new Date(candEnd) &&
                     new Date(candStart)     < new Date(intervalEnd)
     if (!overlap) continue
@@ -152,35 +173,22 @@ const findActiveConflictForRoom = async ({
       conflict:        cand,
       conflictRoom:    candRoom,
       conflictStart:   candStart,
-      conflictEnd:     candEnd,
+      // Trả về scheduledCheckOut cho UI (không show "9999")
+      conflictEnd:     candEnd === FAR_FUTURE
+        ? (candRoom?.checkOut ?? cand.checkOut)
+        : candEnd,
       conflictStatus:  candStatus,
+      isStillCheckedIn,  // ⭐ NEW: cho FE biết khách đang ở chưa trả
     }
   }
 
   return null
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// ⭐ HELPER: Tìm conflict khi TẠO MỚI / ĐỔI NGÀY booking
-//
-// Khác với findActiveConflictForRoom:
-// - Đây là check overlap [intervalStart, intervalEnd] với BẤT KỲ booking active
-//   nào trên cùng phòng (xét cả actualCheckIn/actualCheckOut nếu có)
-// - Tham số: bookingIds (mảng) — bỏ qua các booking này (vd update self)
-//
-// LOGIC:
-// 1. Status active: confirmed/reserved/checked_in (BỎ checked_out, cancelled)
-// 2. Resolve interval thực tế của candidate:
-//    [actualCheckIn ?? checkIn, actualCheckOut ?? checkOut]
-//    → Quan trọng: nếu khách check-in sớm (actualCheckIn=11:00 dù checkIn=14:00),
-//      booking mới đặt 11:30 vẫn bị block đúng
-// 3. Per-sub-room cho booking đoàn (skip checked_out/cancelled sub)
-// 4. Overlap chuẩn: a < d && c < b (>=, <= không tính là overlap → cho phép
-//    nối tiếp đúng giờ: A trả 12:00, B nhận 12:00 → OK)
-// ════════════════════════════════════════════════════════════════════════════
 const findOverlapForNewBooking = async ({
   roomId, intervalStart, intervalEnd,
   excludeBookingIds = [],
+  actionType = 'checkin',  // ⭐ 'checkin' | 'reserve'
 }) => {
   const filter = {
     $or: [
@@ -200,29 +208,32 @@ const findOverlapForNewBooking = async ({
     let candStart   = null
     let candEnd     = null
     let candStatus  = cand.status
+    let isStillCheckedIn = false
 
     if (Array.isArray(cand.rooms) && cand.rooms.length > 0) {
-      // Booking đoàn — tìm sub-room cụ thể
       candRoom = cand.rooms.find(r =>
         String(r.roomId?._id ?? r.roomId) === String(roomId)
       )
       if (!candRoom) continue
-      // Bỏ qua sub-room đã trả/hủy
       if (['checked_out', 'cancelled'].includes(candRoom.status)) continue
       candStatus = candRoom.status
       candStart  = candRoom.actualCheckIn  ?? candRoom.checkIn  ?? cand.checkIn
-      candEnd    = candRoom.actualCheckOut ?? candRoom.checkOut ?? cand.checkOut
+      candEnd    = resolveCandidateEnd(
+        candStatus,
+        candRoom.actualCheckOut,
+        candRoom.checkOut ?? cand.checkOut,
+        actionType,
+      )
+      isStillCheckedIn = candStatus === 'checked_in' && !candRoom.actualCheckOut
     } else {
-      // Booking đơn — match qua cand.roomId
       if (String(cand.roomId) !== String(roomId)) continue
       candStart = cand.actualCheckIn  ?? cand.checkIn
-      candEnd   = cand.actualCheckOut ?? cand.checkOut
+      candEnd   = resolveCandidateEnd(candStatus, cand.actualCheckOut, cand.checkOut, actionType)
+      isStillCheckedIn = candStatus === 'checked_in' && !cand.actualCheckOut
     }
 
     if (!candStart || !candEnd) continue
 
-    // Overlap chuẩn: [a,b] vs [c,d] overlap khi a < d && c < b
-    // Khoảng nối tiếp đúng giờ (A trả 12:00, B nhận 12:00) KHÔNG tính overlap
     const overlap = new Date(intervalStart) < new Date(candEnd) &&
                     new Date(candStart)     < new Date(intervalEnd)
     if (!overlap) continue
@@ -231,8 +242,11 @@ const findOverlapForNewBooking = async ({
       conflict:       cand,
       conflictRoom:   candRoom,
       conflictStart:  candStart,
-      conflictEnd:    candEnd,
+      conflictEnd:    candEnd === FAR_FUTURE
+        ? (candRoom?.checkOut ?? cand.checkOut)
+        : candEnd,
       conflictStatus: candStatus,
+      isStillCheckedIn,
     }
   }
 
@@ -382,7 +396,6 @@ const previewPrice = async (req, res, next) => {
     })
   } catch (err) { next(err) }
 }
-
 // ── CREATE ────────────────────────────────────────────
 const create = async (req, res, next) => {
   try {
@@ -412,9 +425,6 @@ const create = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
 
     // ⭐ Determine effective interval cho conflict check
-    //    - Nếu chỉ tạo booking (reserved/confirmed): check [checkIn, checkOut] dự kiến
-    //    - Nếu tạo + check-in luôn (status='checked_in'): khách sẽ vào ngay lúc now
-    //      → check [min(now, checkIn), checkOut] để bắt đè lên booking đang ở
     const validInitialEarly = ['reserved', 'confirmed', 'checked_in']
     const initialStatusEarly = validInitialEarly.includes(requestedStatus) ? requestedStatus : 'reserved'
     const willCheckInNow = initialStatusEarly === 'checked_in'
@@ -428,25 +438,29 @@ const create = async (req, res, next) => {
       roomId,
       intervalStart: conflictIntervalStart,
       intervalEnd:   conflictIntervalEnd,
+      actionType:    willCheckInNow ? 'checkin' : 'reserve',
     })
     if (conflictResult) {
-      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
       const statusLabel = {
         reserved:   'đã đặt',
         confirmed:  'đã xác nhận',
-        checked_in: 'đang ở',
+        checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
       }[conflictStatus] ?? conflictStatus
       const actionLabel = willCheckInNow ? 'nhận phòng ngay' : 'đặt phòng'
       return res.status(400).json({
         success: false,
         code: 'CONFLICT_OVERLAP',
-        message: `Không thể ${actionLabel} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.${willCheckInNow ? ` Bạn muốn nhận phòng từ ${nowForCreate.toLocaleString('vi-VN')} nhưng phòng đang bị chiếm.` : ' Vui lòng chọn khoảng giờ khác.'}`,
+        message: isStillCheckedIn
+          ? `Không thể ${actionLabel} — phòng đang có khách ${conflict.customerName} chưa trả phòng (dự kiến trả ${new Date(conflictEnd).toLocaleString('vi-VN')}). Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+          : `Không thể ${actionLabel} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.${willCheckInNow ? ` Bạn muốn nhận phòng từ ${nowForCreate.toLocaleString('vi-VN')} nhưng phòng đang bị chiếm.` : ' Vui lòng chọn khoảng giờ khác.'}`,
         data: {
           conflictBookingId:    conflict._id,
           conflictCustomerName: conflict.customerName,
           conflictCheckIn:      conflictStart,
           conflictCheckOut:     conflictEnd,
           conflictStatus,
+          isStillCheckedIn,
           attemptedCheckInAt:   willCheckInNow ? nowForCreate : null,
           requestedCheckIn:     checkInDate,
           requestedCheckOut:    checkOutDate,
@@ -641,7 +655,6 @@ const changeDates = async (req, res, next) => {
       }
     }
 
-    // ⭐ Check conflict cho từng phòng riêng biệt
     for (const rid of allRoomIds) {
       if (!rid) continue
       const conflictResult = await findOverlapForNewBooking({
@@ -649,24 +662,28 @@ const changeDates = async (req, res, next) => {
         intervalStart: newCheckIn,
         intervalEnd:   newCheckOut,
         excludeBookingIds: [booking._id],
+        actionType:    'reserve',
       })
       if (conflictResult) {
-        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
         const statusLabel = {
           reserved:   'đã đặt',
           confirmed:  'đã xác nhận',
-          checked_in: 'đang ở',
+          checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
         }[conflictStatus] ?? conflictStatus
         return res.status(400).json({
           success: false,
           code: 'CONFLICT_OVERLAP',
-          message: `Trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+          message: isStillCheckedIn
+            ? `Phòng đang có khách ${conflict.customerName} chưa trả phòng. Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+            : `Trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
           data: {
             conflictBookingId:    conflict._id,
             conflictCustomerName: conflict.customerName,
             conflictCheckIn:      conflictStart,
             conflictCheckOut:     conflictEnd,
             conflictStatus,
+            isStillCheckedIn,
           },
         })
       }
@@ -782,24 +799,28 @@ const changeDatesRoom = async (req, res, next) => {
       intervalStart: newCheckIn,
       intervalEnd:   newCheckOut,
       excludeBookingIds: [booking._id],
+      actionType:    'reserve',
     })
     if (conflictResult) {
-      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
       const statusLabel = {
         reserved:   'đã đặt',
         confirmed:  'đã xác nhận',
-        checked_in: 'đang ở',
+        checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
       }[conflictStatus] ?? conflictStatus
       return res.status(400).json({
         success: false,
         code: 'CONFLICT_OVERLAP',
-        message: `Phòng ${subRoom.roomNumber} bị trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+        message: isStillCheckedIn
+          ? `Phòng ${subRoom.roomNumber} đang có khách ${conflict.customerName} chưa trả phòng. Vui lòng xử lý trả phòng trước.`
+          : `Phòng ${subRoom.roomNumber} bị trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
         data: {
           conflictBookingId:    conflict._id,
           conflictCustomerName: conflict.customerName,
           conflictCheckIn:      conflictStart,
           conflictCheckOut:     conflictEnd,
           conflictStatus,
+          isStillCheckedIn,
         },
       })
     }
@@ -913,7 +934,6 @@ const changeDatesRoom = async (req, res, next) => {
     next(err)
   }
 }
-
 // ── MOVE ROOM ─────────────────────────────────────────
 const moveRoom = async (req, res, next) => {
   try {
@@ -964,29 +984,34 @@ const moveRoom = async (req, res, next) => {
     const checkInRange  = (isGroup && subRoom?.checkIn)  ? subRoom.checkIn  : booking.checkIn
     const checkOutRange = (isGroup && subRoom?.checkOut) ? subRoom.checkOut : booking.checkOut
 
+    const moveActionType = booking.status === 'checked_in' ? 'checkin' : 'reserve'
     const moveConflictResult = await findOverlapForNewBooking({
       roomId:        newRoomId,
       intervalStart: checkInRange,
       intervalEnd:   checkOutRange,
       excludeBookingIds: [booking._id],
+      actionType:    moveActionType,
     })
     if (moveConflictResult) {
-      const { conflict, conflictStart, conflictEnd, conflictStatus } = moveConflictResult
+      const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = moveConflictResult
       const statusLabel = {
         reserved:   'đã đặt',
         confirmed:  'đã xác nhận',
-        checked_in: 'đang ở',
+        checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
       }[conflictStatus] ?? conflictStatus
       return res.status(400).json({
         success: false,
         code: 'CONFLICT_OVERLAP',
-        message: `Phòng đích đã có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+        message: isStillCheckedIn
+          ? `Phòng đích đang có khách ${conflict.customerName} chưa trả phòng. Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+          : `Phòng đích đã có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
         data: {
           conflictBookingId:    conflict._id,
           conflictCustomerName: conflict.customerName,
           conflictCheckIn:      conflictStart,
           conflictCheckOut:     conflictEnd,
           conflictStatus,
+          isStillCheckedIn,
         },
       })
     }
@@ -1531,7 +1556,6 @@ const changePolicy = async (req, res, next) => {
     res.status(500).json({ success: false, message: err.message })
   }
 }
-
 // ── CHECK-IN ──────────────────────────────────────────
 const checkin = async (req, res, next) => {
   try {
@@ -1542,12 +1566,6 @@ const checkin = async (req, res, next) => {
 
     const now = new Date()
 
-    // ⭐ Logic check-in:
-    //   - Quy ước: cho check-in bất kỳ lúc nào nếu không overlap với booking khác
-    //   - Khoảng kiểm tra: [now hoặc booking.checkIn (chọn sớm hơn), booking.checkOut]
-    //     → Vì khách sẽ thực sự ở phòng từ giờ check-in đến giờ trả
-    //   - Nếu overlap → block
-    //   - Nếu không overlap → cho check-in, set actualCheckIn = now
     const intervalStart = now < booking.checkIn ? now : booking.checkIn
     const intervalEnd   = booking.checkOut
 
@@ -1557,24 +1575,28 @@ const checkin = async (req, res, next) => {
         intervalStart,
         intervalEnd,
         excludeBookingIds: [booking._id],
+        actionType:    'checkin',
       })
       if (conflictResult) {
-        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
         const statusLabel = {
           reserved:   'đã đặt',
           confirmed:  'đã xác nhận',
-          checked_in: 'đang ở',
+          checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
         }[conflictStatus] ?? conflictStatus
         return {
           success: false,
           code: 'CONFLICT_OVERLAP',
-          message: `Không thể check-in${roomLabel ? ` phòng ${roomLabel}` : ''} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}. Vui lòng đợi đến sau khi khách trên trả phòng hoặc đổi phòng khác.`,
+          message: isStillCheckedIn
+            ? `Không thể check-in${roomLabel ? ` phòng ${roomLabel}` : ''} — phòng đang có khách ${conflict.customerName} chưa trả phòng (dự kiến trả ${new Date(conflictEnd).toLocaleString('vi-VN')}). Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+            : `Không thể check-in${roomLabel ? ` phòng ${roomLabel}` : ''} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}. Vui lòng đợi đến sau khi khách trên trả phòng hoặc đổi phòng khác.`,
           data: {
             conflictBookingId:    conflict._id,
             conflictCustomerName: conflict.customerName,
             conflictCheckIn:      conflictStart,
             conflictCheckOut:     conflictEnd,
             conflictStatus,
+            isStillCheckedIn,
             attemptedCheckInAt:   now,
             bookingScheduledCheckIn: booking.checkIn,
           },
@@ -1583,7 +1605,6 @@ const checkin = async (req, res, next) => {
       return null
     }
 
-    // Check tất cả phòng (đơn hoặc đoàn)
     const roomsToCheck = []
     if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
       for (const sr of booking.rooms) {
@@ -1605,7 +1626,6 @@ const checkin = async (req, res, next) => {
       if (err) return res.status(400).json(err)
     }
 
-    // ⭐ Quy ước: actualCheckIn = giờ thực tế khi bấm (kể cả check-in sớm)
     booking.status        = 'checked_in'
     booking.actualCheckIn = now
 
@@ -1681,8 +1701,6 @@ const checkinRoom = async (req, res, next) => {
 
     const now = new Date()
 
-    // ⭐ Logic check-in lẻ: tương tự checkin
-    //    Khoảng kiểm tra: [now hoặc sub.checkIn (chọn sớm hơn), sub.checkOut]
     const subCheckIn  = sub.checkIn  ?? booking.checkIn
     const subCheckOut = sub.checkOut ?? booking.checkOut
     const intervalStart = now < subCheckIn ? now : subCheckIn
@@ -1693,31 +1711,34 @@ const checkinRoom = async (req, res, next) => {
       intervalStart,
       intervalEnd,
       excludeBookingIds: [booking._id],
+      actionType:    'checkin',
     })
     if (conflictResult) {
-      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
       const statusLabel = {
         reserved:   'đã đặt',
         confirmed:  'đã xác nhận',
-        checked_in: 'đang ở',
+        checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
       }[conflictStatus] ?? conflictStatus
       return res.status(400).json({
         success: false,
         code: 'CONFLICT_OVERLAP',
-        message: `Không thể check-in phòng ${sub.roomNumber} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
+        message: isStillCheckedIn
+          ? `Không thể check-in phòng ${sub.roomNumber} — phòng đang có khách ${conflict.customerName} chưa trả phòng (dự kiến trả ${new Date(conflictEnd).toLocaleString('vi-VN')}). Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+          : `Không thể check-in phòng ${sub.roomNumber} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
         data: {
           conflictBookingId:    conflict._id,
           conflictCustomerName: conflict.customerName,
           conflictCheckIn:      conflictStart,
           conflictCheckOut:     conflictEnd,
           conflictStatus,
+          isStillCheckedIn,
           attemptedCheckInAt:   now,
           bookingScheduledCheckIn: subCheckIn,
         },
       })
     }
 
-    // ⭐ Quy ước: actualCheckIn = now (kể cả check-in sớm)
     sub.status        = 'checked_in'
     sub.actualCheckIn = now
 
@@ -1750,9 +1771,6 @@ const checkinRoom = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// ⭐ CHECKOUT — ĐÃ FIX TRIỆT ĐỂ
-// ════════════════════════════════════════════════════════════════════════════
 const checkout = async (req, res, next) => {
   try {
     const { actualCheckOut } = req.body
@@ -1763,7 +1781,6 @@ const checkout = async (req, res, next) => {
 
     const actualCO = actualCheckOut ? new Date(actualCheckOut) : new Date()
 
-    // Guard quyền checkout với giờ quá khứ
     if (actualCheckOut) {
       const now = new Date()
       if (actualCO.getTime() < now.getTime() - 60000) {
@@ -1787,7 +1804,6 @@ const checkout = async (req, res, next) => {
       })
     }
 
-    // ⭐ FIX: Conflict check chuẩn — chỉ block khi 2 booking THẬT SỰ overlap
     const conflictResult = await findActiveConflictForRoom({
       bookingId:      booking._id,
       roomId:         booking.roomId,
@@ -1923,7 +1939,6 @@ const checkout = async (req, res, next) => {
       }
     }
 
-    // Recalc TẤT CẢ sub-rooms (group booking)
     if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
       try {
         const branch = await Branch.findById(booking.branchId)
@@ -2132,10 +2147,6 @@ const checkout = async (req, res, next) => {
     res.json({ success: true, message: 'Check-out thành công', data: { booking, invoice } })
   } catch (err) { next(err) }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// ⭐ CHECKOUT ROOM — ĐÃ FIX TRIỆT ĐỂ
-// ════════════════════════════════════════════════════════════════════════════
 const checkoutRoom = async (req, res, next) => {
   try {
     const { roomId, actualCheckOut, skipPayment = false } = req.body
@@ -2184,7 +2195,6 @@ const checkoutRoom = async (req, res, next) => {
       })
     }
 
-    // ⭐ FIX: Conflict check chuẩn cho per-room
     const subRoomId = String(sub.roomId?._id ?? sub.roomId)
     const conflictResult = await findActiveConflictForRoom({
       bookingId:      booking._id,
@@ -2605,30 +2615,27 @@ const getAvailableByDate = async (req, res, next) => {
 
     const allRooms = await Room.find(roomFilter).sort({ number: 1 })
 
-    const conflictFilter = {
-      roomId:   { $in: allRooms.map(r => r._id) },
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: checkOutDate },
-      checkOut: { $gt: checkInDate },
-    }
-    if (excludeBookingId) conflictFilter._id = { $ne: excludeBookingId }
-
-    const conflictBookings = await Booking.find(conflictFilter)
-    const conflictRoomIds = new Set()
-    conflictBookings.forEach(b => {
-      if (b.roomId) conflictRoomIds.add(b.roomId.toString())
-      ;(b.rooms ?? []).forEach(r => {
-        if (r.roomId && r.status !== 'checked_out' && r.status !== 'cancelled') {
-          conflictRoomIds.add(r.roomId.toString())
-        }
+    // ⭐ FIX: Tự xử lý conflict thay vì query Mongo trực tiếp
+    //   actionType='reserve' vì đây là tìm phòng để ĐẶT (cho phép đặt sau khoảng A đang ở)
+    const bookedRoomIds = new Set()
+    for (const room of allRooms) {
+      const conflictResult = await findOverlapForNewBooking({
+        roomId:        room._id,
+        intervalStart: checkInDate,
+        intervalEnd:   checkOutDate,
+        excludeBookingIds: excludeBookingId ? [excludeBookingId] : [],
+        actionType:    'reserve',
       })
-    })
-    const available = allRooms.filter(r => !conflictRoomIds.has(r._id.toString()))
+      if (conflictResult) {
+        bookedRoomIds.add(String(room._id))
+      }
+    }
+
+    const available = allRooms.filter(r => !bookedRoomIds.has(r._id.toString()))
 
     res.json({ success: true, data: { data: available, total: available.length } })
   } catch (err) { next(err) }
 }
-
 const applyDiscount = async (req, res, next) => {
   try {
     const { discountPercent = 0, discountAmount = 0, isFreeRoom = false } = req.body
@@ -3212,7 +3219,6 @@ const allocatePaymentToRooms = (booking, amount, targetRoomId = null) => {
 
   return { allocations, remaining }
 }
-
 const getAvailableByType = async (req, res, next) => {
   try {
     const { branchId, checkIn, checkOut } = req.query
@@ -3227,22 +3233,20 @@ const getAvailableByType = async (req, res, next) => {
       roomStatus: { $ne: 'maintenance' },
     }).populate('typeId')
 
-    const conflicts = await Booking.find({
-      branchId,
-      status: { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: co },
-      checkOut: { $gt: ci },
-    }).select('roomId rooms status customerName checkIn checkOut')
-
+    // ⭐ FIX: Dùng helper findOverlapForNewBooking với actionType='reserve'
+    //    để cho phép xem available phòng để ĐẶT trước (kể cả khi A chưa trả)
     const bookedRoomIds = new Set()
-    conflicts.forEach(b => {
-      if (b.roomId) bookedRoomIds.add(String(b.roomId))
-      ;(b.rooms ?? []).forEach(r => {
-        if (r.roomId && r.status !== 'checked_out' && r.status !== 'cancelled') {
-          bookedRoomIds.add(String(r.roomId))
-        }
+    for (const room of allRooms) {
+      const conflictResult = await findOverlapForNewBooking({
+        roomId:        room._id,
+        intervalStart: ci,
+        intervalEnd:   co,
+        actionType:    'reserve',
       })
-    })
+      if (conflictResult) {
+        bookedRoomIds.add(String(room._id))
+      }
+    }
 
     const typeMap = new Map()
     allRooms.forEach(room => {
@@ -3426,7 +3430,6 @@ const createGroup = async (req, res, next) => {
     const branch = await Branch.findById(branchId)
     if (!branch) return res.status(404).json({ success: false, message: 'Không tìm thấy chi nhánh' })
 
-    // ⭐ Determine effective interval cho conflict check
     const willCheckInNowGrp = initialStatus === 'checked_in'
     const nowForGrp = new Date()
     const grpIntervalStart = willCheckInNowGrp && nowForGrp < checkInDate
@@ -3438,20 +3441,23 @@ const createGroup = async (req, res, next) => {
         roomId:        r.roomId,
         intervalStart: grpIntervalStart,
         intervalEnd:   checkOutDate,
+        actionType:    willCheckInNowGrp ? 'checkin' : 'reserve',
       })
       if (conflictResult) {
         const room = await Room.findById(r.roomId)
-        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const { conflict, conflictStart, conflictEnd, conflictStatus, isStillCheckedIn } = conflictResult
         const statusLabel = {
           reserved:   'đã đặt',
           confirmed:  'đã xác nhận',
-          checked_in: 'đang ở',
+          checked_in: isStillCheckedIn ? 'đang ở (chưa trả phòng)' : 'đang ở',
         }[conflictStatus] ?? conflictStatus
         const actionLabel = willCheckInNowGrp ? 'nhận phòng ngay' : 'đặt phòng'
         return res.status(400).json({
           success: false,
           code: 'CONFLICT_OVERLAP',
-          message: `Không thể ${actionLabel} — phòng ${room?.number ?? r.roomId} đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
+          message: isStillCheckedIn
+            ? `Không thể ${actionLabel} — phòng ${room?.number ?? r.roomId} đang có khách ${conflict.customerName} chưa trả phòng (dự kiến trả ${new Date(conflictEnd).toLocaleString('vi-VN')}). Vui lòng xử lý trả phòng cho khách hiện tại trước.`
+            : `Không thể ${actionLabel} — phòng ${room?.number ?? r.roomId} đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
           data: {
             roomNumber:           room?.number ?? null,
             conflictBookingId:    conflict._id,
@@ -3459,6 +3465,7 @@ const createGroup = async (req, res, next) => {
             conflictCheckIn:      conflictStart,
             conflictCheckOut:     conflictEnd,
             conflictStatus,
+            isStillCheckedIn,
             attemptedCheckInAt:   willCheckInNowGrp ? nowForGrp : null,
           },
         })

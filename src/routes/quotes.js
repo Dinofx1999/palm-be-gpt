@@ -7,7 +7,8 @@ const {
   remove,
   getAlternativeRooms,
   changeStatus,
-  publicAccept,   // ⭐ NEW
+  publicAccept,
+  reloadPolicies,   // ⭐ NEW
 } = require('../controllers/quoteController');
 
 // ⚠️ THỨ TỰ ROUTE QUAN TRỌNG:
@@ -21,9 +22,10 @@ router.post('/public-accept/:token', publicAccept);   // ⭐ NEW: khách tự ac
 router.get('/alternative-rooms', authenticate, getAlternativeRooms);
 
 // ── PRIVATE routes — :param paths sau ──────────
-router.post('/',                    authenticate, create);
-router.get('/',                     authenticate, getAll);
-router.patch('/:id/status',         authenticate, changeStatus);
-router.delete('/:id',               authenticate, remove);
+router.post('/',                       authenticate, create);
+router.get('/',                        authenticate, getAll);
+router.patch('/:id/status',            authenticate, changeStatus);
+router.post('/:id/reload-policies',    authenticate, reloadPolicies);   // ⭐ NEW
+router.delete('/:id',                  authenticate, remove);
 
 module.exports = router;

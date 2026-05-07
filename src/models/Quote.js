@@ -97,6 +97,9 @@ const quoteSchema = new mongoose.Schema({
     cancellationPolicy: { type: String, default: '' },
     requiredDocuments:  { type: String, default: '' },
     hotelRules:         { type: String, default: '' },
+    // ⭐ Snapshot giờ check-in/check-out của chi nhánh (cho block "Quy định" trên public page)
+    checkInTime:        { type: String, default: '14:00' },
+    checkOutTime:       { type: String, default: '12:00' },
     includedServices: [{
       icon:        String,
       name:        String,

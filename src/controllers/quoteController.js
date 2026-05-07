@@ -139,19 +139,37 @@ const create = async (req, res, next) => {
 
     const branch = await Branch.findById(branchId).lean();
 
+    // ⭐ Snapshot branchPolicies — đọc từ NHIỀU nguồn để tương thích các schema cũ/mới:
+    //   1. branch.quotePolicy.* (subdoc nested cho settings báo giá)
+    //   2. branch.* (field root level — fallback nếu schema cũ)
+    //   Ưu tiên (1) trước, fallback (2)
+    const qp = branch?.quotePolicy ?? {};
     const branchPolicies = {
-      cancellationPolicy: branch?.quotePolicy?.cancellationPolicy ?? '',
-      requiredDocuments:  branch?.quotePolicy?.requiredDocuments  ?? '',
-      hotelRules:         branch?.quotePolicy?.hotelRules         ?? '',
-      includedServices:   branch?.quotePolicy?.includedServices   ?? [],
+      cancellationPolicy: qp.cancellationPolicy ?? branch?.cancellationPolicy ?? '',
+      requiredDocuments:  qp.requiredDocuments  ?? branch?.requiredDocuments  ?? '',
+      hotelRules:         qp.hotelRules         ?? branch?.hotelRules         ?? '',
+      includedServices:   qp.includedServices   ?? branch?.includedServices   ?? [],
+      // ⭐ Snapshot giờ check-in/out của chi nhánh (để hiển thị trong "Quy định")
+      checkInTime:        branch?.checkInTime  ?? '14:00',
+      checkOutTime:       branch?.checkOutTime ?? '12:00',
       contact: {
         phone:   branch?.phone   ?? '',
         email:   branch?.email   ?? '',
         address: branch?.address ?? '',
         city:    branch?.city    ?? '',
-        zalo:    branch?.phone ? String(branch.phone).replace(/\D/g, '') : '',
+        zalo:    branch?.zalo ?? (branch?.phone ? String(branch.phone).replace(/\D/g, '') : ''),
       },
     };
+
+    // ⭐ DEBUG: log policies snapshot để verify
+    console.log('[create quote] branchPolicies snapshot:', {
+      branchId,
+      cancellationPolicy: !!branchPolicies.cancellationPolicy,
+      requiredDocuments:  !!branchPolicies.requiredDocuments,
+      hotelRules:         !!branchPolicies.hotelRules,
+      includedServicesCount: (branchPolicies.includedServices ?? []).length,
+      hasContact: !!(branchPolicies.contact.phone || branchPolicies.contact.email),
+    });
 
     let finalRooms = enrichedRooms;
     const isAllByType = enrichedRooms.every(r => r.displayMode === 'by_type');
@@ -526,6 +544,65 @@ const getAlternativeRooms = async (req, res, next) => {
   }
 };
 
+// ⭐ NEW: Reload policies snapshot từ branch hiện tại
+//   Dùng khi: quote cũ chưa có snapshot, hoặc admin sửa policies branch và muốn quote
+//   reflect data mới (chỉ áp dụng cho quote chưa confirmed/converted)
+const reloadPolicies = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const quote = await Quote.findById(id);
+    if (!quote) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy báo giá' });
+    }
+
+    // Chỉ cho reload policies khi quote chưa confirmed (giữ tính bất biến sau confirm)
+    if (['confirmed', 'accepted', 'converted'].includes(quote.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Không thể reload policies — báo giá đã ở trạng thái ${quote.status} (đã khoá snapshot)`,
+      });
+    }
+
+    const branch = await Branch.findById(quote.branchId).lean();
+    if (!branch) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy chi nhánh' });
+    }
+
+    const qp = branch.quotePolicy ?? {};
+    quote.branchPolicies = {
+      cancellationPolicy: qp.cancellationPolicy ?? branch.cancellationPolicy ?? '',
+      requiredDocuments:  qp.requiredDocuments  ?? branch.requiredDocuments  ?? '',
+      hotelRules:         qp.hotelRules         ?? branch.hotelRules         ?? '',
+      includedServices:   qp.includedServices   ?? branch.includedServices   ?? [],
+      checkInTime:        branch.checkInTime  ?? '14:00',
+      checkOutTime:       branch.checkOutTime ?? '12:00',
+      contact: {
+        phone:   branch.phone   ?? '',
+        email:   branch.email   ?? '',
+        address: branch.address ?? '',
+        city:    branch.city    ?? '',
+        zalo:    branch.zalo ?? (branch.phone ? String(branch.phone).replace(/\D/g, '') : ''),
+      },
+    };
+    quote.markModified('branchPolicies');
+    await quote.save();
+
+    const populated = await Quote.findById(id)
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .lean();
+
+    res.json({
+      success: true,
+      message: 'Đã reload quy định từ chi nhánh',
+      data: { quote: populated },
+    });
+  } catch (err) {
+    console.error('[reloadPolicies] error:', err);
+    next(err);
+  }
+};
+
 module.exports = {
   create,
   getPublic,
@@ -533,5 +610,6 @@ module.exports = {
   remove,
   getAlternativeRooms,
   changeStatus,
-  publicAccept,   // ⭐ NEW
+  publicAccept,
+  reloadPolicies,   // ⭐ NEW
 };
