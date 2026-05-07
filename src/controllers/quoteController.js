@@ -7,6 +7,25 @@ const PricePolicy = require('../models/PricePolicy');
 const Floor = require('../models/Floor');
 const mongoose = require('mongoose');
 
+// ⭐ Constants
+const VALID_STATUSES = [
+  'draft', 'sent', 'viewed', 'confirmed', 'accepted',
+  'rejected', 'expired', 'converted', 'cancelled',
+];
+
+// ⭐ State machine NỚI LỎNG
+const STATUS_TRANSITIONS = {
+  draft:     null,
+  sent:      ['draft', 'viewed', 'confirmed'],
+  viewed:    ['sent', 'draft'],
+  confirmed: ['draft', 'sent', 'viewed'],
+  accepted:  ['draft', 'sent', 'viewed', 'confirmed'],
+  rejected:  ['draft', 'sent', 'viewed', 'confirmed'],
+  expired:   null,
+  cancelled: null,
+  converted: ['confirmed', 'accepted'],
+};
+
 // ── CREATE quote ─────────────────
 const create = async (req, res, next) => {
   try {
@@ -29,9 +48,7 @@ const create = async (req, res, next) => {
         extraAdults: 0, extraChildren: 0,
       };
       let alternativeRooms = [];
-      // ⭐ NEW: Aggregated images cho mode 'by_type' (gộp ảnh từ tất cả phòng cùng loại)
       let aggregatedImages = [];
-      // ⭐ NEW: Display mode cho line này (default: 'selected')
       const displayMode = line.displayMode ?? 'selected';
 
       try {
@@ -61,33 +78,24 @@ const create = async (req, res, next) => {
           }
         }
 
-        // ⭐ Mode 'with_alternatives' OR 'by_type' đều cần fetch phòng từ alternativeRoomIds
-        //   Khác biệt: mode 'with_alternatives' liệt kê ds phòng (cho khách thấy số),
-        //   mode 'by_type' chỉ gộp ảnh (KHÔNG liệt kê số phòng)
         if (Array.isArray(line.alternativeRoomIds) && line.alternativeRoomIds.length > 0) {
           const altRoomDocs = await Room.find({
             _id: { $in: line.alternativeRoomIds },
           }).lean();
 
           if (displayMode === 'by_type') {
-            // ⭐ Mode by_type: gộp ảnh từ phòng đã chọn + tất cả phòng cùng loại còn trống
-            //   (line.images đã có ảnh phòng đã chọn, em gộp thêm ảnh từ phòng khác)
             const allImagesSet = new Set();
-            // Ảnh phòng đã chọn (line.roomId)
             for (const img of (images ?? [])) {
               if (img) allImagesSet.add(img);
             }
-            // Ảnh từ các phòng cùng loại
             for (const r of altRoomDocs) {
               for (const img of (r.images ?? [])) {
                 if (img) allImagesSet.add(img);
               }
             }
             aggregatedImages = Array.from(allImagesSet);
-            // KHÔNG set alternativeRooms (giữ rỗng để FE không hiển thị số phòng)
             alternativeRooms = [];
           } else {
-            // ⭐ Mode with_alternatives (như cũ): liệt kê chi tiết các phòng cùng loại
             const floorIds = [...new Set(altRoomDocs.map(r => String(r.floorId)).filter(Boolean))];
             const floorDocs = await Floor.find({ _id: { $in: floorIds } }).lean();
             const floorMap = new Map(floorDocs.map(f => [String(f._id), f.name]));
@@ -106,31 +114,26 @@ const create = async (req, res, next) => {
 
       const { alternativeRoomIds, displayMode: _, ...lineWithoutInternals } = line;
 
-      // ⭐ NEW: Trong mode 'by_type', ẩn roomNumber khỏi line (không hiển thị "Phòng 201")
-      //   Giữ lại typeId/typeName để render nhóm theo loại
       if (displayMode === 'by_type') {
         return {
           ...lineWithoutInternals,
-          // ⭐ Override roomNumber & roomId → null/empty để FE biết không hiển thị số phòng
           roomNumber: '',
           roomId:     null,
-          // Ảnh dùng aggregatedImages thay vì images đơn lẻ
           images:     aggregatedImages,
           amenities, description,
           policyInfo,
-          alternativeRooms: [], // empty
-          aggregatedImages,     // also stored separately for clarity
-          displayMode,          // ⭐ persist mode để renderer (PDF/HTML) biết cách hiển thị
+          alternativeRooms: [],
+          aggregatedImages,
+          displayMode,
         };
       }
 
-      // Mode 'selected' và 'with_alternatives' giữ nguyên hành vi cũ
       return {
         ...lineWithoutInternals,
         images, amenities, description,
         policyInfo,
         alternativeRooms,
-        displayMode, // ⭐ vẫn persist để FE/renderer biết
+        displayMode,
       };
     }));
 
@@ -141,23 +144,15 @@ const create = async (req, res, next) => {
       requiredDocuments:  branch?.quotePolicy?.requiredDocuments  ?? '',
       hotelRules:         branch?.quotePolicy?.hotelRules         ?? '',
       includedServices:   branch?.quotePolicy?.includedServices   ?? [],
-
-      // ⭐ NEW: Snapshot contact info từ Branch — báo giá có kênh liên hệ rõ ràng
-      //   Đây là snapshot tại thời điểm tạo quote: nếu sau này branch đổi SĐT,
-      //   quote cũ vẫn giữ thông tin liên hệ tại lúc gửi cho khách (đúng tinh thần proposal)
       contact: {
         phone:   branch?.phone   ?? '',
         email:   branch?.email   ?? '',
         address: branch?.address ?? '',
         city:    branch?.city    ?? '',
-        // Zalo dùng chung số phone (chỉ giữ digits) → FE tự build link zalo.me/<digits>
         zalo:    branch?.phone ? String(branch.phone).replace(/\D/g, '') : '',
       },
     };
 
-    // ⭐ NEW: Trong mode 'by_type', merge các line cùng typeId thành 1 line duy nhất
-    //   Lý do: nếu user chọn 3 phòng cùng loại 201/301/401 với mode by_type,
-    //   không cần render 3 dòng giống hệt nhau → gộp thành 1 dòng "Standard City View Room × 3 phòng"
     let finalRooms = enrichedRooms;
     const isAllByType = enrichedRooms.every(r => r.displayMode === 'by_type');
     if (isAllByType) {
@@ -174,13 +169,14 @@ const create = async (req, res, next) => {
       }
       finalRooms = Array.from(groupedByType.values()).map(line => ({
         ...line,
-        // Giá hiển thị = giá per-room (giữ nguyên), thêm field quantity để FE hiển thị "× N phòng"
         quantity:   line._quantity,
-        roomAmount: line._totalRoomAmount, // tổng theo loại = đơn giá × số phòng
+        roomAmount: line._totalRoomAmount,
         _quantity: undefined,
         _totalRoomAmount: undefined,
       }));
     }
+
+    const userId = req.user?.id ?? req.user?._id ?? null;
 
     const quote = await Quote.create({
       branchId,
@@ -194,24 +190,241 @@ const create = async (req, res, next) => {
       totalAmount: totalAmount ?? 0,
       notes: notes ?? '',
       branchPolicies,
-      // ⭐ NEW: persist top-level mode flag để frontend public quote render đúng cách
       displayMode: isAllByType ? 'by_type'
                   : enrichedRooms.some(r => r.displayMode === 'with_alternatives') ? 'with_alternatives'
                   : 'selected',
-      createdBy: req.user?.id ?? null,
+      status:    'draft',
+      createdBy: userId,
+      statusHistory: [{
+        status:    'draft',
+        changedBy: userId,
+        changedAt: new Date(),
+        note:      'Tạo báo giá',
+      }],
     });
+
+    const populated = await Quote.findById(quote._id)
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .lean();
 
     res.status(201).json({
       success: true,
       data: {
-        quote,
+        quote: populated,
         publicUrl: `/quote/${quote.token}`,
       },
     });
   } catch (err) { next(err); }
 };
 
-// ⭐ FIX v3: hỗ trợ nhiều variant tên field
+// ── GET ALL ──────────────────
+const getAll = async (req, res, next) => {
+  try {
+    const { branchId, status, page = 1, limit = 20 } = req.query;
+    const filter = {};
+    if (branchId) filter.branchId = branchId;
+    if (status)   filter.status   = status;
+
+    const total = await Quote.countDocuments(filter);
+    const data  = await Quote.find(filter)
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .sort({ createdAt: -1 })
+      .skip((+page - 1) * +limit)
+      .limit(+limit)
+      .lean();
+
+    res.json({ success: true, data: { data, total, page: +page, limit: +limit } });
+  } catch (err) { next(err); }
+};
+
+// ── GET PUBLIC ──────────────
+const getPublic = async (req, res, next) => {
+  try {
+    const { token } = req.params;
+    const quote = await Quote.findOne({ token })
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .lean();
+
+    if (!quote) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy báo giá' });
+    }
+    if (quote.expiresAt && new Date(quote.expiresAt) < new Date()) {
+      return res.status(410).json({ success: false, message: 'Báo giá đã hết hạn' });
+    }
+
+    if (quote.status === 'sent') {
+      Quote.findByIdAndUpdate(quote._id, {
+        status: 'viewed',
+        $push: {
+          statusHistory: {
+            status:    'viewed',
+            changedBy: null,
+            changedAt: new Date(),
+            note:      'Khách đã xem báo giá',
+          },
+        },
+      }).catch(err => console.warn('[getPublic] auto-update viewed failed:', err.message));
+      quote.status = 'viewed';
+    }
+
+    res.json({ success: true, data: { quote } });
+  } catch (err) { next(err); }
+};
+
+// ⭐ NEW: PUBLIC ACCEPT — khách tự click chấp nhận từ trang public
+//   Endpoint: POST /quotes/public-accept/:token
+//   Không cần auth — chỉ cần token đúng + status hiện tại là 'confirmed'
+const publicAccept = async (req, res, next) => {
+  try {
+    const { token } = req.params;
+    const { acknowledged } = req.body;
+
+    // ⭐ Khách phải tick checkbox đồng ý
+    if (acknowledged !== true) {
+      return res.status(400).json({
+        success: false,
+        message: 'Quý khách cần xác nhận đã đọc báo giá trước khi đồng ý',
+      });
+    }
+
+    const quote = await Quote.findOne({ token });
+    if (!quote) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy báo giá' });
+    }
+
+    // ⭐ Check hết hạn
+    if (quote.expiresAt && new Date(quote.expiresAt) < new Date()) {
+      return res.status(410).json({ success: false, message: 'Báo giá đã hết hạn' });
+    }
+
+    // ⭐ Chỉ cho phép accept khi đang ở 'confirmed'
+    //   (báo giá phải được nv xác nhận giá trước, khách mới có thể chốt)
+    if (quote.status !== 'confirmed') {
+      return res.status(400).json({
+        success: false,
+        message: quote.status === 'accepted'
+          ? 'Báo giá này đã được chấp nhận trước đó'
+          : 'Báo giá chưa được khách sạn xác nhận. Vui lòng liên hệ trực tiếp khách sạn.',
+      });
+    }
+
+    const updated = await Quote.findByIdAndUpdate(
+      quote._id,
+      {
+        status: 'accepted',
+        $push: {
+          statusHistory: {
+            status:    'accepted',
+            changedBy: null,  // null = khách (qua public link)
+            changedAt: new Date(),
+            note:      'Khách đồng ý đặt phòng qua trang công khai',
+          },
+        },
+      },
+      { new: true },
+    )
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .lean();
+
+    res.json({
+      success: true,
+      message: 'Cảm ơn Quý khách đã xác nhận đặt phòng',
+      data: { quote: updated },
+    });
+  } catch (err) {
+    console.error('[publicAccept] error:', err);
+    next(err);
+  }
+};
+
+// ⭐ CHANGE STATUS (admin endpoint, có auth)
+const changeStatus = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status: newStatus, note } = req.body;
+
+    if (!newStatus || !VALID_STATUSES.includes(newStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `Trạng thái không hợp lệ. Phải là một trong: ${VALID_STATUSES.join(', ')}`,
+      });
+    }
+
+    const quote = await Quote.findById(id);
+    if (!quote) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy báo giá' });
+    }
+
+    const oldStatus = quote.status;
+
+    if (oldStatus === newStatus) {
+      return res.status(400).json({
+        success: false,
+        message: 'Trạng thái mới giống trạng thái hiện tại',
+      });
+    }
+
+    const allowedFrom = STATUS_TRANSITIONS[newStatus];
+    if (allowedFrom && !allowedFrom.includes(oldStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `Không thể chuyển từ "${oldStatus}" sang "${newStatus}". Trạng thái nguồn hợp lệ: ${allowedFrom.join(', ')}`,
+      });
+    }
+
+    const userId = req.user?.id ?? req.user?._id ?? null;
+
+    const update = {
+      status: newStatus,
+      $push: {
+        statusHistory: {
+          status:    newStatus,
+          changedBy: userId,
+          changedAt: new Date(),
+          note:      note ?? '',
+        },
+      },
+    };
+
+    if (newStatus === 'confirmed') {
+      update.confirmedBy = userId;
+      update.confirmedAt = new Date();
+    }
+
+    if (oldStatus === 'confirmed' && newStatus !== 'confirmed') {
+      update.confirmedBy = null;
+      update.confirmedAt = null;
+    }
+
+    const updated = await Quote.findByIdAndUpdate(id, update, { new: true })
+      .populate('createdBy',   'name email avatar')
+      .populate('confirmedBy', 'name email avatar')
+      .lean();
+
+    res.json({
+      success: true,
+      message: `Đã đổi trạng thái sang "${newStatus}"`,
+      data: { quote: updated },
+    });
+  } catch (err) {
+    console.error('[changeStatus] error:', err);
+    next(err);
+  }
+};
+
+// ── REMOVE ──────────────────────
+const remove = async (req, res, next) => {
+  try {
+    await Quote.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: 'Đã xoá' });
+  } catch (err) { next(err); }
+};
+
+// ── GET ALTERNATIVE ROOMS ─────────
 const getAlternativeRooms = async (req, res, next) => {
   try {
     const { branchId, typeId, checkIn, checkOut, excludeRoomIds = '' } = req.query;
@@ -223,18 +436,11 @@ const getAlternativeRooms = async (req, res, next) => {
     const co = new Date(checkOut);
     const excludeIds = excludeRoomIds.split(',').filter(Boolean);
 
-    console.log('\n═══════ [alt-rooms] DEBUG ═══════');
-    console.log('Query:', { branchId, typeId, checkIn, checkOut });
-    console.log('Exclude:', excludeIds);
-
-    // ⭐ Hỗ trợ cả "typeId" và "roomTypeId" (tùy schema project)
-    // Hỗ trợ cả branchId là String và ObjectId
     const branchObjId = mongoose.Types.ObjectId.isValid(branchId)
       ? new mongoose.Types.ObjectId(branchId) : branchId;
     const typeObjId = mongoose.Types.ObjectId.isValid(typeId)
       ? new mongoose.Types.ObjectId(typeId) : typeId;
 
-    // Query 1: thử với typeId
     let allRooms = await Room.find({
       $or: [
         { branchId: branchId },
@@ -253,43 +459,21 @@ const getAlternativeRooms = async (req, res, next) => {
       ],
     }).sort({ number: 1 }).lean();
 
-    console.log('Query attempt 1 (with typeId/roomTypeId):', allRooms.length);
-
-    // Query 2 fallback: thử với typeId là string thường (không cast)
     if (allRooms.length === 0) {
       allRooms = await Room.find({
         branchId,
         _id: { $nin: excludeIds },
       }).sort({ number: 1 }).lean();
-
-      console.log('Query attempt 2 (no type filter):', allRooms.length);
-      console.log('Sample room field names:', allRooms[0] ? Object.keys(allRooms[0]) : 'none');
-      if (allRooms[0]) {
-        console.log('Sample room values:', {
-          _id: String(allRooms[0]._id),
-          number: allRooms[0].number,
-          typeId: allRooms[0].typeId ? String(allRooms[0].typeId) : 'N/A',
-          roomTypeId: allRooms[0].roomTypeId ? String(allRooms[0].roomTypeId) : 'N/A',
-          branchId: allRooms[0].branchId ? String(allRooms[0].branchId) : 'N/A',
-        });
-      }
-
-      // Filter manual sau khi lấy ra
       allRooms = allRooms.filter(r => {
         const rTypeId = r.typeId ? String(r.typeId) : (r.roomTypeId ? String(r.roomTypeId) : '');
         return rTypeId === String(typeId);
       });
-      console.log('After manual type filter:', allRooms.length);
     }
 
     if (allRooms.length === 0) {
-      console.log('═══════ [alt-rooms] NO ROOMS FOUND ═══════\n');
       return res.json({ success: true, data: { rooms: [], total: 0 } });
     }
 
-    console.log('Found rooms cùng type:', allRooms.map(r => r.number).join(', '));
-
-    // ⭐ Tìm bookings đang OVERLAP — query rộng để bắt nhiều schema variants
     const conflicts = await Booking.find({
       $or: [
         { branchId: branchId },
@@ -307,26 +491,12 @@ const getAlternativeRooms = async (req, res, next) => {
       ],
     }).lean();
 
-    console.log('Conflict bookings:', conflicts.length);
-    if (conflicts[0]) {
-      console.log('Sample booking field names:', Object.keys(conflicts[0]));
-      console.log('Sample booking:', {
-        _id: String(conflicts[0]._id),
-        status: conflicts[0].status,
-        roomId: conflicts[0].roomId ? String(conflicts[0].roomId) : 'N/A',
-        rooms: conflicts[0].rooms ? `array[${conflicts[0].rooms.length}]` : 'N/A',
-        roomIds: conflicts[0].roomIds ? `array[${conflicts[0].roomIds.length}]` : 'N/A',
-      });
-    }
-
     const bookedIds = new Set();
     conflicts.forEach(b => {
       if (b.roomId) bookedIds.add(String(b.roomId));
-
       if (Array.isArray(b.roomIds)) {
         b.roomIds.forEach(id => bookedIds.add(String(id)));
       }
-
       if (Array.isArray(b.rooms)) {
         b.rooms.forEach(r => {
           if (r.status === 'checked_out' || r.status === 'cancelled') return;
@@ -336,12 +506,7 @@ const getAlternativeRooms = async (req, res, next) => {
       }
     });
 
-    console.log('Booked roomIds:', Array.from(bookedIds));
-
     const available = allRooms.filter(r => !bookedIds.has(String(r._id)));
-
-    console.log('Available cùng type:', available.map(r => r.number).join(', '));
-    console.log('═══════════════════════════════════════\n');
 
     const floorIds = [...new Set(available.map(r => String(r.floorId)).filter(Boolean))];
     const floorDocs = await Floor.find({ _id: { $in: floorIds } }).lean();
@@ -361,43 +526,12 @@ const getAlternativeRooms = async (req, res, next) => {
   }
 };
 
-const getPublic = async (req, res, next) => {
-  try {
-    const { token } = req.params;
-    const quote = await Quote.findOne({ token }).lean();
-    if (!quote) {
-      return res.status(404).json({ success: false, message: 'Không tìm thấy báo giá' });
-    }
-    if (quote.expiresAt && new Date(quote.expiresAt) < new Date()) {
-      return res.status(410).json({ success: false, message: 'Báo giá đã hết hạn' });
-    }
-    res.json({ success: true, data: { quote } });
-  } catch (err) { next(err); }
+module.exports = {
+  create,
+  getPublic,
+  getAll,
+  remove,
+  getAlternativeRooms,
+  changeStatus,
+  publicAccept,   // ⭐ NEW
 };
-
-const getAll = async (req, res, next) => {
-  try {
-    const { branchId, status, page = 1, limit = 20 } = req.query;
-    const filter = {};
-    if (branchId) filter.branchId = branchId;
-    if (status)   filter.status   = status;
-
-    const total = await Quote.countDocuments(filter);
-    const data  = await Quote.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((+page - 1) * +limit)
-      .limit(+limit)
-      .lean();
-
-    res.json({ success: true, data: { data, total, page: +page, limit: +limit } });
-  } catch (err) { next(err); }
-};
-
-const remove = async (req, res, next) => {
-  try {
-    await Quote.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'Đã xoá' });
-  } catch (err) { next(err); }
-};
-
-module.exports = { create, getPublic, getAll, remove, getAlternativeRooms };

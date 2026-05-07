@@ -33,7 +33,6 @@ const parseDateRange = (query) => {
       to   = query.to   ? new Date(query.to)   : new Date()
       from.setHours(0, 0, 0, 0)
       to.setHours(23, 59, 59, 999)
-      // Auto granularity theo độ rộng
       const days = Math.ceil((to - from) / 86400000)
       if (days <= 2)       { granularity = 'hour';  buckets = days * 24 }
       else if (days <= 60) { granularity = 'day';   buckets = days }
@@ -54,7 +53,6 @@ const parseDateRange = (query) => {
   return { range, from, to, granularity, buckets }
 }
 
-// ⭐ Helper: format date theo granularity
 const formatBucketKey = (d, granularity) => {
   const yyyy = d.getFullYear()
   const mm = String(d.getMonth() + 1).padStart(2, '0')
@@ -66,7 +64,6 @@ const formatBucketKey = (d, granularity) => {
   return `${yyyy}-${mm}-${dd}`
 }
 
-// ⭐ Helper: build empty buckets giữa from→to để chart không bị trống
 const buildEmptyBuckets = (from, to, granularity) => {
   const out = []
   const cur = new Date(from)
@@ -79,8 +76,6 @@ const buildEmptyBuckets = (from, to, granularity) => {
   return out
 }
 
-// ⭐ Compute room status thực tế (giống logic FE realStatusOf)
-//   Cần aggregate Booking active để biết phòng nào đang có khách
 const computeRoomStatusCounts = async (branchId) => {
   const roomFilter = {}
   if (branchId) roomFilter.branchId = new mongoose.Types.ObjectId(branchId)
@@ -88,20 +83,16 @@ const computeRoomStatusCounts = async (branchId) => {
   const allRooms = await Room.find(roomFilter).select('_id roomStatus').lean()
   const totalRooms = allRooms.length
 
-  // Lấy các booking đang active (có thể chiếm phòng)
   const activeBookings = await Booking.find({
     ...(branchId ? { branchId: new mongoose.Types.ObjectId(branchId) } : {}),
     status: { $in: ['reserved', 'confirmed', 'checked_in'] },
   }).select('roomId rooms status').lean()
 
-  // Map roomId → bookingStatus (ưu tiên checked_in > confirmed > reserved)
   const roomToStatus = new Map()
   const STATUS_PRIORITY = { checked_in: 3, confirmed: 2, reserved: 1 }
   for (const bk of activeBookings) {
-    // Booking đơn: roomId
     const roomIds = []
     if (bk.roomId) roomIds.push(String(bk.roomId))
-    // Booking đoàn: rooms[]
     if (Array.isArray(bk.rooms)) {
       for (const sr of bk.rooms) {
         if (sr.roomId && sr.status !== 'cancelled') {
@@ -117,7 +108,6 @@ const computeRoomStatusCounts = async (branchId) => {
     }
   }
 
-  // Compute realStatus cho từng room
   const counts = {
     available: 0, reserved: 0, occupied: 0,
     checkout: 0, cleaning: 0, maintenance: 0,
@@ -139,10 +129,6 @@ const computeRoomStatusCounts = async (branchId) => {
   return { totalRooms, counts }
 }
 
-// ⭐ Compute revenue từ Booking.actualCheckOut
-//   - Doanh thu = totalAmount của booking
-//   - Chỉ tính booking đã checked_out (có actualCheckOut)
-//   - Nếu không có actualCheckOut, fallback checkOut (lịch dự kiến)
 const computeRevenueData = async (branchId, from, to, granularity) => {
   const matchStage = {
     status: 'checked_out',
@@ -150,7 +136,6 @@ const computeRevenueData = async (branchId, from, to, granularity) => {
   }
   if (branchId) matchStage.branchId = new mongoose.Types.ObjectId(branchId)
 
-  // Bucket format theo granularity
   let bucketFormat
   if (granularity === 'hour')  bucketFormat = '%Y-%m-%d %H:00'
   if (granularity === 'day')   bucketFormat = '%Y-%m-%d'
@@ -168,7 +153,6 @@ const computeRevenueData = async (branchId, from, to, granularity) => {
     { $sort: { _id: 1 } },
   ])
 
-  // Build empty buckets + fill
   const empty = buildEmptyBuckets(from, to, granularity)
   const aggMap = new Map(aggResult.map(r => [r._id, { amount: r.amount, count: r.count }]))
 
@@ -187,45 +171,188 @@ const computeRevenueData = async (branchId, from, to, granularity) => {
   return { revenueChart: filled, totalRevenue, totalBookings }
 }
 
+// ⭐ NEW: Top phòng bán chạy trong range (theo doanh thu)
+//   - Đếm số booking đã trả phòng (checked_out) trong from-to
+//   - Tách cả group: nếu booking là đoàn, count từng sub-room
+const computeTopRooms = async (branchId, from, to, limit = 5) => {
+  const matchStage = {
+    status: 'checked_out',
+    actualCheckOut: { $gte: from, $lte: to },
+  }
+  if (branchId) matchStage.branchId = new mongoose.Types.ObjectId(branchId)
+
+  const pipeline = [
+    { $match: matchStage },
+    {
+      $facet: {
+        singles: [
+          { $match: { $or: [
+            { rooms: { $exists: false } },
+            { rooms: { $size: 0 } },
+          ] } },
+          {
+            $group: {
+              _id: '$roomId',
+              roomNumber: { $first: '$roomNumber' },
+              roomType:   { $first: '$roomType' },
+              bookings:   { $sum: 1 },
+              revenue:    { $sum: { $ifNull: ['$totalAmount', 0] } },
+              nights:     { $sum: { $ifNull: ['$nights', 1] } },
+            },
+          },
+        ],
+        groups: [
+          { $match: { rooms: { $exists: true, $not: { $size: 0 } } } },
+          { $unwind: '$rooms' },
+          { $match: { 'rooms.status': 'checked_out' } },
+          {
+            $group: {
+              _id: '$rooms.roomId',
+              roomNumber: { $first: '$rooms.roomNumber' },
+              roomType:   { $first: '$rooms.roomType' },
+              bookings:   { $sum: 1 },
+              revenue:    { $sum: { $ifNull: ['$rooms.roomAmount', 0] } },
+              nights:     { $sum: { $ifNull: ['$rooms.nights', 1] } },
+            },
+          },
+        ],
+      },
+    },
+    { $project: { all: { $concatArrays: ['$singles', '$groups'] } } },
+    { $unwind: '$all' },
+    {
+      $group: {
+        _id: '$all._id',
+        roomNumber: { $first: '$all.roomNumber' },
+        roomType:   { $first: '$all.roomType' },
+        bookings:   { $sum: '$all.bookings' },
+        revenue:    { $sum: '$all.revenue' },
+        nights:     { $sum: '$all.nights' },
+      },
+    },
+    { $sort: { revenue: -1 } },
+    { $limit: limit },
+  ]
+
+  const result = await Booking.aggregate(pipeline)
+  return result.map(r => ({
+    roomId:     String(r._id),
+    roomNumber: r.roomNumber ?? '—',
+    typeName:   r.roomType ?? '',
+    bookings:   r.bookings ?? 0,
+    revenue:    r.revenue ?? 0,
+    nights:     r.nights ?? 0,
+  }))
+}
+
+// ⭐ NEW: Doanh thu theo loại phòng (cho pie chart)
+const computeRevenueByRoomType = async (branchId, from, to) => {
+  const matchStage = {
+    status: 'checked_out',
+    actualCheckOut: { $gte: from, $lte: to },
+  }
+  if (branchId) matchStage.branchId = new mongoose.Types.ObjectId(branchId)
+
+  const pipeline = [
+    { $match: matchStage },
+    {
+      $facet: {
+        singles: [
+          { $match: { $or: [
+            { rooms: { $exists: false } },
+            { rooms: { $size: 0 } },
+          ] } },
+          {
+            $group: {
+              _id: '$roomType',
+              revenue: { $sum: { $ifNull: ['$totalAmount', 0] } },
+              count:   { $sum: 1 },
+            },
+          },
+        ],
+        groups: [
+          { $match: { rooms: { $exists: true, $not: { $size: 0 } } } },
+          { $unwind: '$rooms' },
+          { $match: { 'rooms.status': 'checked_out' } },
+          {
+            $group: {
+              _id: '$rooms.roomType',
+              revenue: { $sum: { $ifNull: ['$rooms.roomAmount', 0] } },
+              count:   { $sum: 1 },
+            },
+          },
+        ],
+      },
+    },
+    { $project: { all: { $concatArrays: ['$singles', '$groups'] } } },
+    { $unwind: '$all' },
+    {
+      $group: {
+        _id: '$all._id',
+        revenue: { $sum: '$all.revenue' },
+        count:   { $sum: '$all.count' },
+      },
+    },
+    { $sort: { revenue: -1 } },
+  ]
+
+  const result = await Booking.aggregate(pipeline)
+  return result.map(r => ({
+    typeName: r._id ?? 'Khác',
+    revenue:  r.revenue ?? 0,
+    count:    r.count ?? 0,
+  }))
+}
+
 const getStats = async (req, res, next) => {
   try {
     const { branchId } = req.query
     const { range, from, to, granularity, buckets } = parseDateRange(req.query)
 
+    // ⭐ NEW: Tính kỳ trước (cùng độ dài, lùi về trước period)
+    //   - day: lùi 1 ngày (hôm qua)
+    //   - week: lùi 7 ngày
+    //   - month: lùi 30 ngày
+    //   - custom: lùi đúng số ngày của range hiện tại
+    const periodMs = to.getTime() - from.getTime()
+    const prevTo   = new Date(from.getTime() - 1)             // 1ms trước "from" hiện tại
+    const prevFrom = new Date(prevTo.getTime() - periodMs)
+    prevFrom.setHours(0, 0, 0, 0)
+    prevTo.setHours(23, 59, 59, 999)
+
     const today = new Date()
     const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0)
     const endOfDay   = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999)
 
-    // Filter theo branchId
     const branchFilter = branchId ? { branchId: new mongoose.Types.ObjectId(branchId) } : {}
 
-    // Run mọi thứ song song
     const [
       roomStatus,
       revenueData,
+      // ⭐ NEW: Doanh thu kỳ trước (để chart so sánh)
+      revenueDataPrev,
       todayCheckIns,
       todayCheckOuts,
       pendingBookings,
       todayRevenueAgg,
+      topRooms,
+      revenueByRoomType,
     ] = await Promise.all([
       computeRoomStatusCounts(branchId),
       computeRevenueData(branchId, from, to, granularity),
-      // Nhận phòng hôm nay (đã actual check-in)
+      computeRevenueData(branchId, prevFrom, prevTo, granularity),
       Booking.countDocuments({
         ...branchFilter,
         actualCheckIn: { $gte: startOfDay, $lte: endOfDay },
       }),
-      // Trả phòng hôm nay (đã actual check-out)
       Booking.countDocuments({
         ...branchFilter,
         actualCheckOut: { $gte: startOfDay, $lte: endOfDay },
       }),
-      // Booking đang chờ check-in (reserved/confirmed)
       Booking.countDocuments({
         ...branchFilter,
         status: { $in: ['reserved', 'confirmed'] },
       }),
-      // Doanh thu hôm nay riêng (luôn show, không phụ thuộc range tab)
       Booking.aggregate([
         {
           $match: {
@@ -236,16 +363,16 @@ const getStats = async (req, res, next) => {
         },
         { $group: { _id: null, total: { $sum: { $ifNull: ['$totalAmount', 0] } } } },
       ]),
+      computeTopRooms(branchId, from, to, 5),
+      computeRevenueByRoomType(branchId, from, to),
     ])
 
     const todayRevenue = todayRevenueAgg[0]?.total ?? 0
 
-    // KPI tính từ revenueData của tab range
     const aov = revenueData.totalBookings > 0
       ? Math.round(revenueData.totalRevenue / revenueData.totalBookings)
       : 0
 
-    // ARPU = doanh thu / số phòng đã được dùng (trong range)
     const arpu = roomStatus.totalRooms > 0
       ? Math.round(revenueData.totalRevenue / roomStatus.totalRooms)
       : 0
@@ -253,6 +380,19 @@ const getStats = async (req, res, next) => {
     const occupancyRate = roomStatus.totalRooms > 0
       ? Math.round((roomStatus.counts.occupied / roomStatus.totalRooms) * 100)
       : 0
+
+    // ⭐ NEW: % thay đổi so với kỳ trước
+    //   - prev > 0: tính %  ((cur - prev) / prev) * 100
+    //   - prev = 0 và cur > 0: 100% (tăng từ 0)
+    //   - cả 2 = 0: 0%
+    const prevRev = revenueDataPrev.totalRevenue
+    const curRev  = revenueData.totalRevenue
+    let revenueChangePct = 0
+    if (prevRev > 0) {
+      revenueChangePct = Math.round(((curRev - prevRev) / prevRev) * 100)
+    } else if (curRev > 0) {
+      revenueChangePct = 100
+    }
 
     res.json({
       success: true,
@@ -269,11 +409,17 @@ const getStats = async (req, res, next) => {
         occupancyRate,
 
         // ── Doanh thu ──
-        todayRevenue,                                  // luôn là hôm nay
-        rangeRevenue:   revenueData.totalRevenue,      // theo tab range
+        todayRevenue,
+        rangeRevenue:   revenueData.totalRevenue,
         rangeBookings:  revenueData.totalBookings,
-        revenueChart:   revenueData.revenueChart,      // [{key, amount, count}]
-        range:          { type: range, from, to, granularity, buckets },
+        revenueChart:   revenueData.revenueChart,
+        // ⭐ NEW: kỳ trước + % thay đổi
+        previousRangeRevenue:  revenueDataPrev.totalRevenue,
+        previousRangeBookings: revenueDataPrev.totalBookings,
+        revenueChartPrevious:  revenueDataPrev.revenueChart,
+        revenueChangePct,
+        previousRange: { from: prevFrom, to: prevTo },
+        range:         { type: range, from, to, granularity, buckets },
 
         // ── Activity hôm nay ──
         todayCheckIns,
@@ -281,8 +427,12 @@ const getStats = async (req, res, next) => {
         pendingBookings,
 
         // ── KPI ──
-        aov,    // Average Order Value (doanh thu / số booking trong range)
-        arpu,   // Avg Revenue Per Room (doanh thu / số phòng tổng)
+        aov,
+        arpu,
+
+        // Top rooms + pie
+        topRooms,
+        revenueByRoomType,
       },
     })
   } catch (err) {

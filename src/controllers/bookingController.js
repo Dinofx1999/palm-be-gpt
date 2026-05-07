@@ -9,14 +9,11 @@ const { calculatePrice } = require('../utils/priceCalculator');
 const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 
-// ⭐ NEW: Role guard cho undo check-in/check-out
-//   Chỉ Admin + Manager mới được phép hoàn tác
-//   Defense in depth: dù FE đã ẩn button, BE vẫn validate
-//   ⭐ Role names theo Mongoose User schema enum: 'Admin' | 'Manager' | 'Receptionist' | 'Staff'
+// ⭐ Role guard cho undo check-in/check-out — chỉ Admin/Manager
 const ALLOWED_UNDO_ROLES = ['Admin', 'Manager']
 
-// ⭐ NEW: Roles được phép set atTime/actualCheckOut quá khứ với BẤT KỲ phòng nào
-//   Roles khác chỉ được phép nếu phòng ĐÃ TỪNG checkout (audit log có action 'checkout' / 'checkout_room')
+// ⭐ Roles được phép set giờ checkout quá khứ với BẤT KỲ phòng nào
+//    Roles khác chỉ được phép nếu phòng ĐÃ TỪNG checkout (qua audit log)
 const PRIVILEGED_PAST_ROLES = ['Admin', 'Manager']
 
 const checkUndoPermission = (user) => {
@@ -39,11 +36,7 @@ const checkUndoPermission = (user) => {
   return { ok: true }
 }
 
-// ⭐ NEW: Lấy log checkout gần nhất của 1 booking (qua audit log)
-//   - Nếu có roomNumber: chỉ check phòng đó (cho per-room trong đoàn)
-//   - Nếu không: check booking đơn (action='checkout')
-//   Trả về log object hoặc null
-//   Dùng cho phân quyền + lấy giờ actualCheckOut cũ để hiển thị read-only cho Receptionist
+// ⭐ Lấy log checkout gần nhất của 1 booking
 const getLastCheckoutLog = async (bookingId, roomNumber = null) => {
   try {
     const filter = {
@@ -51,11 +44,9 @@ const getLastCheckoutLog = async (bookingId, roomNumber = null) => {
       entityId:   bookingId,
       action:     { $in: ['checkout', 'checkout_room'] },
     }
-    // Nếu là per-room → match metadata.roomNumber chính xác
     if (roomNumber) {
       filter['metadata.roomNumber'] = String(roomNumber)
     }
-    // Lấy log mới nhất (createdAt desc)
     const log = await AuditLog.findOne(filter)
       .sort({ createdAt: -1 })
       .select('_id createdAt action metadata')
@@ -63,40 +54,31 @@ const getLastCheckoutLog = async (bookingId, roomNumber = null) => {
     return log ?? null
   } catch (err) {
     console.error('[getLastCheckoutLog] error:', err.message)
-    // Lỗi DB → fail-safe: trả null (không cho set quá khứ nếu không verify được)
     return null
   }
 }
 
-// Wrapper giữ API cũ — true nếu có log
 const hasBookingBeenCheckedOut = async (bookingId, roomNumber = null) => {
   const log = await getLastCheckoutLog(bookingId, roomNumber)
   return !!log
 }
 
-// ⭐ NEW: Tổng hợp logic phân quyền "set giờ quá khứ"
-//   Trả về { canSetPast, reason, lastCheckoutAt }
-//   - reason: chỉ có khi canSetPast = false
-//   - lastCheckoutAt: giờ actualCheckOut cũ (lấy từ audit log) — dùng cho Receptionist read-only
+// ⭐ Phân quyền "set giờ quá khứ"
 const canSetPastTime = async (user, bookingId, roomNumber = null) => {
   if (!user) {
     return { canSetPast: false, reason: 'Cần đăng nhập', lastCheckoutAt: null }
   }
-  // Admin/Manager: luôn được
   if (PRIVILEGED_PAST_ROLES.includes(user.role)) {
-    // Vẫn lấy lastCheckoutAt nếu có — FE có thể dùng làm hint (default value)
     const log = await getLastCheckoutLog(bookingId, roomNumber)
     return {
       canSetPast: true,
       lastCheckoutAt: log?.metadata?.actualCheckOut ?? null,
     }
   }
-  // Khác: chỉ được nếu phòng đã từng checkout
   const log = await getLastCheckoutLog(bookingId, roomNumber)
   if (log) {
     return {
       canSetPast: true,
-      // ⭐ Lấy giờ actualCheckOut cũ để FE fill vào DateTimePicker (read-only cho Receptionist)
       lastCheckoutAt: log.metadata?.actualCheckOut ?? null,
     }
   }
@@ -105,6 +87,156 @@ const canSetPastTime = async (user, bookingId, roomNumber = null) => {
     reason: 'Chỉ Admin/Manager được phép set giờ trả phòng quá khứ. Nhân viên chỉ được sửa nếu phòng đã từng trả phòng (đã từng checkout).',
     lastCheckoutAt: null,
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ FIX TRIỆT ĐỂ: Tìm booking conflict THẬT SỰ trên 1 phòng cụ thể
+//
+// VẤN ĐỀ CŨ:
+// - Query include status 'checked_out' → match cả booking đã trả rồi
+// - So sánh dùng checkIn/checkOut DỰ KIẾN cấp booking
+//   → 2 booking liên tiếp trong cùng ngày bị xem là conflict dù thực tế không overlap
+//
+// LOGIC MỚI:
+// 1. Chỉ status active: confirmed/reserved/checked_in (BỎ checked_out)
+// 2. Resolve interval THỰC TẾ của candidate:
+//    [actualCheckIn ?? checkIn, actualCheckOut ?? checkOut]
+// 3. Bỏ qua sub-room đã checked_out trong booking đoàn
+// 4. So sánh overlap chuẩn: a < d && c < b
+// ════════════════════════════════════════════════════════════════════════════
+const findActiveConflictForRoom = async ({
+  bookingId, roomId, intervalStart, intervalEnd,
+}) => {
+  const candidates = await Booking.find({
+    _id:    { $ne: bookingId },
+    $or: [
+      { roomId },
+      { 'rooms.roomId': roomId },
+    ],
+    // ⭐ CHỈ status đang active — bỏ checked_out (phòng đã trống)
+    status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
+  }).sort({ checkIn: 1 })
+
+  for (const cand of candidates) {
+    let candRoom    = null
+    let candStatus  = cand.status
+    let candStart   = null
+    let candEnd     = null
+
+    if (Array.isArray(cand.rooms) && cand.rooms.length > 0) {
+      // Booking đoàn → tìm sub-room match roomId
+      candRoom = cand.rooms.find(r =>
+        String(r.roomId?._id ?? r.roomId) === String(roomId)
+      )
+      if (!candRoom) continue
+      // Bỏ qua sub-room đã trả/cancel (phòng đã giải phóng)
+      if (['checked_out', 'cancelled'].includes(candRoom.status)) continue
+      candStatus = candRoom.status
+      candStart  = candRoom.actualCheckIn  ?? candRoom.checkIn  ?? cand.checkIn
+      candEnd    = candRoom.actualCheckOut ?? candRoom.checkOut ?? cand.checkOut
+    } else {
+      // Booking đơn — match qua cand.roomId
+      if (String(cand.roomId) !== String(roomId)) continue
+      candStart = cand.actualCheckIn  ?? cand.checkIn
+      candEnd   = cand.actualCheckOut ?? cand.checkOut
+    }
+
+    if (!candStart || !candEnd) continue
+
+    // ⭐ Overlap check chuẩn: [a,b] vs [c,d] overlap khi a < d && c < b
+    const overlap = new Date(intervalStart) < new Date(candEnd) &&
+                    new Date(candStart)     < new Date(intervalEnd)
+    if (!overlap) continue
+
+    return {
+      conflict:        cand,
+      conflictRoom:    candRoom,
+      conflictStart:   candStart,
+      conflictEnd:     candEnd,
+      conflictStatus:  candStatus,
+    }
+  }
+
+  return null
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ HELPER: Tìm conflict khi TẠO MỚI / ĐỔI NGÀY booking
+//
+// Khác với findActiveConflictForRoom:
+// - Đây là check overlap [intervalStart, intervalEnd] với BẤT KỲ booking active
+//   nào trên cùng phòng (xét cả actualCheckIn/actualCheckOut nếu có)
+// - Tham số: bookingIds (mảng) — bỏ qua các booking này (vd update self)
+//
+// LOGIC:
+// 1. Status active: confirmed/reserved/checked_in (BỎ checked_out, cancelled)
+// 2. Resolve interval thực tế của candidate:
+//    [actualCheckIn ?? checkIn, actualCheckOut ?? checkOut]
+//    → Quan trọng: nếu khách check-in sớm (actualCheckIn=11:00 dù checkIn=14:00),
+//      booking mới đặt 11:30 vẫn bị block đúng
+// 3. Per-sub-room cho booking đoàn (skip checked_out/cancelled sub)
+// 4. Overlap chuẩn: a < d && c < b (>=, <= không tính là overlap → cho phép
+//    nối tiếp đúng giờ: A trả 12:00, B nhận 12:00 → OK)
+// ════════════════════════════════════════════════════════════════════════════
+const findOverlapForNewBooking = async ({
+  roomId, intervalStart, intervalEnd,
+  excludeBookingIds = [],
+}) => {
+  const filter = {
+    $or: [
+      { roomId },
+      { 'rooms.roomId': roomId },
+    ],
+    status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+  }
+  if (excludeBookingIds.length > 0) {
+    filter._id = { $nin: excludeBookingIds }
+  }
+
+  const candidates = await Booking.find(filter).sort({ checkIn: 1 })
+
+  for (const cand of candidates) {
+    let candRoom    = null
+    let candStart   = null
+    let candEnd     = null
+    let candStatus  = cand.status
+
+    if (Array.isArray(cand.rooms) && cand.rooms.length > 0) {
+      // Booking đoàn — tìm sub-room cụ thể
+      candRoom = cand.rooms.find(r =>
+        String(r.roomId?._id ?? r.roomId) === String(roomId)
+      )
+      if (!candRoom) continue
+      // Bỏ qua sub-room đã trả/hủy
+      if (['checked_out', 'cancelled'].includes(candRoom.status)) continue
+      candStatus = candRoom.status
+      candStart  = candRoom.actualCheckIn  ?? candRoom.checkIn  ?? cand.checkIn
+      candEnd    = candRoom.actualCheckOut ?? candRoom.checkOut ?? cand.checkOut
+    } else {
+      // Booking đơn — match qua cand.roomId
+      if (String(cand.roomId) !== String(roomId)) continue
+      candStart = cand.actualCheckIn  ?? cand.checkIn
+      candEnd   = cand.actualCheckOut ?? cand.checkOut
+    }
+
+    if (!candStart || !candEnd) continue
+
+    // Overlap chuẩn: [a,b] vs [c,d] overlap khi a < d && c < b
+    // Khoảng nối tiếp đúng giờ (A trả 12:00, B nhận 12:00) KHÔNG tính overlap
+    const overlap = new Date(intervalStart) < new Date(candEnd) &&
+                    new Date(candStart)     < new Date(intervalEnd)
+    if (!overlap) continue
+
+    return {
+      conflict:       cand,
+      conflictRoom:   candRoom,
+      conflictStart:  candStart,
+      conflictEnd:    candEnd,
+      conflictStatus: candStatus,
+    }
+  }
+
+  return null
 }
 
 // ── GET ALL ───────────────────────────────────────────
@@ -128,25 +260,19 @@ const getAll = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: Helper build invoice items từ priceBreakdown thực tế.
-//   - Single booking: lấy từ booking.priceBreakdown
-//   - Group: gộp tất cả booking.rooms[].priceBreakdown (bỏ phòng cancelled)
-//   Mỗi segment trong breakdown = 1 dòng item trong invoice → đúng nhất với giờ checkout thực tế.
-//   Format: 'Phòng {roomNumber} – {label segment}' (vd: 'Phòng 201 – Giá ngày (06/05 21:17 - 07/05 12:00)')
+// ⭐ Helper build invoice items từ priceBreakdown thực tế
 const buildInvoiceItemsFromBooking = (booking) => {
   const items = []
   const isGroup = Array.isArray(booking.rooms) && booking.rooms.length > 0
 
   if (isGroup) {
-    // Group: gộp breakdown từ tất cả sub-rooms (bỏ cancelled)
     for (const sub of booking.rooms) {
       if (sub.status === 'cancelled') continue
       const subBd = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
       for (const b of subBd) {
         const seg = (b && typeof b.toObject === 'function') ? b.toObject() : b
-        // Label đã có "[201] ..." prefix → chuẩn hoá lại
         const rawLabel = String(seg.label ?? '').trim()
-        const cleanLabel = rawLabel.replace(/^\[[^\]]+\]\s*/, '') // bỏ prefix [201]
+        const cleanLabel = rawLabel.replace(/^\[[^\]]+\]\s*/, '')
         items.push({
           description: `Phòng ${sub.roomNumber} – ${cleanLabel}`,
           quantity:    1,
@@ -154,7 +280,6 @@ const buildInvoiceItemsFromBooking = (booking) => {
           amount:      Number(seg.amount ?? 0),
         })
       }
-      // Services của sub-room (nếu có)
       if ((sub.servicesAmount ?? 0) > 0) {
         items.push({
           description: `Phòng ${sub.roomNumber} – Dịch vụ`,
@@ -165,7 +290,6 @@ const buildInvoiceItemsFromBooking = (booking) => {
       }
     }
   } else {
-    // Single booking
     const bd = Array.isArray(booking.priceBreakdown) ? booking.priceBreakdown : []
     for (const b of bd) {
       const seg = (b && typeof b.toObject === 'function') ? b.toObject() : b
@@ -176,7 +300,6 @@ const buildInvoiceItemsFromBooking = (booking) => {
         amount:      Number(seg.amount ?? 0),
       })
     }
-    // Services
     if ((booking.servicesAmount ?? 0) > 0) {
       items.push({
         description: `Dịch vụ`,
@@ -187,7 +310,6 @@ const buildInvoiceItemsFromBooking = (booking) => {
     }
   }
 
-  // Fallback nếu không có breakdown (booking cũ): 1 dòng tổng
   if (items.length === 0) {
     items.push({
       description: `Phòng ${booking.roomNumber} – ${booking.roomType ?? ''} × ${booking.nights ?? 1} đêm`,
@@ -208,9 +330,7 @@ const getOne = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: PREVIEW PRICE — gọi từ FE để tính trước, không lưu DB
-// POST /bookings/preview-price
-// Body: { roomId, checkIn, checkOut, priceType, adults, children, policyId, confirmConvert }
+// ⭐ PREVIEW PRICE
 const previewPrice = async (req, res, next) => {
   try {
     const {
@@ -229,7 +349,6 @@ const previewPrice = async (req, res, next) => {
     if (!policy) policy = await PricePolicy.findOne({ roomTypeId: room.typeId, branchId: room.branchId, isActive: true })
 
     const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
-
     const maxChildren = room.typeId?.maxChildren ?? 0
 
     const result = calculatePrice({
@@ -238,7 +357,6 @@ const previewPrice = async (req, res, next) => {
       priceType, policy, branch, adults, children, maxAdults, maxChildren,
     })
 
-    // ⭐ NEW: Trả 400 nếu policy không enable loại giá user yêu cầu
     if (result.error) {
       return res.status(400).json({
         success: false,
@@ -257,7 +375,7 @@ const previewPrice = async (req, res, next) => {
       success: true,
       data: {
         ...result,
-        totalAmount: result.roomAmount,   // alias cho FE dễ dùng
+        totalAmount: result.roomAmount,
         policyId:    policy?._id ?? null,
         policyName:  policy?.name ?? '',
       },
@@ -278,10 +396,8 @@ const create = async (req, res, next) => {
       confirmConvert = false,
     } = req.body
 
-    // ⭐ Phone là tuỳ chọn — chuẩn hoá: rỗng/null/undefined → '' (sẽ tạo guest không có số)
     let customerPhone = (req.body.customerPhone ?? '').toString().trim()
 
-    // Phone không bắt buộc, chỉ cần customerName + roomId + ngày
     if (!customerName || !roomId || !checkIn || !checkOut)
       return res.status(400).json({ success: false, message: 'Thiếu thông tin bắt buộc (tên khách / phòng / ngày)' })
 
@@ -295,18 +411,51 @@ const create = async (req, res, next) => {
     if (checkOutDate <= checkInDate)
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
 
-    const conflict = await Booking.findOne({
+    // ⭐ Determine effective interval cho conflict check
+    //    - Nếu chỉ tạo booking (reserved/confirmed): check [checkIn, checkOut] dự kiến
+    //    - Nếu tạo + check-in luôn (status='checked_in'): khách sẽ vào ngay lúc now
+    //      → check [min(now, checkIn), checkOut] để bắt đè lên booking đang ở
+    const validInitialEarly = ['reserved', 'confirmed', 'checked_in']
+    const initialStatusEarly = validInitialEarly.includes(requestedStatus) ? requestedStatus : 'reserved'
+    const willCheckInNow = initialStatusEarly === 'checked_in'
+    const nowForCreate = new Date()
+    const conflictIntervalStart = willCheckInNow && nowForCreate < checkInDate
+      ? nowForCreate
+      : checkInDate
+    const conflictIntervalEnd = checkOutDate
+
+    const conflictResult = await findOverlapForNewBooking({
       roomId,
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: checkOutDate },
-      checkOut: { $gt: checkInDate },
+      intervalStart: conflictIntervalStart,
+      intervalEnd:   conflictIntervalEnd,
     })
-    if (conflict)
-      return res.status(400).json({ success: false, message: `Phòng đã có đặt phòng từ ${new Date(conflict.checkIn).toLocaleDateString('vi-VN')} đến ${new Date(conflict.checkOut).toLocaleDateString('vi-VN')}` })
+    if (conflictResult) {
+      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const statusLabel = {
+        reserved:   'đã đặt',
+        confirmed:  'đã xác nhận',
+        checked_in: 'đang ở',
+      }[conflictStatus] ?? conflictStatus
+      const actionLabel = willCheckInNow ? 'nhận phòng ngay' : 'đặt phòng'
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_OVERLAP',
+        message: `Không thể ${actionLabel} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.${willCheckInNow ? ` Bạn muốn nhận phòng từ ${nowForCreate.toLocaleString('vi-VN')} nhưng phòng đang bị chiếm.` : ' Vui lòng chọn khoảng giờ khác.'}`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          conflictCheckOut:     conflictEnd,
+          conflictStatus,
+          attemptedCheckInAt:   willCheckInNow ? nowForCreate : null,
+          requestedCheckIn:     checkInDate,
+          requestedCheckOut:    checkOutDate,
+        },
+      })
+    }
 
     const branch = await Branch.findById(room.branchId)
 
-    // Áp giờ chuẩn nếu user chỉ gửi date (giờ = 00:00:00)
     const applyTimeIfMidnight = (date, timeStr) => {
       const d = new Date(date)
       if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) {
@@ -318,22 +467,18 @@ const create = async (req, res, next) => {
     const checkInFinal  = applyTimeIfMidnight(checkInDate,  branch?.checkInTime  || '14:00')
     const checkOutFinal = applyTimeIfMidnight(checkOutDate, branch?.checkOutTime || '12:00')
 
-    // Lấy policy
     let policy = policyId ? await PricePolicy.findById(policyId) : null
     if (!policy) policy = await PricePolicy.findOne({ roomTypeId: room.typeId, branchId: room.branchId, isActive: true })
 
     const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
-
     const maxChildren = room.typeId?.maxChildren ?? 0
 
-    // ⭐ Tính giá qua helper
     const priceResult = calculatePrice({
       checkIn:  checkInFinal,
       checkOut: checkOutFinal,
       priceType, policy, branch, adults, children, maxAdults, maxChildren,
     })
 
-    // ⭐ NEW: Trả 400 nếu policy không enable loại giá user yêu cầu
     if (priceResult.error) {
       return res.status(400).json({
         success: false,
@@ -348,7 +493,6 @@ const create = async (req, res, next) => {
       })
     }
 
-    // ⭐ Nếu auto-convert mà user chưa confirm → trả 422 với notice để FE hiện cảnh báo
     if (priceResult.converted && !confirmConvert) {
       return res.status(422).json({
         success: false,
@@ -364,16 +508,12 @@ const create = async (req, res, next) => {
     const roomAmount  = priceResult.roomAmount
     const totalAmount = roomAmount - (discount ?? 0)
 
-    // Tìm/tạo customer
-    // Nếu có SĐT → tìm customer có sẵn (để tích luỹ totalVisits/totalSpent)
-    // Nếu KHÔNG có SĐT (khách walk-in vô danh) → luôn tạo mới với phone=undefined
-    //   (KHÔNG dùng '' vì sparse index chỉ bỏ qua null/undefined)
     let customer
     if (customerPhone) {
       customer = await Customer.findOne({ phone: customerPhone })
       if (!customer) customer = await Customer.create({ name: customerName, phone: customerPhone })
     } else {
-      customer = await Customer.create({ name: customerName })   // ⭐ không truyền phone
+      customer = await Customer.create({ name: customerName })
     }
 
     const validInitial  = ['reserved', 'confirmed', 'checked_in']
@@ -398,10 +538,9 @@ const create = async (req, res, next) => {
       isFreeRoom:      false,
       roomAmount, totalAmount,
       servicesAmount: 0,
-      priceBreakdown: priceResult.breakdown,   // ⭐ Lưu breakdown chi tiết
+      priceBreakdown: priceResult.breakdown,
       policyId:       policy?._id ?? null,
       policyName:     policy?.name ?? '',
-      // ⭐ Snapshot policy để tính lại đúng khi chuyển phòng (segment 1)
       policySnapshot: policy ? buildPolicySnapshot(policy, room.typeId?.capacity ?? null) : null,
       status:         initialStatus,
       actualCheckIn:  initialStatus === 'checked_in' ? new Date() : null,
@@ -412,7 +551,6 @@ const create = async (req, res, next) => {
       currentGuestName: customerName,
     })
 
-    // ⭐ Audit
     await logAction({
       entityType: 'Booking', entityId: booking._id,
       action: initialStatus === 'checked_in' ? 'create_and_checkin' : 'create',
@@ -464,7 +602,6 @@ const update = async (req, res, next) => {
     const booking = await Booking.findByIdAndUpdate(req.params.id, payload, { new: true })
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
-    // ⭐ Audit — chỉ log nếu có thay đổi quan trọng
     const changedFields = Object.keys(payload).filter(k => !['nights','roomAmount','totalAmount'].includes(k))
     if (changedFields.length > 0) {
       await logAction({
@@ -497,27 +634,44 @@ const changeDates = async (req, res, next) => {
     if (newCheckOut <= newCheckIn)
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
 
-    // ⭐ Conflict check — bao gồm cả phòng đoàn (rooms[].roomId)
     const allRoomIds = [booking.roomId]
     if (Array.isArray(booking.rooms)) {
       for (const sr of booking.rooms) {
         if (sr.roomId) allRoomIds.push(sr.roomId)
       }
     }
-    const conflict = await Booking.findOne({
-      _id:      { $ne: booking._id },
-      $or: [
-        { roomId:         { $in: allRoomIds } },
-        { 'rooms.roomId': { $in: allRoomIds } },
-      ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: newCheckOut },
-      checkOut: { $gt: newCheckIn },
-    })
-    if (conflict)
-      return res.status(400).json({ success: false, message: `Trùng với đặt phòng khác` })
 
-    // ⭐ Tính lại giá theo logic mới
+    // ⭐ Check conflict cho từng phòng riêng biệt
+    for (const rid of allRoomIds) {
+      if (!rid) continue
+      const conflictResult = await findOverlapForNewBooking({
+        roomId:        rid,
+        intervalStart: newCheckIn,
+        intervalEnd:   newCheckOut,
+        excludeBookingIds: [booking._id],
+      })
+      if (conflictResult) {
+        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const statusLabel = {
+          reserved:   'đã đặt',
+          confirmed:  'đã xác nhận',
+          checked_in: 'đang ở',
+        }[conflictStatus] ?? conflictStatus
+        return res.status(400).json({
+          success: false,
+          code: 'CONFLICT_OVERLAP',
+          message: `Trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+          data: {
+            conflictBookingId:    conflict._id,
+            conflictCustomerName: conflict.customerName,
+            conflictCheckIn:      conflictStart,
+            conflictCheckOut:     conflictEnd,
+            conflictStatus,
+          },
+        })
+      }
+    }
+
     const room   = await Room.findById(booking.roomId).populate('typeId')
     const branch = await Branch.findById(booking.branchId)
     const policy = booking.policyId ? await PricePolicy.findById(booking.policyId) : null
@@ -530,7 +684,6 @@ const changeDates = async (req, res, next) => {
       adults: booking.adults, children: booking.children, maxAdults, maxChildren,
     })
 
-    // ⭐ NEW: Trả 400 nếu policy không enable loại giá
     if (priceResult.error) {
       return res.status(400).json({
         success: false,
@@ -560,8 +713,6 @@ const changeDates = async (req, res, next) => {
     booking.roomAmount  = priceResult.roomAmount
     booking.totalAmount = priceResult.roomAmount + (booking.servicesAmount ?? 0) - (booking.discount ?? 0)
 
-    // ⭐ NEW: Nếu khách đã check-in → đổi giờ check-in thực tế (actualCheckIn),
-    //   giữ nguyên checkIn dự kiến. Ngược lại (reserved) → đổi checkIn dự kiến như cũ.
     let updatedActualCheckIn = false
     if (booking.status === 'checked_in') {
       booking.actualCheckIn = newCheckIn
@@ -571,7 +722,6 @@ const changeDates = async (req, res, next) => {
     }
     await booking.save()
 
-    // ⭐ Audit
     await logAction({
       entityType: 'Booking', entityId: booking._id,
       action: 'change_dates',
@@ -583,7 +733,7 @@ const changeDates = async (req, res, next) => {
         newCheckIn, newCheckOut,
         nights: booking.nights,
         roomAmount: booking.roomAmount,
-        updatedActualCheckIn,   // ⭐ flag để biết đổi loại nào
+        updatedActualCheckIn,
       },
     })
 
@@ -595,9 +745,7 @@ const changeDates = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: PATCH /bookings/:id/change-dates-room
-//   Đổi ngày RIÊNG cho 1 phòng trong đoàn (không ảnh hưởng phòng khác)
-//   Body: { roomId, checkIn, checkOut, confirmConvert? }
+// ⭐ PATCH /bookings/:id/change-dates-room
 const changeDatesRoom = async (req, res, next) => {
   try {
     const { roomId: subRoomId, checkIn, checkOut, confirmConvert = false } = req.body
@@ -615,7 +763,6 @@ const changeDatesRoom = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Booking không có phòng đoàn' })
     }
 
-    // Tìm sub-room
     const subRoom = booking.rooms.find(sr => String(sr.roomId?._id ?? sr.roomId) === String(subRoomId))
     if (!subRoom) {
       return res.status(404).json({ success: false, message: 'Phòng không thuộc đoàn này' })
@@ -630,22 +777,33 @@ const changeDatesRoom = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
     }
 
-    // ⭐ Conflict check — chỉ check phòng này (subRoomId) với booking khác
-    const conflict = await Booking.findOne({
-      _id:      { $ne: booking._id },
-      $or: [
-        { roomId:         subRoomId },
-        { 'rooms.roomId': subRoomId },
-      ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: newCheckOut },
-      checkOut: { $gt: newCheckIn },
+    const conflictResult = await findOverlapForNewBooking({
+      roomId:        subRoomId,
+      intervalStart: newCheckIn,
+      intervalEnd:   newCheckOut,
+      excludeBookingIds: [booking._id],
     })
-    if (conflict) {
-      return res.status(400).json({ success: false, message: `Phòng ${subRoom.roomNumber} bị trùng với đặt phòng khác` })
+    if (conflictResult) {
+      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const statusLabel = {
+        reserved:   'đã đặt',
+        confirmed:  'đã xác nhận',
+        checked_in: 'đang ở',
+      }[conflictStatus] ?? conflictStatus
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_OVERLAP',
+        message: `Phòng ${subRoom.roomNumber} bị trùng với đặt phòng khác (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          conflictCheckOut:     conflictEnd,
+          conflictStatus,
+        },
+      })
     }
 
-    // ⭐ Recalc giá cho sub-room này theo dates mới
     const room   = await Room.findById(subRoom.roomId).populate('typeId')
     const branch = await Branch.findById(booking.branchId)
     const policy = subRoom.policyId ? await PricePolicy.findById(subRoom.policyId)
@@ -664,7 +822,6 @@ const changeDatesRoom = async (req, res, next) => {
       maxAdults, maxChildren,
     })
 
-    // ⭐ NEW: Trả 400 nếu policy không enable loại giá
     if (priceResult.error) {
       return res.status(400).json({
         success: false,
@@ -689,18 +846,14 @@ const changeDatesRoom = async (req, res, next) => {
       })
     }
 
-    // ⭐ Cập nhật sub-room
     const oldCheckIn  = subRoom.checkIn  ?? booking.checkIn
     const oldCheckOut = subRoom.checkOut ?? booking.checkOut
     const oldActualCheckIn = subRoom.actualCheckIn ?? null
 
-    // ⭐ NEW: Nếu sub-room đã check-in → đổi actualCheckIn (giờ thực tế),
-    //   KHÔNG đụng checkIn dự kiến. Ngược lại (reserved) → đổi checkIn dự kiến.
     let updatedActualCheckIn = false
     if (subRoom.status === 'checked_in') {
       subRoom.actualCheckIn = newCheckIn
       updatedActualCheckIn  = true
-      // checkIn dự kiến: giữ nguyên (không đụng)
     } else {
       subRoom.checkIn = newCheckIn
     }
@@ -712,14 +865,9 @@ const changeDatesRoom = async (req, res, next) => {
       label:  String(b.label ?? ''),
       amount: Number(b.amount ?? 0),
       type:   b.type === 'surcharge' ? 'surcharge' : 'base',
-      // ⭐ Inject roomNumber vào meta để FE group bill theo phòng
       meta:   { ...(b.meta || {}), roomNumber: subRoom.roomNumber },
     }))
 
-    // ⭐ Auto-backfill các sub-room khác CHƯA có checkIn/checkOut
-    //   Nếu KHÔNG backfill → sau khi sync booking.checkIn (min) → các sub-room này
-    //   sẽ đọc booking.checkIn (mới) làm fallback → bị đổi theo!
-    //   Backfill = giữ nguyên dates cũ cho các phòng KHÔNG được đổi
     for (const other of booking.rooms) {
       if (other === subRoom) continue
       if (!other.checkIn)  other.checkIn  = booking.checkIn
@@ -727,12 +875,9 @@ const changeDatesRoom = async (req, res, next) => {
       if (!other.nights)   other.nights   = booking.nights
     }
 
-    // ⭐ Sync roomAmount root = sum tất cả sub-room
     booking.roomAmount = booking.rooms.reduce((s, sr) => s + (sr.roomAmount ?? 0), 0)
     booking.totalAmount = booking.roomAmount + (booking.servicesAmount ?? 0) - (booking.discount ?? 0) + (booking.transferFee ?? 0)
 
-    // ⭐ Sync booking.checkIn/checkOut = min/max của tất cả sub-room (cho hiển thị tổng quan)
-    //   AN TOÀN vì giờ các sub-room khác đã có dates riêng (vừa backfill ở trên)
     const allCheckIns  = booking.rooms.map(sr => sr.checkIn  ?? booking.checkIn)
     const allCheckOuts = booking.rooms.map(sr => sr.checkOut ?? booking.checkOut)
     booking.checkIn  = new Date(Math.min(...allCheckIns.map(d => new Date(d).getTime())))
@@ -740,7 +885,6 @@ const changeDatesRoom = async (req, res, next) => {
 
     await booking.save()
 
-    // ⭐ Audit log
     await logAction({
       entityType: 'Booking', entityId: booking._id,
       action: 'change_dates',
@@ -751,11 +895,11 @@ const changeDatesRoom = async (req, res, next) => {
       metadata: {
         roomId: subRoomId, roomNumber: subRoom.roomNumber,
         oldCheckIn, oldCheckOut,
-        oldActualCheckIn,                    // ⭐ giờ thực tế cũ (nếu có)
+        oldActualCheckIn,
         newCheckIn, newCheckOut,
         nights: priceResult.nights, roomAmount: priceResult.roomAmount,
         bookingId: booking._id,
-        updatedActualCheckIn,                // ⭐ flag để biết đổi loại nào
+        updatedActualCheckIn,
       },
     })
 
@@ -771,19 +915,6 @@ const changeDatesRoom = async (req, res, next) => {
 }
 
 // ── MOVE ROOM ─────────────────────────────────────────
-// (… toàn bộ moveRoom, changePolicy, checkin, checkinRoom, checkout, checkoutRoom,
-//   cancel, undo, undoRoom, getAvailableByDate, applyDiscount, calculateBill,
-//   allocatePaymentToRooms, getAvailableByType, calculateGroupPrice,
-//   previewGroup, createGroup — GIỮ NGUYÊN từ file gốc)
-//
-// Lý do: 4 patches chỉ ảnh hưởng chỗ gọi calculatePrice(). Các function khác
-// không trực tiếp gọi calculatePrice nên không cần sửa. Phần dưới em copy
-// nguyên văn từ file gốc anh đã paste.
-// ──────────────────────────────────────────────────────────
-
-// ⭐ TRỌN BỘ PHẦN CÒN LẠI từ file gốc — KHÔNG SỬA — bắt đầu từ moveRoom
-// ──────────────────────────────────────────────────────────
-
 const moveRoom = async (req, res, next) => {
   try {
     const {
@@ -833,32 +964,31 @@ const moveRoom = async (req, res, next) => {
     const checkInRange  = (isGroup && subRoom?.checkIn)  ? subRoom.checkIn  : booking.checkIn
     const checkOutRange = (isGroup && subRoom?.checkOut) ? subRoom.checkOut : booking.checkOut
 
-    const conflict1 = await Booking.findOne({
-      _id:      { $ne: booking._id },
-      roomId:   newRoomId,
-      status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-      checkIn:  { $lt: checkOutRange },
-      checkOut: { $gt: checkInRange },
+    const moveConflictResult = await findOverlapForNewBooking({
+      roomId:        newRoomId,
+      intervalStart: checkInRange,
+      intervalEnd:   checkOutRange,
+      excludeBookingIds: [booking._id],
     })
-    if (conflict1)
-      return res.status(400).json({ success: false, message: 'Phòng đích đã có đặt phòng trong khoảng này' })
-
-    const conflict2 = await Booking.findOne({
-      _id:        { $ne: booking._id },
-      'rooms.roomId': newRoomId,
-      status:     { $in: ['confirmed', 'reserved', 'checked_in'] },
-    })
-    if (conflict2) {
-      const hasOverlap = (conflict2.rooms || []).some(sr => {
-        if (String(sr.roomId) !== String(newRoomId)) return false
-        if (['cancelled', 'checked_out'].includes(sr.status)) return false
-        const ci = sr.checkIn  ?? conflict2.checkIn
-        const co = sr.checkOut ?? conflict2.checkOut
-        return ci < checkOutRange && co > checkInRange
+    if (moveConflictResult) {
+      const { conflict, conflictStart, conflictEnd, conflictStatus } = moveConflictResult
+      const statusLabel = {
+        reserved:   'đã đặt',
+        confirmed:  'đã xác nhận',
+        checked_in: 'đang ở',
+      }[conflictStatus] ?? conflictStatus
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_OVERLAP',
+        message: `Phòng đích đã có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          conflictCheckOut:     conflictEnd,
+          conflictStatus,
+        },
       })
-      if (hasOverlap) {
-        return res.status(400).json({ success: false, message: 'Phòng đích đã có đặt phòng (đoàn) trong khoảng này' })
-      }
     }
 
     const oldRoomId      = isGroup ? subRoom.roomId       : booking.roomId
@@ -887,12 +1017,8 @@ const moveRoom = async (req, res, next) => {
 
       if (snap && (snap.dayEnabled || snap.hourEnabled || snap.nightEnabled || (snap.dayPrice && snap.dayPrice > 0) || (snap.nightPrice && snap.nightPrice > 0))) {
         oldPolicy = snap
-        console.log('[moveRoom] seg1 using snapshot:', snap.name, 'dayPrice:', snap.dayPrice)
       } else if (sourcePolicyId) {
         oldPolicy = await PricePolicy.findById(sourcePolicyId)
-        console.log('[moveRoom] seg1 fallback to PricePolicy.findById:', oldPolicy?.name, 'dayPrice:', oldPolicy?.dayPrice)
-      } else {
-        console.log('[moveRoom] ⚠️ seg1 no oldPolicy → pro-rata fallback')
       }
 
       const oldMaxAdults   = snap?.maxAdults   ?? oldRoom?.typeId?.maxAdults   ?? snap?.capacity ?? oldRoom?.typeId?.capacity ?? 2
@@ -945,8 +1071,6 @@ const moveRoom = async (req, res, next) => {
             label: `[${oldRoomNumber}] ${b.label}`,
             meta:  { ...(b.meta || {}), segment: 1, roomNumber: oldRoomNumber, policyId: sourcePolicyId },
           }))
-          console.log('[moveRoom seg1] amount=', seg1Amount,
-                      'items=', seg1Items.map(b => `${b.label}: ${b.amount}`))
         } else {
           const oldNights = Math.max(1, currentNights || 1)
           if (sourcePriceType === 'hour') {
@@ -1019,34 +1143,19 @@ const moveRoom = async (req, res, next) => {
       if (applyNewPrice && newPolicyId) {
         let sourceSnapshot = null
         const oldPolId = subRoom.policyId ?? booking.policyId
-        console.log('[moveRoom group] Pre-recalc: subRoom.policyId=', subRoom.policyId,
-                    '| booking.policyId=', booking.policyId,
-                    '| newPolicyId=', newPolicyId,
-                    '| oldPolId resolved=', oldPolId,
-                    '| same as new?=', String(oldPolId) === String(newPolicyId))
         if (oldPolId) {
           try {
             const oldPol = await PricePolicy.findById(oldPolId)
             if (oldPol) {
               const oldCap = oldRoom?.typeId?.capacity ?? booking.policySnapshot?.capacity ?? 2
               sourceSnapshot = buildPolicySnapshot(oldPol, oldCap)
-              console.log('[moveRoom group] Built snapshot from oldPolId:',
-                          oldPol.name, 'dayPrice=', oldPol.dayPrice,
-                          'capacity=', oldCap)
-            } else {
-              console.log('[moveRoom group] ⚠️ oldPolId not found in DB:', oldPolId)
             }
           } catch (e) {
-            console.log('[moveRoom group] ⚠️ Error fetching oldPolicy:', e.message)
+            console.log('[moveRoom group] Error fetching oldPolicy:', e.message)
           }
         }
         if (!sourceSnapshot && booking.policySnapshot) {
           sourceSnapshot = booking.policySnapshot
-          console.log('[moveRoom group] Fallback to booking.policySnapshot:',
-                      booking.policySnapshot.name, 'dayPrice=', booking.policySnapshot.dayPrice)
-        }
-        if (!sourceSnapshot) {
-          console.log('[moveRoom group] ⚠️ NO source snapshot — will pro-rata fallback in recalc')
         }
 
         const recalc = await recalcMoveBreakdown({
@@ -1200,7 +1309,6 @@ const moveRoom = async (req, res, next) => {
       usedTransferAt    = recalc.usedSplit
       booking.policyId       = recalc.newPolicy._id
       booking.policyName     = recalc.newPolicy.name
-      // ⭐ Snapshot dùng total = maxAdults + maxChildren cho backward compat
       booking.policySnapshot = buildPolicySnapshot(recalc.newPolicy, (recalc.newMaxAdults ?? 0) + (recalc.newMaxChildren ?? 0))
       policyChanged          = true
     }
@@ -1289,8 +1397,7 @@ const moveRoom = async (req, res, next) => {
   }
 }
 
-// ⭐ NEW: Đổi chính sách giá (không chuyển phòng) — dùng cho modal "Đổi giá"
-// PATCH /bookings/:id/change-policy
+// ⭐ PATCH /bookings/:id/change-policy
 const changePolicy = async (req, res, next) => {
   try {
     const {
@@ -1343,6 +1450,7 @@ const changePolicy = async (req, res, next) => {
       const branch  = await Branch.findById(booking.branchId)
       const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
       const maxChildren = room?.typeId?.maxChildren ?? 0
+      const capacity    = room?.typeId?.capacity ?? (maxAdults + maxChildren)
 
       const result = calculatePrice({
         checkIn:   booking.checkIn,
@@ -1354,7 +1462,6 @@ const changePolicy = async (req, res, next) => {
         maxAdults, maxChildren,
       })
 
-      // ⭐ NEW: Trả 400 nếu policy mới không enable loại giá hiện tại của booking
       if (result.error) {
         return res.status(400).json({
           success: false,
@@ -1425,6 +1532,7 @@ const changePolicy = async (req, res, next) => {
   }
 }
 
+// ── CHECK-IN ──────────────────────────────────────────
 const checkin = async (req, res, next) => {
   try {
     const booking = await Booking.findById(req.params.id)
@@ -1433,16 +1541,79 @@ const checkin = async (req, res, next) => {
       return res.status(400).json({ success: false, message: `Không thể check-in từ trạng thái: ${booking.status}` })
 
     const now = new Date()
+
+    // ⭐ Logic check-in:
+    //   - Quy ước: cho check-in bất kỳ lúc nào nếu không overlap với booking khác
+    //   - Khoảng kiểm tra: [now hoặc booking.checkIn (chọn sớm hơn), booking.checkOut]
+    //     → Vì khách sẽ thực sự ở phòng từ giờ check-in đến giờ trả
+    //   - Nếu overlap → block
+    //   - Nếu không overlap → cho check-in, set actualCheckIn = now
+    const intervalStart = now < booking.checkIn ? now : booking.checkIn
+    const intervalEnd   = booking.checkOut
+
+    const checkConflictForCheckin = async (roomId, roomLabel) => {
+      const conflictResult = await findOverlapForNewBooking({
+        roomId,
+        intervalStart,
+        intervalEnd,
+        excludeBookingIds: [booking._id],
+      })
+      if (conflictResult) {
+        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const statusLabel = {
+          reserved:   'đã đặt',
+          confirmed:  'đã xác nhận',
+          checked_in: 'đang ở',
+        }[conflictStatus] ?? conflictStatus
+        return {
+          success: false,
+          code: 'CONFLICT_OVERLAP',
+          message: `Không thể check-in${roomLabel ? ` phòng ${roomLabel}` : ''} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}. Vui lòng đợi đến sau khi khách trên trả phòng hoặc đổi phòng khác.`,
+          data: {
+            conflictBookingId:    conflict._id,
+            conflictCustomerName: conflict.customerName,
+            conflictCheckIn:      conflictStart,
+            conflictCheckOut:     conflictEnd,
+            conflictStatus,
+            attemptedCheckInAt:   now,
+            bookingScheduledCheckIn: booking.checkIn,
+          },
+        }
+      }
+      return null
+    }
+
+    // Check tất cả phòng (đơn hoặc đoàn)
+    const roomsToCheck = []
+    if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
+      for (const sr of booking.rooms) {
+        if (['cancelled', 'checked_out'].includes(sr.status)) continue
+        if (sr.roomId) roomsToCheck.push({
+          id: String(sr.roomId._id ?? sr.roomId),
+          number: sr.roomNumber,
+        })
+      }
+    } else if (booking.roomId) {
+      roomsToCheck.push({
+        id: String(booking.roomId),
+        number: booking.roomNumber,
+      })
+    }
+
+    for (const r of roomsToCheck) {
+      const err = await checkConflictForCheckin(r.id, roomsToCheck.length > 1 ? r.number : null)
+      if (err) return res.status(400).json(err)
+    }
+
+    // ⭐ Quy ước: actualCheckIn = giờ thực tế khi bấm (kể cả check-in sớm)
     booking.status        = 'checked_in'
     booking.actualCheckIn = now
 
-    let subRoomCount = 0
     if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
       for (const sr of booking.rooms) {
         if (sr.status === 'reserved' || sr.status === 'confirmed') {
           sr.status         = 'checked_in'
           sr.actualCheckIn  = now
-          subRoomCount++
         }
       }
     }
@@ -1509,6 +1680,44 @@ const checkinRoom = async (req, res, next) => {
     }
 
     const now = new Date()
+
+    // ⭐ Logic check-in lẻ: tương tự checkin
+    //    Khoảng kiểm tra: [now hoặc sub.checkIn (chọn sớm hơn), sub.checkOut]
+    const subCheckIn  = sub.checkIn  ?? booking.checkIn
+    const subCheckOut = sub.checkOut ?? booking.checkOut
+    const intervalStart = now < subCheckIn ? now : subCheckIn
+    const intervalEnd   = subCheckOut
+
+    const conflictResult = await findOverlapForNewBooking({
+      roomId:        String(sub.roomId._id ?? sub.roomId),
+      intervalStart,
+      intervalEnd,
+      excludeBookingIds: [booking._id],
+    })
+    if (conflictResult) {
+      const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+      const statusLabel = {
+        reserved:   'đã đặt',
+        confirmed:  'đã xác nhận',
+        checked_in: 'đang ở',
+      }[conflictStatus] ?? conflictStatus
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_OVERLAP',
+        message: `Không thể check-in phòng ${sub.roomNumber} vào lúc ${now.toLocaleString('vi-VN')} — phòng đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          conflictCheckOut:     conflictEnd,
+          conflictStatus,
+          attemptedCheckInAt:   now,
+          bookingScheduledCheckIn: subCheckIn,
+        },
+      })
+    }
+
+    // ⭐ Quy ước: actualCheckIn = now (kể cả check-in sớm)
     sub.status        = 'checked_in'
     sub.actualCheckIn = now
 
@@ -1541,6 +1750,9 @@ const checkinRoom = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ CHECKOUT — ĐÃ FIX TRIỆT ĐỂ
+// ════════════════════════════════════════════════════════════════════════════
 const checkout = async (req, res, next) => {
   try {
     const { actualCheckOut } = req.body
@@ -1551,8 +1763,7 @@ const checkout = async (req, res, next) => {
 
     const actualCO = actualCheckOut ? new Date(actualCheckOut) : new Date()
 
-    // ⭐ NEW: Guard quyền checkout với giờ quá khứ
-    //   Admin/Manager bypass; user khác chỉ cho nếu booking đã từng checkout
+    // Guard quyền checkout với giờ quá khứ
     if (actualCheckOut) {
       const now = new Date()
       if (actualCO.getTime() < now.getTime() - 60000) {
@@ -1576,41 +1787,27 @@ const checkout = async (req, res, next) => {
       })
     }
 
-    const conflictBooking = await Booking.findOne({
-      _id:    { $ne: booking._id },
-      $or: [
-        { roomId:         booking.roomId },
-        { 'rooms.roomId': booking.roomId },
-      ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in', 'checked_out'] },
-      checkIn:  { $lt: actualCO },
-      checkOut: { $gt: refCheckIn },
-    }).sort({ checkIn: 1 })
+    // ⭐ FIX: Conflict check chuẩn — chỉ block khi 2 booking THẬT SỰ overlap
+    const conflictResult = await findActiveConflictForRoom({
+      bookingId:      booking._id,
+      roomId:         booking.roomId,
+      intervalStart:  refCheckIn,
+      intervalEnd:    actualCO,
+    })
 
-    if (conflictBooking) {
-      let conflictRoomCheckIn = conflictBooking.checkIn
-      let conflictRoomActualCheckIn = conflictBooking.actualCheckIn
-      if (Array.isArray(conflictBooking.rooms) && conflictBooking.rooms.length > 0) {
-        const cSub = conflictBooking.rooms.find(r => String(r.roomId?._id ?? r.roomId) === String(booking.roomId))
-        if (cSub) {
-          conflictRoomCheckIn = cSub.checkIn ?? conflictBooking.checkIn
-          conflictRoomActualCheckIn = cSub.actualCheckIn ?? conflictBooking.actualCheckIn
-        }
-      }
-      const limitTime = conflictRoomActualCheckIn ?? conflictRoomCheckIn
-      if (actualCO > new Date(limitTime)) {
-        return res.status(400).json({
-          success: false,
-          code: 'CONFLICT_NEW_BOOKING',
-          message: `Phòng ${booking.roomNumber} đã có booking khác (${conflictBooking.customerName}) nhận phòng lúc ${new Date(limitTime).toLocaleString('vi-VN')}. Giờ trả phòng phải trước thời điểm này.`,
-          data: {
-            conflictBookingId:    conflictBooking._id,
-            conflictCustomerName: conflictBooking.customerName,
-            conflictCheckIn:      limitTime,
-            requestedCheckOut:    actualCO,
-          },
-        })
-      }
+    if (conflictResult) {
+      const { conflict, conflictStart } = conflictResult
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_NEW_BOOKING',
+        message: `Phòng ${booking.roomNumber} đã có booking khác (${conflict.customerName}) nhận phòng lúc ${new Date(conflictStart).toLocaleString('vi-VN')}. Giờ trả phòng phải trước thời điểm này.`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          requestedCheckOut:    actualCO,
+        },
+      })
     }
 
     const hasCustomPriceItems = (booking.priceBreakdown ?? []).some(b => b.meta?.customPrice === true)
@@ -1682,8 +1879,6 @@ const checkout = async (req, res, next) => {
         booking.priceBreakdown = newBreakdown
         booking.discount       = recalcDiscount
         booking.totalAmount    = Math.max(0, roomPart + (booking.servicesAmount ?? 0) - recalcDiscount + (booking.transferFee || 0))
-
-        console.log(`[checkout] Custom price + early/late: ${nightsToCharge} đêm × custom = ${newRoomAmount.toLocaleString('vi-VN')}đ`)
       } catch (calcErr) {
         console.error('Recalc custom price on checkout failed:', calcErr)
       }
@@ -1705,9 +1900,6 @@ const checkout = async (req, res, next) => {
           maxAdults, maxChildren,
         })
 
-        // ⭐ NOTE: KHÔNG block checkout vì priceResult.error
-        //   Lý do: tại thời điểm checkout, booking đã tồn tại, policy có thể đã thay đổi.
-        //   Nếu có error → giữ nguyên giá cũ (không recalc) để không ảnh hưởng flow checkout.
         if (priceResult.error) {
           console.warn('[checkout] Recalc skipped due to policy mismatch:', priceResult.error.message)
         } else {
@@ -1731,31 +1923,23 @@ const checkout = async (req, res, next) => {
       }
     }
 
-    // ⭐ NEW: Recalc TẤT CẢ sub-rooms (group booking) theo giờ checkout thực tế
-    //   Lý do: nếu là đoàn, mỗi sub-room phải recalc riêng với giờ checkout = actualCO
-    //   để priceBreakdown reflect đúng thực tế. Sau đó booking.roomAmount = sum(rooms.roomAmount).
+    // Recalc TẤT CẢ sub-rooms (group booking)
     if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
       try {
         const branch = await Branch.findById(booking.branchId)
         let groupRoomTotal = 0
 
         for (const sub of booking.rooms) {
-          // Bỏ qua phòng đã checkout trước đó (giữ nguyên priceBreakdown đã chốt)
-          // và phòng cancelled
           if (sub.status === 'checked_out' || sub.status === 'cancelled') {
             groupRoomTotal += sub.roomAmount ?? 0
             continue
           }
 
-          // Recalc cho sub-room đang ở (sẽ checkout cùng lúc)
           const room   = await Room.findById(sub.roomId).populate('typeId')
           const policy = sub.policyId ? await PricePolicy.findById(sub.policyId) : null
           const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
           const maxChildren = room?.typeId?.maxChildren ?? 0
 
-          // ⭐ FIX: Detect xem sub-room đã từng chuyển phòng chưa
-          //   Nếu có seg1 (segment=1) → preserve seg1, chỉ recalc seg2 với filter
-          //   Nếu không → recalc bình thường từ actualCheckIn
           const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
           const seg1Items = []
           let splitFromTime = null
@@ -1771,7 +1955,6 @@ const checkout = async (req, res, next) => {
 
           let subPriceResult
           if (seg1Items.length > 0) {
-            // Phòng đã chuyển — preserve seg1, recalc seg2 từ splitAt → actualCO
             const splitAt = splitFromTime ? new Date(splitFromTime) : (sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn)
             const seg2Result = calculatePrice({
               checkIn:   splitAt,
@@ -1782,7 +1965,6 @@ const checkout = async (req, res, next) => {
               children:  sub.children ?? booking.children,
               maxAdults, maxChildren,
             })
-            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
               return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
@@ -1801,9 +1983,7 @@ const checkout = async (req, res, next) => {
                 })),
               ],
             }
-            console.log(`[checkout][group][moved] room ${sub.roomNumber}: seg1=${seg1Amount} + seg2=${seg2Amount} = ${subPriceResult.roomAmount}`)
           } else {
-            // Phòng bình thường (không chuyển) — recalc full
             subPriceResult = calculatePrice({
               checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
               checkOut:  actualCO,
@@ -1821,7 +2001,6 @@ const checkout = async (req, res, next) => {
             }
           }
 
-          // Update sub-room
           sub.roomAmount     = subPriceResult.roomAmount
           sub.nights         = subPriceResult.nights
           sub.priceBreakdown = (subPriceResult.breakdown ?? []).map(b => {
@@ -1835,11 +2014,8 @@ const checkout = async (req, res, next) => {
           })
 
           groupRoomTotal += sub.roomAmount
-
-          console.log(`[checkout][group] Recalc room ${sub.roomNumber}: ${sub.nights} đêm = ${sub.roomAmount}đ`)
         }
 
-        // Recalc booking.totalAmount cho group
         booking.roomAmount = groupRoomTotal
         const subtotal = groupRoomTotal + (booking.servicesAmount ?? 0)
         const pctDisc  = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
@@ -1875,7 +2051,6 @@ const checkout = async (req, res, next) => {
       }
     }
 
-    // ⭐ NEW: Sync booking.paymentStatus với invoice (booking-list hiển thị field này)
     {
       const invForStatus = await Invoice.findOne({ bookingId: booking._id })
       const paid = invForStatus?.paidAmount ?? 0
@@ -1909,7 +2084,6 @@ const checkout = async (req, res, next) => {
     }
 
     let invoice = await Invoice.findOne({ bookingId: booking._id })
-    // ⭐ NEW: Rebuild items từ priceBreakdown thực tế (mỗi segment 1 dòng)
     const newItems = buildInvoiceItemsFromBooking(booking)
 
     if (!invoice) {
@@ -1935,9 +2109,7 @@ const checkout = async (req, res, next) => {
       invoice.remainingAmount = Math.max(0, booking.totalAmount - (invoice.paidAmount ?? 0))
       invoice.paymentStatus   = invoice.paidAmount >= booking.totalAmount ? 'paid' :
                                 invoice.paidAmount > 0 ? 'partial' : 'unpaid'
-      // ⭐ NEW: Cập nhật items theo breakdown thực tế
       invoice.items   = newItems
-      // ⭐ NEW: Backfill branchId nếu invoice cũ chưa có
       if (!invoice.branchId && booking.branchId) invoice.branchId = booking.branchId
       await invoice.save()
     }
@@ -1961,6 +2133,9 @@ const checkout = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ CHECKOUT ROOM — ĐÃ FIX TRIỆT ĐỂ
+// ════════════════════════════════════════════════════════════════════════════
 const checkoutRoom = async (req, res, next) => {
   try {
     const { roomId, actualCheckOut, skipPayment = false } = req.body
@@ -1981,10 +2156,7 @@ const checkoutRoom = async (req, res, next) => {
     }
 
     const actualCO = actualCheckOut ? new Date(actualCheckOut) : new Date()
-    console.log(`[checkoutRoom] booking=${booking._id} room=${sub.roomNumber} body.actualCheckOut=${actualCheckOut} → actualCO=${actualCO.toISOString()}`)
 
-    // ⭐ NEW: Guard quyền checkout với giờ quá khứ (per-room)
-    //   Admin/Manager bypass; user khác chỉ cho nếu phòng này đã từng checkout
     if (actualCheckOut) {
       const now = new Date()
       if (actualCO.getTime() < now.getTime() - 60000) {
@@ -2012,42 +2184,28 @@ const checkoutRoom = async (req, res, next) => {
       })
     }
 
+    // ⭐ FIX: Conflict check chuẩn cho per-room
     const subRoomId = String(sub.roomId?._id ?? sub.roomId)
-    const conflictBooking = await Booking.findOne({
-      _id:    { $ne: booking._id },
-      $or: [
-        { roomId:         subRoomId },
-        { 'rooms.roomId': subRoomId },
-      ],
-      status:   { $in: ['confirmed', 'reserved', 'checked_in', 'checked_out'] },
-      checkIn:  { $lt: actualCO },
-      checkOut: { $gt: refCheckIn },
-    }).sort({ checkIn: 1 })
+    const conflictResult = await findActiveConflictForRoom({
+      bookingId:      booking._id,
+      roomId:         subRoomId,
+      intervalStart:  refCheckIn,
+      intervalEnd:    actualCO,
+    })
 
-    if (conflictBooking) {
-      let conflictRoomCheckIn = conflictBooking.checkIn
-      let conflictRoomActualCheckIn = conflictBooking.actualCheckIn
-      if (Array.isArray(conflictBooking.rooms) && conflictBooking.rooms.length > 0) {
-        const cSub = conflictBooking.rooms.find(r => String(r.roomId?._id ?? r.roomId) === subRoomId)
-        if (cSub) {
-          conflictRoomCheckIn = cSub.checkIn ?? conflictBooking.checkIn
-          conflictRoomActualCheckIn = cSub.actualCheckIn ?? conflictBooking.actualCheckIn
-        }
-      }
-      const limitTime = conflictRoomActualCheckIn ?? conflictRoomCheckIn
-      if (actualCO > new Date(limitTime)) {
-        return res.status(400).json({
-          success: false,
-          code: 'CONFLICT_NEW_BOOKING',
-          message: `Phòng ${sub.roomNumber} đã có booking khác (${conflictBooking.customerName}) nhận phòng lúc ${new Date(limitTime).toLocaleString('vi-VN')}. Giờ trả phòng phải trước thời điểm này.`,
-          data: {
-            conflictBookingId:   conflictBooking._id,
-            conflictCustomerName: conflictBooking.customerName,
-            conflictCheckIn:     limitTime,
-            requestedCheckOut:   actualCO,
-          },
-        })
-      }
+    if (conflictResult) {
+      const { conflict, conflictStart } = conflictResult
+      return res.status(400).json({
+        success: false,
+        code: 'CONFLICT_NEW_BOOKING',
+        message: `Phòng ${sub.roomNumber} đã có booking khác (${conflict.customerName}) nhận phòng lúc ${new Date(conflictStart).toLocaleString('vi-VN')}. Giờ trả phòng phải trước thời điểm này.`,
+        data: {
+          conflictBookingId:    conflict._id,
+          conflictCustomerName: conflict.customerName,
+          conflictCheckIn:      conflictStart,
+          requestedCheckOut:    actualCO,
+        },
+      })
     }
 
     const checkOutDiffMin = Math.abs((actualCO - booking.checkOut) / 60000)
@@ -2069,7 +2227,6 @@ const checkoutRoom = async (req, res, next) => {
           maxAdults, maxChildren,
         })
 
-        // ⭐ NOTE: KHÔNG block checkout vì priceResult.error (tương tự checkout đơn)
         if (priceResult.error) {
           console.warn('[checkoutRoom] Recalc skipped due to policy mismatch:', priceResult.error.message)
         } else {
@@ -2097,8 +2254,6 @@ const checkoutRoom = async (req, res, next) => {
               children:  sub.children ?? booking.children,
               maxAdults, maxChildren,
             })
-            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
-            //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
               return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
@@ -2117,8 +2272,6 @@ const checkoutRoom = async (req, res, next) => {
 
             sub.roomAmount     = seg1Amount + seg2Amount
             sub.priceBreakdown = [...seg1Items, ...seg2Items]
-            console.log('[checkoutRoom] preserved seg1:', seg1Items.length, 'items, seg1Amount=', seg1Amount,
-                        '| seg2 amount=', seg2Amount, '| total=', sub.roomAmount)
           } else {
             sub.roomAmount      = priceResult.roomAmount
             sub.priceBreakdown  = (priceResult.breakdown ?? []).map(b => ({
@@ -2181,7 +2334,7 @@ const checkoutRoom = async (req, res, next) => {
       }
     }
 
-    sub.status         = 'checked_out'
+    sub.status = 'checked_out'
 
     const totalRoomsAmount = booking.rooms.reduce((sum, r) => sum + (r.roomAmount ?? 0), 0)
     booking.roomAmount  = totalRoomsAmount
@@ -2211,7 +2364,6 @@ const checkoutRoom = async (req, res, next) => {
       booking.actualCheckOut = actualCO
     }
 
-    // ⭐ NEW: Sync booking.paymentStatus (booking-list hiển thị field này, KHÔNG phải invoice.paymentStatus)
     booking.paymentStatus = paidAmount >= booking.totalAmount ? 'paid' :
                             paidAmount > 0 ? 'partial' : 'unpaid'
 
@@ -2225,9 +2377,7 @@ const checkoutRoom = async (req, res, next) => {
       invoice.remainingAmount = Math.max(0, booking.totalAmount - paidAmount)
       invoice.paymentStatus   = paidAmount >= booking.totalAmount ? 'paid' :
                                 paidAmount > 0 ? 'partial' : 'unpaid'
-      // ⭐ NEW: Rebuild items từ all sub-rooms breakdown (gộp các phòng đã + đang checkout)
       invoice.items   = buildInvoiceItemsFromBooking(booking)
-      // ⭐ NEW: Backfill branchId nếu invoice cũ chưa có
       if (!invoice.branchId && booking.branchId) invoice.branchId = booking.branchId
       await invoice.save()
     } else if (allCheckedOut) {
@@ -2307,7 +2457,6 @@ const cancel = async (req, res, next) => {
 
 const undo = async (req, res, next) => {
   try {
-    // ⭐ Role guard — chỉ admin/manager được hoàn tác
     const perm = checkUndoPermission(req.user)
     if (!perm.ok) {
       return res.status(perm.status).json({
@@ -2353,7 +2502,6 @@ const undo = async (req, res, next) => {
       user: req.user, branchId: booking.branchId,
       metadata: {
         reason, newStatus, roomNumber: booking.roomNumber,
-        // ⭐ NEW: log thêm role để trace ai làm action này
         actorRole: req.user.role,
       },
     })
@@ -2364,7 +2512,6 @@ const undo = async (req, res, next) => {
 
 const undoRoom = async (req, res, next) => {
   try {
-    // ⭐ Role guard — chỉ admin/manager được hoàn tác
     const perm = checkUndoPermission(req.user)
     if (!perm.ok) {
       return res.status(perm.status).json({
@@ -2431,7 +2578,6 @@ const undoRoom = async (req, res, next) => {
       user: req.user, branchId: booking.branchId,
       metadata: {
         reason, roomId, roomNumber: sub.roomNumber, prevStatus, newSubStatus, bookingId: booking._id,
-        // ⭐ NEW: log thêm role để trace ai làm action này
         actorRole: req.user.role,
       },
     })
@@ -2543,15 +2689,10 @@ const calculateBill = async (req, res, next) => {
     const booking = await Booking.findById(req.params.id)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
-    // ⭐ NEW: Guard quyền set atTime quá khứ
-    //   - Admin/Manager: bypass
-    //   - Khác: chỉ cho nếu phòng đã từng checkout (qua audit log)
     if (atTime) {
       const atTimeDate = new Date(atTime)
       const now = new Date()
-      // Cho phép sai số 1 phút (avoid race condition khi user click ngay)
       if (atTimeDate.getTime() < now.getTime() - 60000) {
-        // Lấy roomNumber để check audit per-room (nếu là phòng đoàn được filter)
         let roomNumberForAudit = null
         if (filterRoomId) {
           const sub = (booking.rooms ?? []).find(r =>
@@ -2632,8 +2773,6 @@ const calculateBill = async (req, res, next) => {
             }
             const splitAt = splitFromTime ? new Date(splitFromTime) : (sr.actualCheckIn ?? booking.checkIn)
             const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
-            console.log('[calc-bill move]', sr.roomNumber, 'seg1Items count=', seg1Items.length,
-                        'seg1Amount=', seg1Amount, 'splitAt=', splitAt)
 
             const seg2Result = calculatePrice({
               checkIn:   splitAt,
@@ -2644,10 +2783,6 @@ const calculateBill = async (req, res, next) => {
               children:  sr.children ?? booking.children,
               maxAdults, maxChildren,
             })
-            // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
-            //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
-            //   Bug: khi splitAt < dayCheckInTime (vd 11:56 < 14:00), priceCalculator
-            //   tự cộng phụ thu "Nhận phòng sớm" mặc dù khách đã ở từ trước.
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
               return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
@@ -2717,13 +2852,6 @@ const calculateBill = async (req, res, next) => {
         const subDiscount = sr.discountAmount ?? 0
         const subTotalAmount = Math.max(0, totalRoomAmount + subServices - subDiscount)
 
-        console.log(`[calc-bill SINGLE] booking=${booking._id} room=${sr.roomNumber} subTotal=${subTotalAmount} sr.paidAmount=${sr.paidAmount ?? 0}`)
-
-        const otherCheckedIn = booking.rooms.filter(r =>
-          r !== sr && r.status === 'checked_in'
-        )
-        const isLastCheckedInRoom = otherCheckedIn.length === 0
-
         let subPaidAmount = sr.paidAmount ?? 0
 
         const invoiceForPay = await Invoice.findOne({ bookingId: booking._id })
@@ -2740,7 +2868,6 @@ const calculateBill = async (req, res, next) => {
         subPaidAmount = Math.min(subPaidAmount, subTotalAmount)
 
         const subRemainingAmount = Math.max(0, subTotalAmount - subPaidAmount)
-        console.log(`[calc-bill SINGLE result] room=${sr.roomNumber} isLast=${isLastCheckedInRoom} invoicePaid=${invoicePaidTotal} otherPaid=${otherSubPaidSum} excess=${excessInvoicePaid} subPaid=${subPaidAmount} subRemain=${subRemainingAmount}`)
 
         const groupRoomAmount = booking.rooms.reduce((s, r) => {
           if (r.status === 'cancelled') return s
@@ -2845,7 +2972,7 @@ const calculateBill = async (req, res, next) => {
     if (hasCustomPrice) {
       if (mode === 'now') {
         const now = new Date()
-        const parseTime = (str, refDate) => {
+        const parseTime = (str) => {
           if (!str) return null
           const dt = new Date(str)
           if (!isNaN(dt.getTime())) return dt
@@ -2959,10 +3086,6 @@ const calculateBill = async (req, res, next) => {
           children:  booking.children,
           maxAdults, maxChildren,
         })
-        // ⭐ FIX: Lọc bỏ "Nhận phòng sớm" khỏi seg 2 — phòng mới sau move
-        //   không phải nhận phòng sớm thật, chỉ là tiếp nối từ phòng cũ.
-        //   Bug: khi lastTransferAt < dayCheckInTime (vd 11:56 < 14:00), priceCalculator
-        //   tự cộng phụ thu "Nhận phòng sớm" mặc dù khách đã ở từ trước.
         const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
           const label = String(b.label || '')
           return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
@@ -2995,8 +3118,6 @@ const calculateBill = async (req, res, next) => {
       })
     }
 
-    // ⭐ NOTE: KHÔNG block calculate-bill vì priceResult.error
-    //   Chỉ log warning. UI vẫn hiển thị giá hiện tại của booking để user xử lý.
     if (priceResult.error) {
       console.warn('[calculateBill] priceResult.error:', priceResult.error.message)
     }
@@ -3113,16 +3234,6 @@ const getAvailableByType = async (req, res, next) => {
       checkOut: { $gt: ci },
     }).select('roomId rooms status customerName checkIn checkOut')
 
-    console.log('[getAvailableByType] checkIn=', ci.toISOString(), 'checkOut=', co.toISOString())
-    console.log('[getAvailableByType] allRooms count:', allRooms.length,
-      'rooms:', allRooms.map(r => `${r.number}(${r.roomStatus})`).join(', '))
-    console.log('[getAvailableByType] conflicts count:', conflicts.length)
-    conflicts.forEach(b => {
-      console.log(`  - booking ${b._id} status=${b.status} customer=${b.customerName}`,
-        `roomId=${b.roomId}`, `rooms=${(b.rooms||[]).length}`,
-        `ci=${b.checkIn?.toISOString?.()} co=${b.checkOut?.toISOString?.()}`)
-    })
-
     const bookedRoomIds = new Set()
     conflicts.forEach(b => {
       if (b.roomId) bookedRoomIds.add(String(b.roomId))
@@ -3172,7 +3283,7 @@ const getAvailableByType = async (req, res, next) => {
   }
 }
 
-// ⭐ HELPER: Tính giá cho cả nhóm phòng — dùng chung cho previewGroup + createGroup
+// ⭐ HELPER: Tính giá cho cả nhóm phòng
 async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsInput }) {
   const checkInDate  = new Date(checkIn)
   const checkOutDate = new Date(checkOut)
@@ -3200,7 +3311,6 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
       maxChildren: room.typeId?.maxChildren ?? 0,
     })
 
-    // ⭐ NEW: Throw error nếu policy không enable loại giá user yêu cầu
     if (priceResult.error) {
       const err = new Error(`Phòng ${room.number}: ${priceResult.error.message}`)
       err.code       = priceResult.error.code
@@ -3246,7 +3356,7 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
       byType.set(key, {
         typeId:      line.typeId,
         typeName:    line.typeName,
-        capacity:    line.capacity,           // legacy
+        capacity:    line.capacity,
         maxAdults:   line.maxAdults,
         maxChildren: line.maxChildren,
         rooms:       [],
@@ -3279,7 +3389,6 @@ const previewGroup = async (req, res) => {
 
     res.json({ success: true, data: result })
   } catch (err) {
-    // ⭐ NEW: Catch error 400 từ calculateGroupPrice (priceResult.error)
     if (err.statusCode === 400) {
       return res.status(400).json({
         success: false,
@@ -3317,21 +3426,41 @@ const createGroup = async (req, res, next) => {
     const branch = await Branch.findById(branchId)
     if (!branch) return res.status(404).json({ success: false, message: 'Không tìm thấy chi nhánh' })
 
+    // ⭐ Determine effective interval cho conflict check
+    const willCheckInNowGrp = initialStatus === 'checked_in'
+    const nowForGrp = new Date()
+    const grpIntervalStart = willCheckInNowGrp && nowForGrp < checkInDate
+      ? nowForGrp
+      : checkInDate
+
     for (const r of roomsInput) {
-      const conflict = await Booking.findOne({
-        $or: [
-          { roomId: r.roomId },
-          { 'rooms.roomId': r.roomId },
-        ],
-        status:   { $in: ['confirmed', 'reserved', 'checked_in'] },
-        checkIn:  { $lt: checkOutDate },
-        checkOut: { $gt: checkInDate },
+      const conflictResult = await findOverlapForNewBooking({
+        roomId:        r.roomId,
+        intervalStart: grpIntervalStart,
+        intervalEnd:   checkOutDate,
       })
-      if (conflict) {
+      if (conflictResult) {
         const room = await Room.findById(r.roomId)
+        const { conflict, conflictStart, conflictEnd, conflictStatus } = conflictResult
+        const statusLabel = {
+          reserved:   'đã đặt',
+          confirmed:  'đã xác nhận',
+          checked_in: 'đang ở',
+        }[conflictStatus] ?? conflictStatus
+        const actionLabel = willCheckInNowGrp ? 'nhận phòng ngay' : 'đặt phòng'
         return res.status(400).json({
           success: false,
-          message: `Phòng ${room?.number ?? r.roomId} đã có đặt phòng trùng lịch`,
+          code: 'CONFLICT_OVERLAP',
+          message: `Không thể ${actionLabel} — phòng ${room?.number ?? r.roomId} đang có khách (${conflict.customerName} — ${statusLabel}) từ ${new Date(conflictStart).toLocaleString('vi-VN')} đến ${new Date(conflictEnd).toLocaleString('vi-VN')}.`,
+          data: {
+            roomNumber:           room?.number ?? null,
+            conflictBookingId:    conflict._id,
+            conflictCustomerName: conflict.customerName,
+            conflictCheckIn:      conflictStart,
+            conflictCheckOut:     conflictEnd,
+            conflictStatus,
+            attemptedCheckInAt:   willCheckInNowGrp ? nowForGrp : null,
+          },
         })
       }
     }
@@ -3344,7 +3473,6 @@ const createGroup = async (req, res, next) => {
         branchId, checkIn: checkInDate, checkOut: checkOutDate, rooms: roomsInput,
       })
     } catch (err) {
-      // ⭐ NEW: Catch error 400 từ calculateGroupPrice
       if (err.statusCode === 400) {
         return res.status(400).json({
           success: false,
@@ -3368,7 +3496,6 @@ const createGroup = async (req, res, next) => {
       const policy = line.policyId ? await PricePolicy.findById(line.policyId) : null
 
       const breakdown = Array.isArray(line.breakdown) ? line.breakdown : []
-      console.log(`[createGroup] subRoom ${i} breakdown:`, breakdown.length, 'items, first:', breakdown[0])
 
       const subRoom = {
         roomId:         line.roomId,
@@ -3484,11 +3611,7 @@ const createGroup = async (req, res, next) => {
   }
 }
 
-// ⭐ NEW: GET /bookings/:id/can-set-past?roomId=xxx
-//   Trả về quyền set giờ trả phòng quá khứ
-//   - Admin/Manager: luôn cho phép
-//   - Khác: chỉ cho phép nếu phòng đã từng checkout (qua audit log)
-//   FE dùng để ẩn/hiện checkbox "Cho phép trả phòng trong quá khứ"
+// ⭐ GET /bookings/:id/can-set-past?roomId=xxx
 const getCanSetPast = async (req, res, next) => {
   try {
     const { roomId = null } = req.query
@@ -3497,7 +3620,6 @@ const getCanSetPast = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
     }
 
-    // Nếu có roomId → tìm roomNumber tương ứng (cho per-room check)
     let roomNumberForAudit = null
     if (roomId && Array.isArray(booking.rooms)) {
       const sub = booking.rooms.find(r =>
@@ -3513,11 +3635,8 @@ const getCanSetPast = async (req, res, next) => {
         canSetPast: perm.canSetPast,
         reason:     perm.reason ?? null,
         userRole:   req.user?.role ?? null,
-        // Cho FE biết logic phía sau (debug)
         isPrivilegedRole:  PRIVILEGED_PAST_ROLES.includes(req.user?.role),
         roomNumber: roomNumberForAudit,
-        // ⭐ NEW: Giờ checkout cũ (lấy từ audit log) — FE dùng làm default value cho DateTimePicker
-        //         Receptionist sẽ thấy DateTimePicker disabled với giờ này
         lastCheckoutAt: perm.lastCheckoutAt ?? null,
       },
     })
@@ -3535,14 +3654,11 @@ module.exports = {
   applyDiscount,
   calculateBill,
   changePolicy,
-  // ⭐ NEW (group)
   createGroup,
   getAvailableByType,
   previewGroup,
-  // ⭐ NEW (per-room actions cho đoàn)
   checkinRoom,
   checkoutRoom,
   undoRoom,
-  // ⭐ NEW (permission check)
   getCanSetPast,
 }

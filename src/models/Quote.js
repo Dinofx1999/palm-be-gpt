@@ -44,10 +44,22 @@ const quoteRoomSchema = new mongoose.Schema({
   roomAmount:         { type: Number, default: 0 },
   nights:             { type: Number, default: 1 },
 
+  // ⭐ NEW: Số lượng phòng (chỉ dùng cho mode 'by_type' khi merge các phòng cùng loại)
+  quantity:           { type: Number, default: 1 },
+
   breakdown:          [breakdownSchema],
 
-  // ⭐ NEW: Phòng thay thế cùng loại đang trống
-  // Snapshot tại thời điểm tạo quote — để khách xem có thêm lựa chọn
+  // ⭐ NEW: Display mode cho line này (snapshot)
+  displayMode: {
+    type: String,
+    enum: ['selected', 'with_alternatives', 'by_type'],
+    default: 'selected',
+  },
+
+  // ⭐ NEW: Aggregated images cho mode 'by_type'
+  aggregatedImages: [{ type: String }],
+
+  // ⭐ Phòng thay thế cùng loại đang trống
   alternativeRooms: [{
     roomId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Room' },
     roomNumber: { type: String },
@@ -92,13 +104,39 @@ const quoteSchema = new mongoose.Schema({
       isFree:      Boolean,
       price:       Number,
     }],
+    // ⭐ Snapshot contact info từ Branch
+    contact: {
+      phone:   { type: String, default: '' },
+      email:   { type: String, default: '' },
+      address: { type: String, default: '' },
+      city:    { type: String, default: '' },
+      zalo:    { type: String, default: '' },
+    },
   },
 
+  // ⭐ NEW: Display mode top-level (cho frontend public page render đúng)
+  displayMode: {
+    type: String,
+    enum: ['selected', 'with_alternatives', 'by_type'],
+    default: 'selected',
+  },
+
+  // ⭐ UPDATED: Mở rộng status enum để hỗ trợ workflow phê duyệt
+  //   draft     → mới tạo, chưa gửi cho khách
+  //   sent      → đã gửi link cho khách
+  //   viewed    → khách đã xem (auto-set khi truy cập public URL)
+  //   confirmed → nhân viên xác nhận (lock thông tin, sẵn sàng convert thành booking)
+  //   accepted  → khách đã đồng ý (có thể tự khách click hoặc nv set)
+  //   rejected  → khách từ chối
+  //   expired   → quá hạn (auto khi expiresAt < now)
+  //   converted → đã tạo booking từ quote này
+  //   cancelled → huỷ
   status: {
     type: String,
-    enum: ['active', 'converted', 'expired', 'cancelled'],
-    default: 'active',
+    enum: ['draft', 'sent', 'viewed', 'confirmed', 'accepted', 'rejected', 'expired', 'converted', 'cancelled'],
+    default: 'draft',
   },
+
   convertedBookingId: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', default: null },
 
   expiresAt: {
@@ -106,11 +144,28 @@ const quoteSchema = new mongoose.Schema({
     default: () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 ngày
   },
 
+  // ⭐ Người báo giá (đã có)
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+
+  // ⭐ NEW: Người xác nhận báo giá
+  //   Set khi status đổi sang 'confirmed' (qua endpoint PATCH /:id/status)
+  confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  confirmedAt: { type: Date, default: null },
+
+  // ⭐ NEW: History đổi status — dùng cho audit log (optional, có thể tắt nếu không cần)
+  statusHistory: [{
+    status:    { type: String },
+    changedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    changedAt: { type: Date, default: Date.now },
+    note:      { type: String, default: '' },
+  }],
+
   notes:     { type: String, default: '' },
 }, { timestamps: true });
 
 quoteSchema.index({ token: 1 }, { unique: true });
 quoteSchema.index({ branchId: 1, createdAt: -1 });
+quoteSchema.index({ status: 1 });
+quoteSchema.index({ confirmedBy: 1 });
 
 module.exports = mongoose.model('Quote', quoteSchema);
