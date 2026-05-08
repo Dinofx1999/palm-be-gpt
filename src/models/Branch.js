@@ -41,6 +41,9 @@ hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết 
   // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
   // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
   // (Giờ check-in/out + phụ thu vượt người được lấy từ PricePolicy của từng loại phòng)
+  latitude: { type: Number, default: null },         // ⭐ THÊM
+  longitude: { type: Number, default: null },        // ⭐ THÊM
+  geofenceRadius: { type: Number, default: 100 },    // ⭐ THÊM (mét)
   quotePolicy: {
     cancellationPolicy: { type: String, default: '' },
     requiredDocuments:  { type: String, default: '' },

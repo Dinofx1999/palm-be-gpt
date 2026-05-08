@@ -48,7 +48,9 @@ app.use('/api/price-policies',  require('./routes/pricePolicies'));
 app.use('/api/audit-logs',      require('./routes/auditLogs'));   // ⭐ NEW
 app.use('/api/quotes', require('./routes/quotes'));  // ⭐ NEW
 app.use('/api/salary', require('./routes/salaryy'));  // ⭐ THÊM DÒNG NÀY
-
+app.use('/api/penalty',    require('./routes/penalty'));   // ⭐ THÊM
+  app.use('/api/workshift',  require('./routes/workshift')); // ⭐ THÊM
+  app.use('/api/attendance', require('./routes/attendance'));// ⭐ THÊM
 // ⭐ THÊM: Static serve folder uploads
 app.use('/uploads', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');

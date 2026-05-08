@@ -2,20 +2,31 @@
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
 
-// ─────────────────────────────────────────────────────────────────────────
-// 1) Severity tier — bậc mức độ nghiêm trọng (cho type "tiered")
-// ─────────────────────────────────────────────────────────────────────────
-const SeverityTierSchema = new Schema(
+// ═════════════════════════════════════════════════════════════════════════
+// Bậc cho khung giờ trễ — vd: trễ ≤5p → 50k, ≤10p → 100k, ≤15p → 200k
+// ═════════════════════════════════════════════════════════════════════════
+const TimeWindowTierSchema = new Schema(
   {
-    name: { type: String, required: true, trim: true }, // "Nhẹ", "Vừa", "Nghiêm trọng"
+    upToMinutes: { type: Number, required: true, min: 0 }, // trễ đến X phút
     amount: { type: Number, required: true, min: 0 },
   },
   { _id: false }
 );
 
-// ─────────────────────────────────────────────────────────────────────────
-// 2) Penalty — danh mục các loại phạt (per branch)
-// ─────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+// Bậc cho số lần vi phạm — vd: Lần 1: 0k, Lần 2: 20k, Lần 3: 50k
+// ═════════════════════════════════════════════════════════════════════════
+const RepeatCountTierSchema = new Schema(
+  {
+    occurrence: { type: Number, required: true, min: 1 }, // lần thứ N
+    amount: { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
+// ═════════════════════════════════════════════════════════════════════════
+// Penalty (catalog) — định nghĩa loại phạt
+// ═════════════════════════════════════════════════════════════════════════
 const PenaltySchema = new Schema(
   {
     branchId: {
@@ -27,30 +38,33 @@ const PenaltySchema = new Schema(
     name: { type: String, required: true, trim: true },
     description: { type: String, default: '' },
 
-    // 3 loại phạt
+    // 3 khung phạt
     type: {
       type: String,
-      enum: ['fixed', 'per_minute', 'tiered'],
+      enum: ['fixed', 'time_window', 'repeat_count'],
       required: true,
       default: 'fixed',
     },
 
-    // Khi type = 'fixed' — số tiền cố định
+    // type='fixed' — số tiền cố định
     fixedAmount: { type: Number, default: 0, min: 0 },
 
-    // Khi type = 'per_minute' — tính theo phút
-    perMinuteAmount: { type: Number, default: 0, min: 0 },
-    maxAmount: { type: Number, default: 0, min: 0 }, // 0 = không giới hạn
+    // type='time_window' — bậc theo phút trễ
+    timeWindowTiers: { type: [TimeWindowTierSchema], default: [] },
 
-    // Khi type = 'tiered' — danh sách bậc mức độ
-    severityTiers: { type: [SeverityTierSchema], default: [] },
+    // type='repeat_count' — bậc theo số lần
+    repeatCountTiers: { type: [RepeatCountTierSchema], default: [] },
 
-    // Phân loại để gom nhóm (UI)
-    category: {
+    // Mức độ nghiêm trọng — để GOM NHÓM HIỂN THỊ (không ảnh hưởng tiền)
+    severity: {
       type: String,
-      enum: ['punctuality', 'appearance', 'service', 'discipline', 'other'],
-      default: 'other',
+      enum: ['low', 'medium', 'high', 'critical'],
+      default: 'medium',
     },
+
+    // ⭐ Tự động áp dụng khi NV checkin trễ?
+    // Nếu true → khi NV checkin với lateMinutes > 0, hệ thống tự tạo PenaltyRecord
+    autoApplyOnLate: { type: Boolean, default: false },
 
     isActive: { type: Boolean, default: true },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -59,45 +73,43 @@ const PenaltySchema = new Schema(
   { timestamps: true }
 );
 
-PenaltySchema.index({ branchId: 1, isActive: 1, name: 1 });
+PenaltySchema.index({ branchId: 1, isActive: 1, severity: 1 });
+PenaltySchema.index({ branchId: 1, autoApplyOnLate: 1 });
 
-// ─────────────────────────────────────────────────────────────────────────
-// 3) PenaltyRecord — lần phạt thực tế của 1 NV trong 1 tháng
-// ─────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+// PenaltyRecord — lần phạt thực tế
+// ═════════════════════════════════════════════════════════════════════════
 const PenaltyRecordSchema = new Schema(
   {
-    user: {
-      type: Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-      index: true,
-    },
+    user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     branchId: { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
 
-    // Kỳ áp dụng
     year: { type: Number, required: true },
     month: { type: Number, required: true, min: 1, max: 12 },
 
-    // Tham chiếu đến danh mục phạt
     penaltyId: { type: Schema.Types.ObjectId, ref: 'Penalty' },
-
-    // Snapshot info từ Penalty (lưu lại đề phòng penalty bị xóa)
     penaltyName: { type: String, required: true },
-    penaltyType: { type: String, enum: ['fixed', 'per_minute', 'tiered'] },
-    category: { type: String, default: 'other' },
+    penaltyType: { type: String, enum: ['fixed', 'time_window', 'repeat_count'] },
+    severity: { type: String, default: 'medium' },
 
-    // Chi tiết tùy theo type
-    minutes: { type: Number, default: 0 }, // dùng cho per_minute
-    severityName: { type: String, default: '' }, // dùng cho tiered
-    perMinuteAmount: { type: Number, default: 0 }, // snapshot rate khi tạo
+    // Chi tiết
+    minutes: { type: Number, default: 0 }, // dùng cho time_window
+    occurrence: { type: Number, default: 0 }, // dùng cho repeat_count
+    appliedTier: {
+      upToMinutes: Number,
+      occurrence: Number,
+      amount: Number,
+    },
 
-    // Số tiền phạt cuối cùng
     amount: { type: Number, required: true, min: 0 },
 
-    // Metadata
-    occurredOn: { type: Date }, // ngày xảy ra (không bắt buộc)
+    occurredOn: { type: Date },
     reason: { type: String, default: '' },
     note: { type: String, default: '' },
+
+    // ⭐ Liên kết Attendance (nếu phạt do auto từ checkin)
+    attendanceId: { type: Schema.Types.ObjectId, ref: 'Attendance', default: null },
+    autoCreated: { type: Boolean, default: false },
 
     createdBy: { type: Schema.Types.ObjectId, ref: 'User' },
     updatedBy: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -106,6 +118,7 @@ const PenaltyRecordSchema = new Schema(
 );
 
 PenaltyRecordSchema.index({ user: 1, year: 1, month: 1 });
+PenaltyRecordSchema.index({ attendanceId: 1 });
 
 const Penalty = mongoose.model('Penalty', PenaltySchema);
 const PenaltyRecord = mongoose.model('PenaltyRecord', PenaltyRecordSchema);
