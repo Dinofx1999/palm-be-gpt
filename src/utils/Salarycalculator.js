@@ -1,33 +1,14 @@
 // backend/src/utils/salaryCalculator.js
 
-/**
- * Tìm bậc % vượt cao nhất user đạt được.
- *
- * @param {number} exceedPercent - % vượt thực tế (vd 25 = vượt 25% so với target)
- * @param {Array<{upToPercent, percent}>} tiers - đã sort tăng dần theo upToPercent
- * @returns {Object|null} - tier áp dụng hoặc null nếu chưa đủ bậc nào
- *
- * Logic: tìm tier có upToPercent >= exceedPercent, lấy tier đầu tiên thỏa.
- * Nếu vượt cao hơn tất cả → dùng tier cuối (cao nhất).
- *
- * Ví dụ tiers: [{upTo:20, p:0.1}, {upTo:30, p:0.15}]
- *  - exceed 15% → match tier upTo:20 → 0.1%
- *  - exceed 25% → match tier upTo:30 → 0.15%
- *  - exceed 50% → vượt cả 2 → dùng tier cuối (0.15%)
- *  - exceed 0%  → null (chưa vượt)
- */
 function findApplicableTier(exceedPercent, tiers = []) {
   if (!Array.isArray(tiers) || tiers.length === 0) return null;
   if (exceedPercent <= 0) return null;
 
   const sorted = [...tiers].sort((a, b) => a.upToPercent - b.upToPercent);
 
-  // Tìm bậc đầu tiên có upToPercent >= exceedPercent
   for (const t of sorted) {
     if (exceedPercent <= t.upToPercent) return t;
   }
-
-  // Vượt cao hơn tất cả → dùng bậc cao nhất
   return sorted[sorted.length - 1];
 }
 
@@ -35,12 +16,16 @@ function findApplicableTier(exceedPercent, tiers = []) {
  * Tính lương.
  *
  * @param {Object} input
- * @param {Array}  input.components - cơ cấu lương cố định
- * @param {number} input.target     - mục tiêu doanh thu của branch
- * @param {Object} input.roleKpi    - { basePercent, tiers, underTargetPolicy }
- * @param {number} revenue          - doanh thu phân bổ thực tế
+ * @param {Array}  input.components
+ * @param {number} input.target
+ * @param {Object} input.roleKpi
+ * @param {Array}  input.penalties - danh sách phạt [{amount, ...}]
+ * @param {number} revenue
  */
-function calculateSalary({ components = [], target = 0, roleKpi = {} } = {}, revenue = 0) {
+function calculateSalary(
+  { components = [], target = 0, roleKpi = {}, penalties = [] } = {},
+  revenue = 0
+) {
   const fixedTotal = components.reduce(
     (sum, item) => sum + (Number(item.amount) || 0),
     0
@@ -73,13 +58,21 @@ function calculateSalary({ components = [], target = 0, roleKpi = {} } = {}, rev
     }
   }
 
-  const total = fixedTotal + kpiBase + kpiExceed;
+  // ⭐ Tính tổng phạt
+  const penaltyTotal = (penalties || []).reduce(
+    (sum, p) => sum + (Number(p.amount) || 0),
+    0
+  );
+
+  // Tổng lương = Cố định + KPI - Phạt
+  const total = fixedTotal + kpiBase + kpiExceed - penaltyTotal;
   const round = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
   return {
     fixedTotal: round(fixedTotal),
     kpiBase: round(kpiBase),
     kpiExceed: round(kpiExceed),
+    penaltyTotal: round(penaltyTotal),
     total: round(total),
     breakdown: {
       target: t,
@@ -90,6 +83,7 @@ function calculateSalary({ components = [], target = 0, roleKpi = {} } = {}, rev
       appliedTier: appliedTier
         ? { upToPercent: appliedTier.upToPercent, percent: appliedTier.percent }
         : null,
+      penaltyCount: (penalties || []).length,
     },
   };
 }

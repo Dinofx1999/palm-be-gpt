@@ -60,7 +60,24 @@ const KpiConfigSchema = new Schema(
 );
 
 // ─────────────────────────────────────────────────────────────────────────
-// SalaryRecord — snapshot + trạng thái thanh toán
+// Penalty snapshot — dùng trong SalaryRecord
+// ─────────────────────────────────────────────────────────────────────────
+const PenaltySnapshotSchema = new Schema(
+  {
+    penaltyId: { type: Schema.Types.ObjectId, ref: 'Penalty' },
+    name: { type: String, required: true },
+    type: { type: String },
+    minutes: { type: Number, default: 0 },
+    severityName: { type: String, default: '' },
+    amount: { type: Number, required: true, min: 0 },
+    reason: { type: String, default: '' },
+    occurredOn: { type: Date },
+  },
+  { _id: false }
+);
+
+// ─────────────────────────────────────────────────────────────────────────
+// SalaryRecord
 // ─────────────────────────────────────────────────────────────────────────
 const SalaryRecordSchema = new Schema(
   {
@@ -68,37 +85,27 @@ const SalaryRecordSchema = new Schema(
     branchId: { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
     role: { type: String },
 
-    // Kỳ lương
     month: { type: Number, required: true, min: 1, max: 12 },
     year: { type: Number, required: true },
 
-    // Snapshot data (chốt khi đánh dấu đã trả)
     components: { type: [SalaryComponentSchema], default: [] },
     target: { type: Number, default: 0 },
     basePercent: { type: Number, default: 0 },
-    appliedTier: {
-      upToPercent: Number,
-      percent: Number,
-    },
+    appliedTier: { upToPercent: Number, percent: Number },
     revenue: { type: Number, default: 0 },
     fixedTotal: { type: Number, default: 0 },
     kpiBase: { type: Number, default: 0 },
     kpiExceed: { type: Number, default: 0 },
+
+    // ⭐ Phạt
+    penalties: { type: [PenaltySnapshotSchema], default: [] },
+    penaltyTotal: { type: Number, default: 0 },
+
     total: { type: Number, default: 0 },
 
-    // ⭐ Trạng thái thanh toán
-    paidStatus: {
-      type: String,
-      enum: ['paid', 'unpaid'],
-      default: 'paid', // mặc định khi tạo record là đã trả (vì gộp 1 nút)
-      index: true,
-    },
+    paidStatus: { type: String, enum: ['paid', 'unpaid'], default: 'paid', index: true },
     paidAt: { type: Date, default: Date.now },
-    paymentMethod: {
-      type: String,
-      enum: ['cash', 'transfer'],
-      default: 'cash',
-    },
+    paymentMethod: { type: String, enum: ['cash', 'transfer'], default: 'cash' },
     paidNote: { type: String, default: '' },
     paidBy: { type: Schema.Types.ObjectId, ref: 'User' },
 
@@ -108,7 +115,6 @@ const SalaryRecordSchema = new Schema(
   { timestamps: true }
 );
 
-// 1 user × 1 month × 1 year = 1 record duy nhất
 SalaryRecordSchema.index({ user: 1, year: 1, month: 1 }, { unique: true });
 
 const SalaryConfig = mongoose.model('SalaryConfig', SalaryConfigSchema);
