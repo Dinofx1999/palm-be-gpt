@@ -8,7 +8,7 @@ const path = require('path');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 const { connect } = require('./config/database');
-connect();
+const { seedAdminIfEmpty } = require('./utils/seedAdmin'); // ⭐ NEW
 
 // ── Middleware ─────────────────────────────────────────
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
@@ -45,20 +45,20 @@ app.use('/api/price-configs',   require('./routes/priceConfigs'));
 app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/amenities',       require('./routes/amenities'));
 app.use('/api/price-policies',  require('./routes/pricePolicies'));
-app.use('/api/audit-logs',      require('./routes/auditLogs'));   // ⭐ NEW
-app.use('/api/quotes', require('./routes/quotes'));  // ⭐ NEW
-app.use('/api/salary', require('./routes/salaryy'));  // ⭐ THÊM DÒNG NÀY
-app.use('/api/penalty',    require('./routes/penalty'));   // ⭐ THÊM
-  app.use('/api/workshift',  require('./routes/workshift')); // ⭐ THÊM
-  app.use('/api/attendance', require('./routes/attendance'));// ⭐ THÊM
-// ⭐ THÊM: Static serve folder uploads
+app.use('/api/audit-logs',      require('./routes/auditLogs'));
+app.use('/api/quotes',          require('./routes/quotes'));
+app.use('/api/salary',          require('./routes/salaryy'));
+app.use('/api/penalty',         require('./routes/penalty'));
+app.use('/api/workshift',       require('./routes/workshift'));
+app.use('/api/attendance',      require('./routes/attendance'));
+
+// Static serve folder uploads
 app.use('/uploads', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   next();
 }, express.static(path.join(__dirname, '../uploads')));
 
-// ⭐ THÊM: Route upload
 app.use('/api/upload', require('./routes/upload'));
 
 // ── Error handling ─────────────────────────────────────
@@ -67,6 +67,17 @@ app.use(notFound);
 app.use(errorHandler);
 
 // ── Start ──────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n🏨  LuxStay PMS API  →  http://localhost:${PORT}\n`);
-});
+// ⭐ Bootstrap: connect DB → seed admin (nếu trống) → listen
+(async () => {
+  try {
+    await connect();           // chờ DB ready
+    await seedAdminIfEmpty();  // tạo admin mặc định nếu chưa có user nào
+
+    app.listen(PORT, () => {
+      console.log(`\n🏨  LuxStay PMS API  →  http://localhost:${PORT}\n`);
+    });
+  } catch (err) {
+    console.error('❌  Không thể khởi động server:', err);
+    process.exit(1);
+  }
+})();
