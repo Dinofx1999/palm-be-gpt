@@ -5,6 +5,7 @@ const router = express.Router();
 
 const User = require('../models/User');
 const { SalaryConfig, KpiConfig, SalaryRecord } = require('../models/Salary');
+const { PenaltyRecord } = require('../models/Penalty');
 const { calculateSalary } = require('../utils/Salarycalculator');
 const { getEmployeeRevenue } = require('../services/revenueService');
 const { authenticate } = require('../middleware/auth');
@@ -51,7 +52,26 @@ async function resolveKpiForUser(user) {
   return { target: cfg.target || 0, roleKpi };
 }
 
-// Tính ra snapshot lương cho 1 user ở 1 kỳ (dùng cho preview & pay)
+// Lấy danh sách phạt đang áp dụng cho user trong tháng (chưa snapshot)
+async function getPenaltiesForPeriod(userId, year, month) {
+  const records = await PenaltyRecord.find({ user: userId, year, month })
+    .sort({ occurredOn: -1, createdAt: -1 })
+    .lean();
+
+  return records.map((r) => ({
+    _id: r._id,
+    penaltyId: r.penaltyId,
+    name: r.penaltyName,
+    type: r.penaltyType,
+    minutes: r.minutes,
+    severityName: r.severityName,
+    amount: r.amount,
+    reason: r.reason,
+    occurredOn: r.occurredOn,
+  }));
+}
+
+// Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt)
 async function computeSnapshot(userId, year, month) {
   const [cfg, user] = await Promise.all([
     SalaryConfig.findOne({ user: userId }).lean(),
@@ -61,22 +81,19 @@ async function computeSnapshot(userId, year, month) {
 
   const kpi = await resolveKpiForUser(user);
   const revenue = kpi ? await getEmployeeRevenue(user, year, month) : 0;
+  const penalties = await getPenaltiesForPeriod(userId, year, month);
+
   const result = calculateSalary(
     {
       components: cfg?.components || [],
       target: kpi?.target || 0,
       roleKpi: kpi?.roleKpi || {},
+      penalties,
     },
     revenue
   );
 
-  return {
-    user,
-    cfg,
-    kpi,
-    revenue,
-    result,
-  };
+  return { user, cfg, kpi, revenue, result, penalties };
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -145,7 +162,7 @@ router.get('/config/:userId', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// PUT /api/salary/config/:userId — Admin only
+// PUT /api/salary/config/:userId
 // ═════════════════════════════════════════════════════════════════════════
 router.put('/config/:userId', authenticate, async (req, res) => {
   try {
@@ -172,14 +189,7 @@ router.put('/config/:userId', authenticate, async (req, res) => {
 
     const config = await SalaryConfig.findOneAndUpdate(
       { user: userId },
-      {
-        $set: {
-          user: userId,
-          branchId: targetUser.branchId,
-          components,
-          updatedBy: req.user.id,
-        },
-      },
+      { $set: { user: userId, branchId: targetUser.branchId, components, updatedBy: req.user.id } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
@@ -271,10 +281,7 @@ router.put('/kpi/:branchId', authenticate, async (req, res) => {
                 t.upToPercent >= 0 &&
                 t.percent >= 0
             )
-            .map((t) => ({
-              upToPercent: Number(t.upToPercent),
-              percent: Number(t.percent),
-            }))
+            .map((t) => ({ upToPercent: Number(t.upToPercent), percent: Number(t.percent) }))
             .sort((a, b) => a.upToPercent - b.upToPercent)
         : [];
 
@@ -289,14 +296,7 @@ router.put('/kpi/:branchId', authenticate, async (req, res) => {
 
     const updated = await KpiConfig.findOneAndUpdate(
       { branchId },
-      {
-        $set: {
-          branchId,
-          target: Number(target) || 0,
-          roles: sanitized,
-          updatedBy: req.user.id,
-        },
-      },
+      { $set: { branchId, target: Number(target) || 0, roles: sanitized, updatedBy: req.user.id } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
@@ -314,16 +314,19 @@ router.post('/calculate', authenticate, async (req, res) => {
   try {
     const { components, target, roleKpi, revenue, userId, year, month } = req.body;
 
-    // Mode 1: preview
     if (Array.isArray(components)) {
       const result = calculateSalary(
-        { components, target: Number(target) || 0, roleKpi: roleKpi || {} },
+        {
+          components,
+          target: Number(target) || 0,
+          roleKpi: roleKpi || {},
+          penalties: req.body.penalties || [],
+        },
         Number(revenue) || 0
       );
       return res.json(result);
     }
 
-    // Mode 2: tính cho user thật (chỉ tháng hiện tại — preview live)
     if (userId) {
       if (!(await canView(req.user, userId))) {
         return res.status(403).json({ message: 'Không có quyền' });
@@ -331,13 +334,15 @@ router.post('/calculate', authenticate, async (req, res) => {
       const y = parseInt(year, 10) || new Date().getFullYear();
       const m = parseInt(month, 10) || new Date().getMonth() + 1;
 
-      // Nếu kỳ này đã có SalaryRecord (đã chốt) → trả về snapshot từ DB
+      // Nếu đã có SalaryRecord (đã chốt) → trả snapshot
       const existing = await SalaryRecord.findOne({ user: userId, year: y, month: m }).lean();
       if (existing) {
         return res.json({
           fixedTotal: existing.fixedTotal,
           kpiBase: existing.kpiBase,
           kpiExceed: existing.kpiExceed,
+          penaltyTotal: existing.penaltyTotal || 0,
+          penalties: existing.penalties || [],
           total: existing.total,
           breakdown: {
             target: existing.target,
@@ -345,12 +350,12 @@ router.post('/calculate', authenticate, async (req, res) => {
             exceed: Math.max(0, existing.revenue - existing.target),
             exceedPercent:
               existing.target > 0
-                ? Math.round(
-                    ((existing.revenue - existing.target) / existing.target) * 100 * 100
-                  ) / 100
+                ? Math.round(((existing.revenue - existing.target) / existing.target) * 100 * 100) /
+                  100
                 : 0,
             basePercent: existing.basePercent,
             appliedTier: existing.appliedTier || null,
+            penaltyCount: (existing.penalties || []).length,
           },
           revenue: existing.revenue,
           year: y,
@@ -367,11 +372,12 @@ router.post('/calculate', authenticate, async (req, res) => {
         });
       }
 
-      // Chưa chốt → preview realtime
-      const { user, cfg, kpi, revenue: rev, result } = await computeSnapshot(userId, y, m);
+      // Chưa chốt → tính realtime
+      const { user, kpi, revenue: rev, result, penalties } = await computeSnapshot(userId, y, m);
 
       return res.json({
         ...result,
+        penalties,
         revenue: rev,
         year: y,
         month: m,
@@ -414,9 +420,7 @@ router.get('/revenue/:userId', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// ⭐ POST /api/salary/pay/:userId — đánh dấu đã trả (gộp chốt + đánh dấu)
-// Body: { year, month, paymentMethod, paidNote }
-// Admin + Manager (cùng branch) đều được
+// POST /api/salary/pay/:userId — đánh dấu đã trả
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/pay/:userId', authenticate, async (req, res) => {
   try {
@@ -429,21 +433,17 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
     }
 
     const { year, month, paymentMethod = 'cash', paidNote = '' } = req.body;
-    if (!year || !month) {
-      return res.status(400).json({ message: 'Thiếu year/month' });
-    }
+    if (!year || !month) return res.status(400).json({ message: 'Thiếu year/month' });
     if (!['cash', 'transfer'].includes(paymentMethod)) {
       return res.status(400).json({ message: 'Phương thức thanh toán không hợp lệ' });
     }
 
-    // Kiểm tra đã có record cho kỳ này chưa
     const existing = await SalaryRecord.findOne({ user: userId, year, month }).lean();
     if (existing && existing.paidStatus === 'paid') {
       return res.status(400).json({ message: 'Kỳ lương này đã được đánh dấu trả rồi' });
     }
 
-    // Tính snapshot tại thời điểm hiện tại
-    const { user, cfg, kpi, revenue, result } = await computeSnapshot(userId, year, month);
+    const { user, cfg, kpi, revenue, result, penalties } = await computeSnapshot(userId, year, month);
 
     const record = await SalaryRecord.findOneAndUpdate(
       { user: userId, year, month },
@@ -462,6 +462,17 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
           fixedTotal: result.fixedTotal,
           kpiBase: result.kpiBase,
           kpiExceed: result.kpiExceed,
+          penalties: penalties.map((p) => ({
+            penaltyId: p.penaltyId,
+            name: p.name,
+            type: p.type,
+            minutes: p.minutes,
+            severityName: p.severityName,
+            amount: p.amount,
+            reason: p.reason,
+            occurredOn: p.occurredOn,
+          })),
+          penaltyTotal: result.penaltyTotal,
           total: result.total,
           paidStatus: 'paid',
           paidAt: new Date(),
@@ -482,7 +493,7 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// ⭐ DELETE /api/salary/pay/:userId/:year/:month — hủy đánh dấu trả
+// DELETE /api/salary/pay/:userId/:year/:month
 // ═════════════════════════════════════════════════════════════════════════
 router.delete('/pay/:userId/:year/:month', authenticate, async (req, res) => {
   try {
@@ -512,8 +523,7 @@ router.delete('/pay/:userId/:year/:month', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// ⭐ GET /api/salary/history/:userId?months=12
-// Trả lịch sử N tháng gần nhất (gồm cả tháng hiện tại = preview, các tháng trước = từ DB)
+// GET /api/salary/history/:userId?months=12
 // ═════════════════════════════════════════════════════════════════════════
 router.get('/history/:userId', authenticate, async (req, res) => {
   try {
@@ -527,15 +537,12 @@ router.get('/history/:userId', authenticate, async (req, res) => {
     const currentMonth = now.getMonth() + 1;
     const currentYear = now.getFullYear();
 
-    // Tạo list (year, month) cho N tháng gần nhất, gần nhất ở đầu
     const periods = [];
     for (let i = 0; i < months; i++) {
       const d = new Date(currentYear, currentMonth - 1 - i, 1);
       periods.push({ year: d.getFullYear(), month: d.getMonth() + 1 });
     }
 
-    // Fetch tất cả SalaryRecord trong khoảng này
-    const earliest = periods[periods.length - 1];
     const records = await SalaryRecord.find({
       user: userId,
       $or: periods.map((p) => ({ year: p.year, month: p.month })),
@@ -546,20 +553,19 @@ router.get('/history/:userId', authenticate, async (req, res) => {
       recordMap.set(`${r.year}-${r.month}`, r);
     }
 
-    // Build list từng tháng
     const history = [];
     for (const p of periods) {
       const key = `${p.year}-${p.month}`;
       const record = recordMap.get(key);
 
       if (record) {
-        // Đã có snapshot
         history.push({
           year: p.year,
           month: p.month,
           fixedTotal: record.fixedTotal,
           kpiBase: record.kpiBase,
           kpiExceed: record.kpiExceed,
+          penaltyTotal: record.penaltyTotal || 0,
           total: record.total,
           revenue: record.revenue,
           target: record.target,
@@ -571,7 +577,6 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           isCurrent: p.year === currentYear && p.month === currentMonth,
         });
       } else if (p.year === currentYear && p.month === currentMonth) {
-        // Tháng hiện tại chưa chốt → preview realtime
         try {
           const { result, revenue, kpi } = await computeSnapshot(userId, p.year, p.month);
           history.push({
@@ -580,6 +585,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             fixedTotal: result.fixedTotal,
             kpiBase: result.kpiBase,
             kpiExceed: result.kpiExceed,
+            penaltyTotal: result.penaltyTotal || 0,
             total: result.total,
             revenue,
             target: kpi?.target || 0,
@@ -594,6 +600,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             fixedTotal: 0,
             kpiBase: 0,
             kpiExceed: 0,
+            penaltyTotal: 0,
             total: 0,
             revenue: 0,
             target: 0,
@@ -603,13 +610,13 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           });
         }
       } else {
-        // Tháng cũ chưa được chốt → empty
         history.push({
           year: p.year,
           month: p.month,
           fixedTotal: 0,
           kpiBase: 0,
           kpiExceed: 0,
+          penaltyTotal: 0,
           total: 0,
           revenue: 0,
           target: 0,

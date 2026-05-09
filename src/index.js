@@ -5,20 +5,43 @@ const helmet      = require('helmet');
 const morgan      = require('morgan');
 const compression = require('compression');
 const path = require('path');
+
 const app  = express();
+app.set('trust proxy', 1);                     // ⭐ THAY ĐỔI 1
 const PORT = process.env.PORT || 4000;
+
 const { connect } = require('./config/database');
-const { seedAdminIfEmpty } = require('./utils/seedAdmin'); // ⭐ NEW
+const { seedAdminIfEmpty } = require('./utils/seedAdmin');
 
 // ── Middleware ─────────────────────────────────────────
-app.use(helmet({ crossOriginEmbedderPolicy: false }));
+app.use(helmet({ 
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },   // ⭐ THAY ĐỔI 2
+}));
 app.use(compression());
+
+// ⭐ THAY ĐỔI 3: CORS với allowlist (thay vì single string)
+const allowedOrigins = [
+  'https://palmhotel.com.vn',
+  'https://www.palmhotel.com.vn',
+  'http://localhost:5173',
+  'http://192.168.1.33:5174',
+   'http://localhost:5174',  // ⭐ THÊM
+  'http://localhost:5175',  // ⭐ THÊM (phòng hờ)
+  'http://localhost:3000',
+];
+
 app.use(cors({
-  origin: process.env.CLIENT_URL || ['http://localhost:5173', 'http://localhost:3000'],
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS blocked: ${origin}`));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
@@ -29,7 +52,7 @@ app.get('/health', (_req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-// ── Routes ─────────────────────────────────────────────
+// ── Routes (giữ nguyên) ────────────────────────────────
 app.use('/api/auth',            require('./routes/auth'));
 app.use('/api/rooms',           require('./routes/rooms'));
 app.use('/api/bookings',        require('./routes/bookings'));
@@ -67,11 +90,10 @@ app.use(notFound);
 app.use(errorHandler);
 
 // ── Start ──────────────────────────────────────────────
-// ⭐ Bootstrap: connect DB → seed admin (nếu trống) → listen
 (async () => {
   try {
-    await connect();           // chờ DB ready
-    await seedAdminIfEmpty();  // tạo admin mặc định nếu chưa có user nào
+    await connect();
+    await seedAdminIfEmpty();
 
     app.listen(PORT, () => {
       console.log(`\n🏨  LuxStay PMS API  →  http://localhost:${PORT}\n`);

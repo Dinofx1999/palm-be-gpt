@@ -30,7 +30,7 @@ async function canViewForUser(req, targetUserId) {
   return canRecordForUser(req, targetUserId);
 }
 
-// ⭐ Tính số tiền phạt theo type
+// Tính số tiền phạt theo type
 function computePenaltyAmount(penalty, { minutes, occurrence }) {
   if (!penalty) return { amount: 0, appliedTier: null };
 
@@ -84,7 +84,7 @@ function computePenaltyAmount(penalty, { minutes, occurrence }) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// GET /api/penalty/catalog?branchId=...
+// GET /api/penalty/catalog
 // ═════════════════════════════════════════════════════════════════════════
 router.get('/catalog', authenticate, async (req, res) => {
   try {
@@ -111,7 +111,7 @@ router.get('/catalog', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// POST /api/penalty/catalog — tạo loại phạt mới (Admin)
+// POST /api/penalty/catalog
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/catalog', authenticate, async (req, res) => {
   try {
@@ -148,7 +148,6 @@ router.post('/catalog', authenticate, async (req, res) => {
       });
     }
 
-    // Sanitize tiers
     const cleanTimeWindowTiers = Array.isArray(timeWindowTiers)
       ? timeWindowTiers
           .filter(
@@ -181,7 +180,6 @@ router.post('/catalog', authenticate, async (req, res) => {
           .sort((a, b) => a.occurrence - b.occurrence)
       : [];
 
-    // Validate có data theo type
     if (type === 'time_window' && cleanTimeWindowTiers.length === 0) {
       return res.status(400).json({ message: 'Khung giờ phải có ít nhất 1 bậc' });
     }
@@ -210,7 +208,7 @@ router.post('/catalog', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// PUT /api/penalty/catalog/:id — cập nhật (Admin)
+// PUT /api/penalty/catalog/:id
 // ═════════════════════════════════════════════════════════════════════════
 router.put('/catalog/:id', authenticate, async (req, res) => {
   try {
@@ -224,15 +222,9 @@ router.put('/catalog/:id', authenticate, async (req, res) => {
     }
 
     const allowedFields = [
-      'name',
-      'description',
-      'type',
-      'fixedAmount',
-      'timeWindowTiers',
-      'repeatCountTiers',
-      'severity',
-      'autoApplyOnLate',
-      'isActive',
+      'name', 'description', 'type', 'fixedAmount',
+      'timeWindowTiers', 'repeatCountTiers',
+      'severity', 'autoApplyOnLate', 'isActive',
     ];
     const update = {};
     for (const f of allowedFields) {
@@ -240,9 +232,7 @@ router.put('/catalog/:id', authenticate, async (req, res) => {
     }
 
     if (update.type && !VALID_TYPES.includes(update.type)) {
-      return res.status(400).json({
-        message: `Type không hợp lệ. Phải là: ${VALID_TYPES.join(', ')}`,
-      });
+      return res.status(400).json({ message: 'Type không hợp lệ' });
     }
     if (update.severity && !VALID_SEVERITIES.includes(update.severity)) {
       return res.status(400).json({ message: 'Severity không hợp lệ' });
@@ -250,33 +240,15 @@ router.put('/catalog/:id', authenticate, async (req, res) => {
 
     if (update.timeWindowTiers && Array.isArray(update.timeWindowTiers)) {
       update.timeWindowTiers = update.timeWindowTiers
-        .filter(
-          (t) =>
-            typeof t.upToMinutes === 'number' &&
-            typeof t.amount === 'number' &&
-            t.upToMinutes > 0 &&
-            t.amount >= 0
-        )
-        .map((t) => ({
-          upToMinutes: Number(t.upToMinutes),
-          amount: Number(t.amount),
-        }))
+        .filter((t) => typeof t.upToMinutes === 'number' && typeof t.amount === 'number' && t.upToMinutes > 0 && t.amount >= 0)
+        .map((t) => ({ upToMinutes: Number(t.upToMinutes), amount: Number(t.amount) }))
         .sort((a, b) => a.upToMinutes - b.upToMinutes);
     }
 
     if (update.repeatCountTiers && Array.isArray(update.repeatCountTiers)) {
       update.repeatCountTiers = update.repeatCountTiers
-        .filter(
-          (t) =>
-            typeof t.occurrence === 'number' &&
-            typeof t.amount === 'number' &&
-            t.occurrence >= 1 &&
-            t.amount >= 0
-        )
-        .map((t) => ({
-          occurrence: Number(t.occurrence),
-          amount: Number(t.amount),
-        }))
+        .filter((t) => typeof t.occurrence === 'number' && typeof t.amount === 'number' && t.occurrence >= 1 && t.amount >= 0)
+        .map((t) => ({ occurrence: Number(t.occurrence), amount: Number(t.amount) }))
         .sort((a, b) => a.occurrence - b.occurrence);
     }
 
@@ -293,7 +265,7 @@ router.put('/catalog/:id', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// DELETE /api/penalty/catalog/:id — soft delete
+// DELETE /api/penalty/catalog/:id
 // ═════════════════════════════════════════════════════════════════════════
 router.delete('/catalog/:id', authenticate, async (req, res) => {
   try {
@@ -343,7 +315,60 @@ router.get('/records/:userId', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
+// ⭐ NEW: GET /api/penalty/records/:userId/count?penaltyId=...&year=&month=
+// Đếm số lần đã vi phạm 1 loại phạt cụ thể trong tháng
+// → trả về { count: N, nextOccurrence: N+1, nextAmount: ? }
+// ═════════════════════════════════════════════════════════════════════════
+router.get('/records/:userId/count', authenticate, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { penaltyId } = req.query;
+
+    if (!mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({ message: 'userId không hợp lệ' });
+    }
+    if (!mongoose.isValidObjectId(penaltyId)) {
+      return res.status(400).json({ message: 'penaltyId không hợp lệ' });
+    }
+    if (!(await canViewForUser(req, userId))) {
+      return res.status(403).json({ message: 'Không có quyền' });
+    }
+
+    const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+    const month = parseInt(req.query.month, 10) || new Date().getMonth() + 1;
+
+    const count = await PenaltyRecord.countDocuments({
+      user: userId,
+      year,
+      month,
+      penaltyId,
+    });
+
+    // Lấy penalty để biết số tiền cho lần kế tiếp
+    const penalty = await Penalty.findById(penaltyId).lean();
+    const nextOccurrence = count + 1;
+    const { amount: nextAmount, appliedTier } = computePenaltyAmount(penalty, {
+      occurrence: nextOccurrence,
+    });
+
+    res.json({
+      count,
+      nextOccurrence,
+      nextAmount,
+      appliedTier,
+    });
+  } catch (err) {
+    console.error('[GET /penalty/records/count]', err);
+    res.status(500).json({ message: 'Lỗi server' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════
 // POST /api/penalty/records — ghi nhận phạt mới
+// ⭐ Hỗ trợ thêm:
+//   - manualAmount: nếu time_window mà không chọn ca, nhập tiền tay
+//   - shiftId: nếu time_window có chọn ca, BE tự tính minutes từ giờ ca
+//   - occurredAt: ngày + giờ vi phạm (cho time_window auto tính)
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/records', authenticate, async (req, res) => {
   try {
@@ -357,10 +382,12 @@ router.post('/records', authenticate, async (req, res) => {
       month,
       penaltyId,
       minutes = 0,
-      occurrence = 0,
       occurredOn,
       reason = '',
       note = '',
+      manualAmount,           // ⭐ NEW: nhập tiền tay
+      shiftId,                // ⭐ NEW: chọn ca → tự tính minutes
+      occurredAt,             // ⭐ NEW: thời điểm vi phạm
     } = req.body;
 
     if (!mongoose.isValidObjectId(userId)) {
@@ -379,15 +406,56 @@ router.post('/records', authenticate, async (req, res) => {
     const penalty = await Penalty.findById(penaltyId).lean();
     if (!penalty) return res.status(404).json({ message: 'Không tìm thấy loại phạt' });
 
-    // Validate theo type
-    if (penalty.type === 'time_window' && (!minutes || minutes <= 0)) {
-      return res.status(400).json({ message: 'Vui lòng nhập số phút trễ' });
-    }
-    if (penalty.type === 'repeat_count' && (!occurrence || occurrence < 1)) {
-      return res.status(400).json({ message: 'Vui lòng nhập số lần vi phạm' });
-    }
+    let calcMinutes = Number(minutes) || 0;
+    let calcOccurrence = 0;
+    let amount = 0;
+    let appliedTier = null;
 
-    const { amount, appliedTier } = computePenaltyAmount(penalty, { minutes, occurrence });
+    // ─── Tính số tiền tùy theo type ──────────────────────────────────
+    if (penalty.type === 'fixed') {
+      amount = Number(penalty.fixedAmount) || 0;
+    } else if (penalty.type === 'time_window') {
+      // Nếu có manualAmount → ưu tiên dùng (không cần ca)
+      if (typeof manualAmount === 'number' && manualAmount >= 0) {
+        amount = manualAmount;
+        appliedTier = null;
+      } else {
+        // Nếu có shiftId + occurredAt → tự tính minutes từ giờ ca
+        if (shiftId && occurredAt && mongoose.isValidObjectId(shiftId)) {
+          const WorkShift = require('../models/WorkShift');
+          const { calculateLateMinutes } = require('../utils/geoHelpers');
+          const shift = await WorkShift.findById(shiftId).lean();
+          if (shift) {
+            calcMinutes = calculateLateMinutes(
+              new Date(occurredAt),
+              shift.startTime,
+              shift.crossesMidnight,
+              shift.graceMinutes || 0
+            );
+          }
+        }
+        if (!calcMinutes || calcMinutes <= 0) {
+          return res.status(400).json({
+            message: 'Vui lòng nhập số phút trễ HOẶC chọn ca + thời điểm vi phạm HOẶC nhập số tiền thủ công',
+          });
+        }
+        const calc = computePenaltyAmount(penalty, { minutes: calcMinutes });
+        amount = calc.amount;
+        appliedTier = calc.appliedTier;
+      }
+    } else if (penalty.type === 'repeat_count') {
+      // ⭐ Auto đếm số lần đã vi phạm trong tháng này
+      const existingCount = await PenaltyRecord.countDocuments({
+        user: userId,
+        year,
+        month,
+        penaltyId,
+      });
+      calcOccurrence = existingCount + 1; // lần này là lần thứ N+1
+      const calc = computePenaltyAmount(penalty, { occurrence: calcOccurrence });
+      amount = calc.amount;
+      appliedTier = calc.appliedTier;
+    }
 
     const targetUser = await User.findById(userId).select('branchId').lean();
 
@@ -400,11 +468,15 @@ router.post('/records', authenticate, async (req, res) => {
       penaltyName: penalty.name,
       penaltyType: penalty.type,
       severity: penalty.severity,
-      minutes: penalty.type === 'time_window' ? Number(minutes) || 0 : 0,
-      occurrence: penalty.type === 'repeat_count' ? Number(occurrence) || 0 : 0,
+      minutes: penalty.type === 'time_window' ? calcMinutes : 0,
+      occurrence: penalty.type === 'repeat_count' ? calcOccurrence : 0,
       appliedTier,
       amount,
-      occurredOn: occurredOn ? new Date(occurredOn) : null,
+      occurredOn: occurredAt
+        ? new Date(occurredAt)
+        : occurredOn
+        ? new Date(occurredOn)
+        : null,
       reason,
       note,
       createdBy: req.user.id,
@@ -418,7 +490,7 @@ router.post('/records', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// PUT /api/penalty/records/:id — cập nhật ghi nhận phạt
+// PUT /api/penalty/records/:id
 // ═════════════════════════════════════════════════════════════════════════
 router.put('/records/:id', authenticate, async (req, res) => {
   try {
@@ -437,19 +509,25 @@ router.put('/records/:id', authenticate, async (req, res) => {
       return res.status(403).json({ message: 'Không có quyền' });
     }
 
-    const { minutes, occurrence, occurredOn, reason, note } = req.body;
+    const { minutes, occurrence, occurredOn, reason, note, manualAmount } = req.body;
 
-    // Tính lại amount
     const penalty = await Penalty.findById(existing.penaltyId).lean();
     let amount = existing.amount;
     let appliedTier = existing.appliedTier;
+
     if (penalty) {
-      const calc = computePenaltyAmount(penalty, {
-        minutes: minutes ?? existing.minutes,
-        occurrence: occurrence ?? existing.occurrence,
-      });
-      amount = calc.amount;
-      appliedTier = calc.appliedTier;
+      // Manual amount override (cho time_window)
+      if (typeof manualAmount === 'number' && manualAmount >= 0 && penalty.type === 'time_window') {
+        amount = manualAmount;
+        appliedTier = null;
+      } else {
+        const calc = computePenaltyAmount(penalty, {
+          minutes: minutes ?? existing.minutes,
+          occurrence: occurrence ?? existing.occurrence,
+        });
+        amount = calc.amount;
+        appliedTier = calc.appliedTier;
+      }
     }
 
     const update = {
