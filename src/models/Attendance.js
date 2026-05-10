@@ -7,30 +7,40 @@ const AttendanceSchema = new Schema(
     user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     branchId: { type: Schema.Types.ObjectId, ref: 'Branch', required: true, index: true },
     shift: { type: Schema.Types.ObjectId, ref: 'WorkShift', required: true },
-    shiftName: { type: String }, // snapshot tên ca
+    shiftName: { type: String },
 
-    // Ngày làm việc (YYYY-MM-DD lưu dạng string để index dễ)
-    workDate: { type: String, required: true, index: true }, // "2026-05-08"
+    // Ngày làm việc (YYYY-MM-DD)
+    workDate: { type: String, required: true, index: true },
 
     // Giờ shift theo lịch (snapshot)
-    shiftStartTime: { type: String, required: true }, // "07:00"
-    shiftEndTime: { type: String },                    // "15:00"
+    shiftStartTime: { type: String, required: true },
+    shiftEndTime: { type: String },
 
-    // Checkin
+    // ─── Checkin ────────────────────────────────────────────────
     checkInAt: { type: Date, required: true, default: Date.now },
     lateMinutes: { type: Number, default: 0, min: 0 },
 
-    // Checkout (optional, có thể bổ sung sau)
-    checkOutAt: { type: Date, default: null },
-
-    // ⭐ GPS audit
+    // GPS audit cho checkin
     latitude: { type: Number, default: null },
     longitude: { type: Number, default: null },
-    distanceMeters: { type: Number, default: null }, // khoảng cách đến branch
+    distanceMeters: { type: Number, default: null },
     ipAddress: { type: String, default: '' },
     userAgent: { type: String, default: '' },
 
-    // ⭐ Liên kết PenaltyRecord nếu auto tạo phạt trễ
+    // ─── Checkout ───────────────────────────────────────────────
+    checkOutAt: { type: Date, default: null },
+
+    // ⭐ THÊM: GPS audit cho checkout
+    checkOutLatitude: { type: Number, default: null },
+    checkOutLongitude: { type: Number, default: null },
+    checkOutDistanceMeters: { type: Number, default: null },
+    checkOutIpAddress: { type: String, default: '' },
+    checkOutUserAgent: { type: String, default: '' },
+
+    // ⭐ THÊM: Số phút làm việc (computed khi checkout)
+    workedMinutes: { type: Number, default: 0 },
+
+    // ─── Phạt trễ ───────────────────────────────────────────────
     penaltyRecordId: { type: Schema.Types.ObjectId, ref: 'PenaltyRecord', default: null },
 
     // Manager có thể xóa phạt nếu có lý do
@@ -44,9 +54,9 @@ const AttendanceSchema = new Schema(
   { timestamps: true }
 );
 
-// 1 NV chỉ được checkin 1 ca/ngày → unique constraint
+// 1 NV chỉ được checkin 1 ca/ngày
 AttendanceSchema.index({ user: 1, workDate: 1 }, { unique: true });
-// 1 ca chỉ có 1 NV → cũng unique theo workDate + shift (nếu policy 1 NV / ca)
+// 1 ca / 1 NV / ngày
 AttendanceSchema.index({ shift: 1, workDate: 1 });
 
 module.exports = mongoose.model('Attendance', AttendanceSchema);
