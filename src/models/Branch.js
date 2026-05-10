@@ -33,9 +33,9 @@ const branchSchema = new mongoose.Schema({
   // ⭐ Bật/tắt tính năng auto-convert
   autoConvertPriceType: { type: Boolean, default: true },
   // ⭐ NEW: Cấu hình cutoff giá giờ
-hourBookingCutoffEnabled: { type: Boolean, default: false },
-hourBookingCutoffStart:   { type: String,  default: '20:00' },   // giờ bắt đầu cấm
-hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết thúc cấm (exclusive)
+  hourBookingCutoffEnabled: { type: Boolean, default: false },
+  hourBookingCutoffStart:   { type: String,  default: '20:00' },   // giờ bắt đầu cấm
+  hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết thúc cấm (exclusive)
 
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
   // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh
@@ -55,6 +55,17 @@ hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết 
       isFree:      { type: Boolean, default: true },
       price:       { type: Number, default: 0 },
     }],
+  },
+
+  // ⭐ NEW: Cấu hình bảo mật chấm công (Device Binding)
+  //   - deviceBindingEnabled: bật/tắt feature cho branch này
+  //   - autoApproveNewDevice: máy mới chưa ai dùng → cho pass tự động
+  //   - enforceAtLogin / enforceAtCheckin: áp dụng tại điểm nào
+  attendanceSecurity: {
+    deviceBindingEnabled: { type: Boolean, default: false },
+    autoApproveNewDevice: { type: Boolean, default: true },
+    enforceAtLogin:       { type: Boolean, default: true },
+    enforceAtCheckin:     { type: Boolean, default: true },
   },
 }, { timestamps: true });
 

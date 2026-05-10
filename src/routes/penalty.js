@@ -30,6 +30,194 @@ async function canViewForUser(req, targetUserId) {
   return canRecordForUser(req, targetUserId);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ⭐ POST /api/penalty/catalog/:id/copy-to-branches
+// Copy 1 loại phạt sang nhiều branch đích (chỉ thêm mới, giữ nguyên data cũ)
+// Body: { targetBranchIds: ['id1', 'id2'], skipIfNameExists: true }
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/catalog/:id/copy-to-branches', authenticate, async (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({ message: 'Chỉ Admin được copy/đồng bộ' });
+    }
+
+    const { id } = req.params;
+    const { targetBranchIds = [], skipIfNameExists = true } = req.body;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ message: 'id không hợp lệ' });
+    }
+    if (!Array.isArray(targetBranchIds) || targetBranchIds.length === 0) {
+      return res.status(400).json({ message: 'Phải chọn ít nhất 1 branch đích' });
+    }
+
+    const source = await Penalty.findById(id).lean();
+    if (!source) return res.status(404).json({ message: 'Không tìm thấy loại phạt' });
+
+    const validBranchIds = targetBranchIds.filter((b) =>
+      mongoose.isValidObjectId(b) && String(b) !== String(source.branchId)
+    );
+
+    if (validBranchIds.length === 0) {
+      return res.status(400).json({
+        message: 'Không có branch đích hợp lệ (không thể copy về chính branch nguồn)',
+      });
+    }
+
+    const results = {
+      created: [],
+      skipped: [],
+      errors: [],
+    };
+
+    for (const targetBranchId of validBranchIds) {
+      try {
+        if (skipIfNameExists) {
+          const existing = await Penalty.findOne({
+            branchId: targetBranchId,
+            name: source.name,
+            isActive: { $ne: false },
+          }).lean();
+          if (existing) {
+            results.skipped.push({
+              branchId: targetBranchId,
+              reason: `Đã có loại phạt "${source.name}"`,
+            });
+            continue;
+          }
+        }
+
+        const { _id, createdAt, updatedAt, __v, ...cloneData } = source;
+        const newPenalty = await Penalty.create({
+          ...cloneData,
+          branchId: targetBranchId,
+          createdBy: req.user.id,
+        });
+
+        results.created.push({
+          branchId: targetBranchId,
+          newId: newPenalty._id,
+        });
+      } catch (err) {
+        results.errors.push({
+          branchId: targetBranchId,
+          error: err.message,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      sourceName: source.name,
+      results,
+      message: `Đã copy "${source.name}" sang ${results.created.length}/${validBranchIds.length} branch`,
+    });
+  } catch (err) {
+    console.error('[POST /penalty/catalog/copy]', err);
+    res.status(500).json({ message: err.message || 'Lỗi server' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ⭐ POST /api/penalty/catalog/sync-to-branches
+// Đồng bộ TOÀN BỘ catalog từ branch nguồn → các branch đích
+// Body: { sourceBranchId, targetBranchIds, deleteOldFirst: false }
+// ═══════════════════════════════════════════════════════════════════════
+router.post('/catalog/sync-to-branches', authenticate, async (req, res) => {
+  try {
+    if (!isAdmin(req)) {
+      return res.status(403).json({ message: 'Chỉ Admin được đồng bộ' });
+    }
+
+    const { sourceBranchId, targetBranchIds = [], deleteOldFirst = false } = req.body;
+
+    if (!mongoose.isValidObjectId(sourceBranchId)) {
+      return res.status(400).json({ message: 'sourceBranchId không hợp lệ' });
+    }
+    if (!Array.isArray(targetBranchIds) || targetBranchIds.length === 0) {
+      return res.status(400).json({ message: 'Phải chọn ít nhất 1 branch đích' });
+    }
+
+    const sourcePenalties = await Penalty.find({
+      branchId: sourceBranchId,
+      isActive: { $ne: false },
+    }).lean();
+    if (sourcePenalties.length === 0) {
+      return res.status(400).json({ message: 'Branch nguồn chưa có loại phạt nào' });
+    }
+
+    const validTargets = targetBranchIds.filter((b) =>
+      mongoose.isValidObjectId(b) && String(b) !== String(sourceBranchId)
+    );
+
+    const summary = {
+      sourceBranchId,
+      sourceCount: sourcePenalties.length,
+      branches: [],
+    };
+
+    for (const targetBranchId of validTargets) {
+      const branchResult = {
+        branchId: targetBranchId,
+        deleted: 0,
+        created: 0,
+        skipped: 0,
+      };
+
+      try {
+        if (deleteOldFirst) {
+          // Soft delete (giữ history) thay vì hard delete
+          const delResult = await Penalty.updateMany(
+            { branchId: targetBranchId, isActive: { $ne: false } },
+            { $set: { isActive: false, updatedBy: req.user.id } }
+          );
+          branchResult.deleted = delResult.modifiedCount || 0;
+        }
+
+        for (const source of sourcePenalties) {
+          if (!deleteOldFirst) {
+            const existing = await Penalty.findOne({
+              branchId: targetBranchId,
+              name: source.name,
+              isActive: { $ne: false },
+            }).lean();
+            if (existing) {
+              branchResult.skipped += 1;
+              continue;
+            }
+          }
+
+          const { _id, createdAt, updatedAt, __v, ...cloneData } = source;
+          await Penalty.create({
+            ...cloneData,
+            branchId: targetBranchId,
+            createdBy: req.user.id,
+          });
+          branchResult.created += 1;
+        }
+      } catch (err) {
+        branchResult.error = err.message;
+      }
+
+      summary.branches.push(branchResult);
+    }
+
+    const totalCreated = summary.branches.reduce((s, b) => s + b.created, 0);
+    const totalDeleted = summary.branches.reduce((s, b) => s + b.deleted, 0);
+
+    res.json({
+      success: true,
+      summary,
+      message: `Đồng bộ xong: tạo ${totalCreated} record${
+        deleteOldFirst ? `, xóa ${totalDeleted} record cũ` : ''
+      } trên ${validTargets.length} branch`,
+    });
+  } catch (err) {
+    console.error('[POST /penalty/catalog/sync]', err);
+    res.status(500).json({ message: err.message || 'Lỗi server' });
+  }
+});
+
 // Tính số tiền phạt theo type
 function computePenaltyAmount(penalty, { minutes, occurrence }) {
   if (!penalty) return { amount: 0, appliedTier: null };
@@ -315,9 +503,8 @@ router.get('/records/:userId', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// ⭐ NEW: GET /api/penalty/records/:userId/count?penaltyId=...&year=&month=
+// GET /api/penalty/records/:userId/count?penaltyId=...&year=&month=
 // Đếm số lần đã vi phạm 1 loại phạt cụ thể trong tháng
-// → trả về { count: N, nextOccurrence: N+1, nextAmount: ? }
 // ═════════════════════════════════════════════════════════════════════════
 router.get('/records/:userId/count', authenticate, async (req, res) => {
   try {
@@ -344,7 +531,6 @@ router.get('/records/:userId/count', authenticate, async (req, res) => {
       penaltyId,
     });
 
-    // Lấy penalty để biết số tiền cho lần kế tiếp
     const penalty = await Penalty.findById(penaltyId).lean();
     const nextOccurrence = count + 1;
     const { amount: nextAmount, appliedTier } = computePenaltyAmount(penalty, {
@@ -365,10 +551,6 @@ router.get('/records/:userId/count', authenticate, async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════
 // POST /api/penalty/records — ghi nhận phạt mới
-// ⭐ Hỗ trợ thêm:
-//   - manualAmount: nếu time_window mà không chọn ca, nhập tiền tay
-//   - shiftId: nếu time_window có chọn ca, BE tự tính minutes từ giờ ca
-//   - occurredAt: ngày + giờ vi phạm (cho time_window auto tính)
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/records', authenticate, async (req, res) => {
   try {
@@ -385,9 +567,9 @@ router.post('/records', authenticate, async (req, res) => {
       occurredOn,
       reason = '',
       note = '',
-      manualAmount,           // ⭐ NEW: nhập tiền tay
-      shiftId,                // ⭐ NEW: chọn ca → tự tính minutes
-      occurredAt,             // ⭐ NEW: thời điểm vi phạm
+      manualAmount,
+      shiftId,
+      occurredAt,
     } = req.body;
 
     if (!mongoose.isValidObjectId(userId)) {
@@ -411,16 +593,13 @@ router.post('/records', authenticate, async (req, res) => {
     let amount = 0;
     let appliedTier = null;
 
-    // ─── Tính số tiền tùy theo type ──────────────────────────────────
     if (penalty.type === 'fixed') {
       amount = Number(penalty.fixedAmount) || 0;
     } else if (penalty.type === 'time_window') {
-      // Nếu có manualAmount → ưu tiên dùng (không cần ca)
       if (typeof manualAmount === 'number' && manualAmount >= 0) {
         amount = manualAmount;
         appliedTier = null;
       } else {
-        // Nếu có shiftId + occurredAt → tự tính minutes từ giờ ca
         if (shiftId && occurredAt && mongoose.isValidObjectId(shiftId)) {
           const WorkShift = require('../models/WorkShift');
           const { calculateLateMinutes } = require('../utils/geoHelpers');
@@ -444,14 +623,13 @@ router.post('/records', authenticate, async (req, res) => {
         appliedTier = calc.appliedTier;
       }
     } else if (penalty.type === 'repeat_count') {
-      // ⭐ Auto đếm số lần đã vi phạm trong tháng này
       const existingCount = await PenaltyRecord.countDocuments({
         user: userId,
         year,
         month,
         penaltyId,
       });
-      calcOccurrence = existingCount + 1; // lần này là lần thứ N+1
+      calcOccurrence = existingCount + 1;
       const calc = computePenaltyAmount(penalty, { occurrence: calcOccurrence });
       amount = calc.amount;
       appliedTier = calc.appliedTier;
@@ -516,7 +694,6 @@ router.put('/records/:id', authenticate, async (req, res) => {
     let appliedTier = existing.appliedTier;
 
     if (penalty) {
-      // Manual amount override (cho time_window)
       if (typeof manualAmount === 'number' && manualAmount >= 0 && penalty.type === 'time_window') {
         amount = manualAmount;
         appliedTier = null;

@@ -74,6 +74,7 @@ app.use('/api/salary',          require('./routes/salaryy'));
 app.use('/api/penalty',         require('./routes/penalty'));
 app.use('/api/workshift',       require('./routes/workshift'));
 app.use('/api/attendance',      require('./routes/attendance'));
+app.use('/api/admin',           require('./routes/device-security'));   // ⭐ NEW: Device Binding (admin only)
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

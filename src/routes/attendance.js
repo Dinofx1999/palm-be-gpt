@@ -8,6 +8,7 @@ const WorkShift = require('../models/WorkShift');
 const { Penalty, PenaltyRecord } = require('../models/Penalty');
 const Branch = require('../models/Branch');
 const User = require('../models/User');
+const DeviceConflictLog = require('../models/DeviceConflictLog');   // ⭐ NEW
 const {
   calculateDistance,
   calculateLateMinutes,
@@ -28,7 +29,6 @@ function getWorkDate(date = new Date()) {
 
 // ═════════════════════════════════════════════════════════════════════════
 // GET /api/attendance/today
-// Trả về trạng thái checkin hôm nay của user hiện tại + danh sách ca khả dụng
 // ═════════════════════════════════════════════════════════════════════════
 router.get('/today', authenticate, async (req, res) => {
   try {
@@ -49,11 +49,9 @@ router.get('/today', authenticate, async (req, res) => {
         .sort({ sortOrder: 1, startTime: 1 })
         .populate('latePenaltyId', 'name type timeWindowTiers fixedAmount severity')
         .lean(),
-      // Các ca đã có người checkin hôm nay (để FE hiển thị "đã có người")
       Attendance.find({ branchId, workDate })
         .populate('user', 'fullName')
         .lean(),
-      // ⭐ FIX: thêm Branch.findById vào Promise.all
       Branch.findById(branchId).select('name latitude longitude geofenceRadius').lean(),
     ]);
 
@@ -90,7 +88,7 @@ router.get('/today', authenticate, async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════
 // POST /api/attendance/checkin
-// Body: { shiftId, latitude, longitude }
+// Body: { shiftId, latitude, longitude, deviceId, userAgent, components, isFallback }
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/checkin', authenticate, async (req, res) => {
   try {
@@ -100,7 +98,12 @@ router.post('/checkin', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'User không thuộc branch' });
     }
 
-    const { shiftId, latitude, longitude } = req.body;
+    const {
+      shiftId, latitude, longitude,
+      // ⭐ NEW: device fingerprint từ FE
+      deviceId, userAgent, components, isFallback,
+    } = req.body;
+
     if (!mongoose.isValidObjectId(shiftId)) {
       return res.status(400).json({ message: 'shiftId không hợp lệ' });
     }
@@ -131,7 +134,7 @@ router.post('/checkin', authenticate, async (req, res) => {
       return res.status(403).json({ message: 'Ca này không thuộc branch của bạn' });
     }
 
-    // 3. Kiểm tra ca đã có người chưa (1 ca / 1 NV / ngày)
+    // 3. Kiểm tra ca đã có người chưa
     const taken = await Attendance.findOne({ shift: shiftId, workDate })
       .populate('user', 'fullName')
       .lean();
@@ -169,7 +172,168 @@ router.post('/checkin', authenticate, async (req, res) => {
       });
     }
 
-    // 5. Tính số phút trễ
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⭐ 5. DEVICE BINDING CHECK
+    //   - Admin: BYPASS hoàn toàn
+    //   - Khác: tuân theo cấu hình branch
+    // ═══════════════════════════════════════════════════════════════════════
+    const userIsAdmin = req.user.role === 'Admin';
+
+    if (deviceId && !userIsAdmin) {
+      const sec = branch.attendanceSecurity || {};
+      const enabled = sec.deviceBindingEnabled === true && sec.enforceAtCheckin !== false;
+
+      if (enabled) {
+        // Tìm user khác đang owning deviceId này
+        const ownerUser = await User.findOne({
+          _id: { $ne: userId },
+          'knownDevices.deviceId': deviceId,
+        }).select('_id username fullName').lean();
+
+        if (ownerUser) {
+          // ⛔ CHẶN: device đang thuộc user khác
+          await DeviceConflictLog.create({
+            attemptedUser: userId,
+            deviceId,
+            userAgent: userAgent || req.headers['user-agent'] || '',
+            conflictWithUser: ownerUser._id,
+            action: 'checkin',
+            branchId: userBranchId,
+            ip: req.ip || req.headers['x-forwarded-for'] || '',
+            resolution: 'blocked',
+          });
+
+          console.warn('[checkin] 🚫 DEVICE_CONFLICT', {
+            attemptedUser: req.user.username,
+            conflictWith: ownerUser.username,
+            deviceId: deviceId.substring(0, 12) + '...',
+          });
+
+          return res.status(403).json({
+            success: false,
+            code: 'DEVICE_CONFLICT',
+            message: `Thiết bị này đã được sử dụng bởi nhân viên khác (${ownerUser.fullName || ownerUser.username}). Bạn không thể checkin từ thiết bị này. Vui lòng liên hệ Admin.`,
+            conflictWith: ownerUser.fullName || ownerUser.username,
+          });
+        }
+
+        // Pass — update knownDevices
+        const userDoc = await User.findById(userId).select('knownDevices').lean();
+        const exists = (userDoc?.knownDevices || []).some((d) => d.deviceId === deviceId);
+        const now = new Date();
+
+        if (exists) {
+          await User.updateOne(
+            { _id: userId, 'knownDevices.deviceId': deviceId },
+            {
+              $set: {
+                'knownDevices.$.lastSeenAt': now,
+                'knownDevices.$.userAgent': userAgent || req.headers['user-agent'] || '',
+              },
+            }
+          );
+        } else {
+          await User.updateOne(
+            { _id: userId },
+            {
+              $push: {
+                knownDevices: {
+                  deviceId,
+                  userAgent: userAgent || req.headers['user-agent'] || '',
+                  components: components || {},
+                  firstSeenAt: now,
+                  lastSeenAt: now,
+                  isFallback: !!isFallback,
+                  source: 'checkin',
+                },
+              },
+            }
+          );
+
+          await DeviceConflictLog.create({
+            attemptedUser: userId,
+            deviceId,
+            userAgent: userAgent || req.headers['user-agent'] || '',
+            conflictWithUser: null,
+            action: 'checkin',
+            branchId: userBranchId,
+            ip: req.ip || req.headers['x-forwarded-for'] || '',
+            resolution: 'allowed',
+            resolved: true,
+            resolvedNote: 'Máy mới chưa ai dùng — auto pass',
+          });
+
+          console.log('[checkin] ✓ NEW_DEVICE auto-added', {
+            user: req.user.username,
+            deviceId: deviceId.substring(0, 12) + '...',
+          });
+        }
+      }
+    }
+
+    // ⭐ ADMIN: vẫn lưu device để track + log "Admin bypass" nếu trùng máy NV khác
+    if (deviceId && userIsAdmin) {
+      const userDoc = await User.findById(userId).select('knownDevices').lean();
+      const exists = (userDoc?.knownDevices || []).some((d) => d.deviceId === deviceId);
+      const now = new Date();
+
+      if (exists) {
+        await User.updateOne(
+          { _id: userId, 'knownDevices.deviceId': deviceId },
+          { $set: { 'knownDevices.$.lastSeenAt': now } }
+        );
+      } else {
+        await User.updateOne(
+          { _id: userId },
+          {
+            $push: {
+              knownDevices: {
+                deviceId,
+                userAgent: userAgent || req.headers['user-agent'] || '',
+                components: components || {},
+                firstSeenAt: now,
+                lastSeenAt: now,
+                isFallback: !!isFallback,
+                source: 'checkin',
+                label: 'Admin',
+              },
+            },
+          }
+        );
+
+        // Log audit nếu máy đang thuộc user khác
+        const ownerUser = await User.findOne({
+          _id: { $ne: userId },
+          'knownDevices.deviceId': deviceId,
+        }).select('_id username fullName').lean();
+
+        await DeviceConflictLog.create({
+          attemptedUser: userId,
+          deviceId,
+          userAgent: userAgent || req.headers['user-agent'] || '',
+          conflictWithUser: ownerUser?._id || null,
+          action: 'checkin',
+          branchId: userBranchId,
+          ip: req.ip || req.headers['x-forwarded-for'] || '',
+          resolution: 'allowed',
+          resolved: true,
+          resolvedNote: ownerUser
+            ? `Admin bypass — máy đang thuộc ${ownerUser.fullName || ownerUser.username}`
+            : 'Admin checkin máy mới — auto pass',
+        });
+
+        if (ownerUser) {
+          console.log('[checkin] ⚡ ADMIN_BYPASS', {
+            admin: req.user.username,
+            deviceOwner: ownerUser.username,
+            deviceId: deviceId.substring(0, 12) + '...',
+          });
+        }
+      }
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // 6. Tính số phút trễ
     const checkInAt = new Date();
     const lateMinutes = calculateLateMinutes(
       checkInAt,
@@ -178,7 +342,7 @@ router.post('/checkin', authenticate, async (req, res) => {
       shift.graceMinutes || 0
     );
 
-    // 6. Tạo Attendance
+    // 7. Tạo Attendance
     const attendance = await Attendance.create({
       user: userId,
       branchId: userBranchId,
@@ -196,7 +360,7 @@ router.post('/checkin', authenticate, async (req, res) => {
       userAgent: req.headers['user-agent'] || '',
     });
 
-    // 7. ⭐ Auto tạo PenaltyRecord nếu trễ + shift có gắn latePenalty
+    // 8. ⭐ Auto tạo PenaltyRecord nếu trễ + shift có gắn latePenalty
     let penaltyRecord = null;
     if (lateMinutes > 0 && shift.latePenaltyId) {
       const penalty = shift.latePenaltyId;
@@ -224,7 +388,6 @@ router.post('/checkin', authenticate, async (req, res) => {
           createdBy: userId,
         });
 
-        // Liên kết ngược
         await Attendance.findByIdAndUpdate(attendance._id, {
           $set: { penaltyRecordId: penaltyRecord._id },
         });
@@ -251,14 +414,12 @@ router.post('/checkin', authenticate, async (req, res) => {
 
 // ═════════════════════════════════════════════════════════════════════════
 // POST /api/attendance/checkout/:id
-// Body: { latitude, longitude }
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/checkout/:id', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const { latitude, longitude } = req.body;
 
-    // Validate GPS
     if (typeof latitude !== 'number' || typeof longitude !== 'number') {
       return res.status(400).json({
         message: 'Cần vị trí GPS để checkout. Vui lòng cho phép định vị.',
@@ -274,7 +435,6 @@ router.post('/checkout/:id', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Đã checkout rồi' });
     }
 
-    // ⭐ Verify GPS — tương tự checkin
     const branch = await Branch.findById(att.branchId).lean();
     if (!branch) {
       return res.status(500).json({ message: 'Không tìm thấy branch' });
@@ -302,12 +462,10 @@ router.post('/checkout/:id', authenticate, async (req, res) => {
       });
     }
 
-    // ⭐ Tính số phút làm việc
     const checkOutAt = new Date();
     const workedMs = checkOutAt.getTime() - new Date(att.checkInAt).getTime();
     const workedMinutes = Math.max(0, Math.floor(workedMs / 60000));
 
-    // Cập nhật attendance
     att.checkOutAt = checkOutAt;
     att.checkOutLatitude = latitude;
     att.checkOutLongitude = longitude;
@@ -318,7 +476,6 @@ router.post('/checkout/:id', authenticate, async (req, res) => {
 
     await att.save();
 
-    // Format thời lượng
     const hours = Math.floor(workedMinutes / 60);
     const mins = workedMinutes % 60;
     const durationStr = hours > 0
@@ -337,8 +494,7 @@ router.post('/checkout/:id', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// GET /api/attendance/list?userId=&year=&month=
-// Admin/Manager xem lịch sử checkin của 1 NV
+// GET /api/attendance/list
 // ═════════════════════════════════════════════════════════════════════════
 router.get('/list', authenticate, async (req, res) => {
   try {
@@ -349,7 +505,6 @@ router.get('/list', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'userId không hợp lệ' });
     }
 
-    // Permission
     if (String(targetUserId) !== String(req.user.id)) {
       if (isAdmin(req)) {
         // OK
@@ -368,7 +523,7 @@ router.get('/list', authenticate, async (req, res) => {
       const y = parseInt(year, 10);
       const m = parseInt(month, 10);
       const start = `${y}-${String(m).padStart(2, '0')}-01`;
-      const endDate = new Date(y, m, 1); // first day next month
+      const endDate = new Date(y, m, 1);
       const end = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, '0')}-01`;
       filter.workDate = { $gte: start, $lt: end };
     }
@@ -387,8 +542,7 @@ router.get('/list', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// POST /api/attendance/:id/waive — Admin/Manager xóa phạt trễ (nếu có lý do)
-// Body: { reason }
+// POST /api/attendance/:id/waive
 // ═════════════════════════════════════════════════════════════════════════
 router.post('/:id/waive', authenticate, async (req, res) => {
   try {
@@ -401,7 +555,6 @@ router.post('/:id/waive', authenticate, async (req, res) => {
     const att = await Attendance.findById(id);
     if (!att) return res.status(404).json({ message: 'Không tìm thấy' });
 
-    // Manager chỉ xóa được trong branch mình
     if (isManager(req) && String(att.branchId) !== String(req.user.branchId)) {
       return res.status(403).json({ message: 'Không có quyền với branch khác' });
     }
@@ -410,7 +563,6 @@ router.post('/:id/waive', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Đã miễn phạt rồi' });
     }
 
-    // Xóa PenaltyRecord nếu có
     if (att.penaltyRecordId) {
       await PenaltyRecord.findByIdAndDelete(att.penaltyRecordId);
     }
@@ -430,11 +582,9 @@ router.post('/:id/waive', authenticate, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// ⭐ ADMIN/MANAGER ENDPOINTS — quản trị chấm công
+// ⭐ ADMIN/MANAGER ENDPOINTS
 // ═════════════════════════════════════════════════════════════════════════
 
-// GET /api/attendance/admin/list — danh sách tất cả chấm công với filter
-// Query: ?branchId=&workDate=&userId=&hasCheckout=&hasLateMinutes=&from=&to=
 router.get('/admin/list', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -443,7 +593,6 @@ router.get('/admin/list', authenticate, async (req, res) => {
 
     const filter = {};
 
-    // Manager chỉ xem được branch mình
     if (isManager(req)) {
       filter.branchId = req.user.branchId;
     } else if (req.query.branchId && mongoose.isValidObjectId(req.query.branchId)) {
@@ -454,7 +603,6 @@ router.get('/admin/list', authenticate, async (req, res) => {
       filter.user = req.query.userId;
     }
 
-    // Filter theo ngày
     if (req.query.workDate) {
       filter.workDate = req.query.workDate;
     } else if (req.query.from || req.query.to) {
@@ -463,14 +611,12 @@ router.get('/admin/list', authenticate, async (req, res) => {
       if (req.query.to) filter.workDate.$lte = req.query.to;
     }
 
-    // Filter "có trễ"
     if (req.query.hasLateMinutes === 'true') {
       filter.lateMinutes = { $gt: 0 };
     } else if (req.query.hasLateMinutes === 'false') {
       filter.lateMinutes = 0;
     }
 
-    // Filter "đã checkout chưa"
     if (req.query.hasCheckout === 'true') {
       filter.checkOutAt = { $ne: null };
     } else if (req.query.hasCheckout === 'false') {
@@ -493,10 +639,6 @@ router.get('/admin/list', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// GET /api/attendance/admin/stats?workDate=YYYY-MM-DD
-// Thống kê nhanh: tổng đi làm, trễ, phạt
-// ═════════════════════════════════════════════════════════════════════════
 router.get('/admin/stats', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -539,9 +681,6 @@ router.get('/admin/stats', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// POST /api/attendance/admin/:id/undo-checkout — xóa checkout (NV click nhầm)
-// ═════════════════════════════════════════════════════════════════════════
 router.post('/admin/:id/undo-checkout', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -561,7 +700,6 @@ router.post('/admin/:id/undo-checkout', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Chấm công này chưa checkout' });
     }
 
-    // Reset checkout fields
     att.checkOutAt = null;
     att.checkOutLatitude = null;
     att.checkOutLongitude = null;
@@ -580,10 +718,6 @@ router.post('/admin/:id/undo-checkout', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// PATCH /api/attendance/admin/:id/change-shift — đổi sang ca khác
-// Body: { shiftId, recalculateLate=true }
-// ═════════════════════════════════════════════════════════════════════════
 router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -608,7 +742,6 @@ router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Ca không cùng branch' });
     }
 
-    // Check ca mới đã có người khác checkin chưa
     const taken = await Attendance.findOne({
       shift: shiftId,
       workDate: att.workDate,
@@ -620,13 +753,11 @@ router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
       });
     }
 
-    // Cập nhật shift
     att.shift = shiftId;
     att.shiftName = newShift.name;
     att.shiftStartTime = newShift.startTime;
     att.shiftEndTime = newShift.endTime;
 
-    // Tính lại lateMinutes nếu yêu cầu
     if (recalculateLate) {
       const newLate = calculateLateMinutes(
         new Date(att.checkInAt),
@@ -635,7 +766,6 @@ router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
         newShift.graceMinutes || 0
       );
 
-      // Xóa phạt cũ nếu có
       if (att.penaltyRecordId) {
         await PenaltyRecord.findByIdAndDelete(att.penaltyRecordId);
         att.penaltyRecordId = null;
@@ -643,7 +773,6 @@ router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
 
       att.lateMinutes = newLate;
 
-      // Tạo phạt mới nếu vẫn trễ + ca mới có gắn penalty
       if (newLate > 0 && newShift.latePenaltyId) {
         const { amount, appliedTier } = computePenaltyAmount(newShift.latePenaltyId, {
           minutes: newLate,
@@ -684,9 +813,6 @@ router.patch('/admin/:id/change-shift', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// PATCH /api/attendance/admin/:id/note — thêm/sửa ghi chú
-// ═════════════════════════════════════════════════════════════════════════
 router.patch('/admin/:id/note', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -713,9 +839,6 @@ router.patch('/admin/:id/note', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// DELETE /api/attendance/admin/:id — xóa hoàn toàn (Admin only)
-// ═════════════════════════════════════════════════════════════════════════
 router.delete('/admin/:id', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -729,12 +852,10 @@ router.delete('/admin/:id', authenticate, async (req, res) => {
     const att = await Attendance.findById(id).lean();
     if (!att) return res.status(404).json({ message: 'Không tìm thấy' });
 
-    // Manager chỉ được xóa trong branch của mình
     if (isManager(req) && String(att.branchId) !== String(req.user.branchId)) {
       return res.status(403).json({ message: 'Không có quyền với branch khác' });
     }
 
-    // Xóa cả PenaltyRecord nếu có
     if (att.penaltyRecordId) {
       await PenaltyRecord.findByIdAndDelete(att.penaltyRecordId);
     }
@@ -747,11 +868,6 @@ router.delete('/admin/:id', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// ⭐ NEW: PATCH /api/attendance/admin/:id/edit-times
-// Sửa giờ checkin/checkout + tự tính lại trễ + phạt
-// Body: { checkInAt, checkOutAt, reason }
-// ═════════════════════════════════════════════════════════════════════════
 router.patch('/admin/:id/edit-times', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -770,16 +886,13 @@ router.patch('/admin/:id/edit-times', authenticate, async (req, res) => {
       return res.status(403).json({ message: 'Không có quyền' });
     }
 
-    // Lấy shift để tính lại lateMinutes
     const shift = await WorkShift.findById(att.shift).populate('latePenaltyId').lean();
     if (!shift) {
       return res.status(500).json({ message: 'Không tìm thấy ca' });
     }
 
-    // Cập nhật giờ
     if (checkInAt) {
       att.checkInAt = new Date(checkInAt);
-      // Tính lại lateMinutes
       att.lateMinutes = calculateLateMinutes(
         att.checkInAt,
         shift.startTime,
@@ -787,13 +900,11 @@ router.patch('/admin/:id/edit-times', authenticate, async (req, res) => {
         shift.graceMinutes || 0
       );
 
-      // Xóa phạt cũ
       if (att.penaltyRecordId) {
         await PenaltyRecord.findByIdAndDelete(att.penaltyRecordId);
         att.penaltyRecordId = null;
       }
 
-      // Tạo phạt mới nếu vẫn trễ + ca có gắn penalty
       if (att.lateMinutes > 0 && shift.latePenaltyId) {
         const { amount, appliedTier } = computePenaltyAmount(shift.latePenaltyId, {
           minutes: att.lateMinutes,
@@ -824,12 +935,10 @@ router.patch('/admin/:id/edit-times', authenticate, async (req, res) => {
 
     if (checkOutAt !== undefined) {
       if (checkOutAt === null || checkOutAt === '') {
-        // Clear checkout
         att.checkOutAt = null;
         att.workedMinutes = 0;
       } else {
         att.checkOutAt = new Date(checkOutAt);
-        // Tính lại workedMinutes
         const workedMs = att.checkOutAt.getTime() - new Date(att.checkInAt).getTime();
         att.workedMinutes = Math.max(0, Math.floor(workedMs / 60000));
       }
@@ -846,11 +955,6 @@ router.patch('/admin/:id/edit-times', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// ⭐ NEW: POST /api/attendance/admin/manual-create
-// Admin tạo chấm công thay NV (NV quên checkin)
-// Body: { userId, shiftId, workDate, checkInAt, checkOutAt?, reason }
-// ═════════════════════════════════════════════════════════════════════════
 router.post('/admin/manual-create', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -858,12 +962,7 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
     }
 
     const {
-      userId,
-      shiftId,
-      workDate,           // YYYY-MM-DD
-      checkInAt,          // ISO string
-      checkOutAt,         // ISO string (optional)
-      reason = '',
+      userId, shiftId, workDate, checkInAt, checkOutAt, reason = '',
     } = req.body;
 
     if (!mongoose.isValidObjectId(userId) || !mongoose.isValidObjectId(shiftId)) {
@@ -883,7 +982,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
     const shift = await WorkShift.findById(shiftId).populate('latePenaltyId').lean();
     if (!shift) return res.status(404).json({ message: 'Không tìm thấy ca' });
 
-    // Check NV đã có chấm công ngày này chưa
     const existingNV = await Attendance.findOne({ user: userId, workDate });
     if (existingNV) {
       return res.status(400).json({
@@ -891,7 +989,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
       });
     }
 
-    // Check ca này đã có người khác chiếm chưa
     const existingShift = await Attendance.findOne({ shift: shiftId, workDate });
     if (existingShift) {
       const u = await User.findById(existingShift.user).select('fullName').lean();
@@ -903,7 +1000,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
     const checkInDate = new Date(checkInAt);
     const checkOutDate = checkOutAt ? new Date(checkOutAt) : null;
 
-    // Tính lateMinutes
     const lateMinutes = calculateLateMinutes(
       checkInDate,
       shift.startTime,
@@ -911,7 +1007,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
       shift.graceMinutes || 0
     );
 
-    // Tính workedMinutes nếu có checkout
     let workedMinutes = 0;
     if (checkOutDate) {
       workedMinutes = Math.max(0, Math.floor(
@@ -919,7 +1014,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
       ));
     }
 
-    // Tạo attendance
     const att = await Attendance.create({
       user: userId,
       branchId: targetUser.branchId,
@@ -932,7 +1026,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
       checkOutAt: checkOutDate,
       lateMinutes,
       workedMinutes,
-      // GPS để null vì manual create không có
       latitude: null,
       longitude: null,
       distanceMeters: null,
@@ -941,7 +1034,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
       note: `[${new Date().toISOString()}] Tạo bởi Admin/Manager ${req.user.username || req.user.id}: ${reason}`,
     });
 
-    // Tạo phạt nếu trễ + ca có gắn penalty
     if (lateMinutes > 0 && shift.latePenaltyId) {
       const { amount, appliedTier } = computePenaltyAmount(shift.latePenaltyId, {
         minutes: lateMinutes,
@@ -977,11 +1069,6 @@ router.post('/admin/manual-create', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// ⭐ NEW: PATCH /api/attendance/admin/:id/transfer
-// Bàn giao ca cho NV khác (NV A đột xuất nghỉ, B làm thay)
-// Body: { newUserId, reason }
-// ═════════════════════════════════════════════════════════════════════════
 router.patch('/admin/:id/transfer', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
@@ -1007,7 +1094,6 @@ router.patch('/admin/:id/transfer', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'NV mới không cùng branch' });
     }
 
-    // Check NV mới đã có chấm công ngày này chưa
     const existing = await Attendance.findOne({
       user: newUserId,
       workDate: att.workDate,
@@ -1022,10 +1108,8 @@ router.patch('/admin/:id/transfer', authenticate, async (req, res) => {
     const oldUserId = att.user;
     const oldUser = await User.findById(oldUserId).select('fullName').lean();
 
-    // Chuyển user
     att.user = newUserId;
 
-    // Chuyển luôn PenaltyRecord nếu có
     if (att.penaltyRecordId) {
       await PenaltyRecord.findByIdAndUpdate(att.penaltyRecordId, {
         user: newUserId,
@@ -1044,10 +1128,6 @@ router.patch('/admin/:id/transfer', authenticate, async (req, res) => {
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-// ⭐ NEW: GET /api/attendance/admin/users-in-branch
-// Lấy danh sách NV của branch (cho filter + manual create + transfer)
-// ═════════════════════════════════════════════════════════════════════════
 router.get('/admin/users-in-branch', authenticate, async (req, res) => {
   try {
     if (!isAdmin(req) && !isManager(req)) {
