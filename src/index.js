@@ -48,7 +48,7 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // ── Health check ───────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
-  status: 'ok', app: 'LuxStay PMS API', version: '2.6.0',
+  status: 'ok', app: 'LuxStay PMS API', version: '2.7.0',
   timestamp: new Date().toISOString(),
 }));
 
@@ -77,6 +77,14 @@ app.use('/api/penalty',           require('./routes/penalty'));
 app.use('/api/workshift',         require('./routes/workshift'));
 app.use('/api/attendance',        require('./routes/attendance'));
 app.use('/api/admin',             require('./routes/device-security'));
+
+// ⭐ NEW 12/05/2026: Module Tuyển dụng (Careers)
+//   - /api/job-postings:     CRUD vị trí tuyển dụng (Admin/Manager)
+//   - /api/job-applications: Quản lý hồ sơ ứng viên (Admin/Manager)
+//   - /api/public/careers:   Public endpoints — KHÔNG auth (form ứng tuyển)
+app.use('/api/job-postings',      require('./routes/jobPostingRoutes'));
+app.use('/api/job-applications',  require('./routes/jobApplicationRoutes'));
+app.use('/api/public/careers',    require('./routes/publicCareersRoutes'));
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

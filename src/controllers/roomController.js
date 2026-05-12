@@ -146,6 +146,10 @@ const getAll = async (req, res, next) => {
         //   Fallback booking.policyName (đơn)
         policyName:   subRoom?.policyName ?? booking.policyName ?? '',
         priceType:    subRoom?.priceType  ?? booking.priceType  ?? '',
+        // ⭐ NEW 12/05/2026: Nguồn khách (Trực tiếp / Booking.com / Agoda / ...)
+        //   source là field cấp booking — đoàn dùng chung 1 nguồn cho cả đoàn,
+        //   không phải mỗi phòng có nguồn riêng → không có fallback từ subRoom.
+        source:       booking.source ?? '',
       } : null
       obj.currentBookingId = booking?._id ?? null
       return obj
