@@ -429,6 +429,55 @@ const create = async (req, res, next) => {
     const initialStatusEarly = validInitialEarly.includes(requestedStatus) ? requestedStatus : 'reserved'
     const willCheckInNow = initialStatusEarly === 'checked_in'
     const nowForCreate = new Date()
+
+    // ⭐ FIX 07/05/2026: Chặn đặt phòng / nhận phòng ở quá khứ
+    //
+    //   Rule 1: status='reserved/confirmed' (đặt trước):
+    //     - checkIn và checkOut phải > now
+    //     - Cho phép trễ tối đa 60 giây (tránh lỗi clock skew)
+    //
+    //   Rule 2: status='checked_in' (nhận phòng ngay):
+    //     - checkOut PHẢI > now (không thể "nhận phòng" với giờ trả đã qua)
+    //     - checkIn cho phép quá khứ (nhập backdate cho khách đã đến trước, vd
+    //       nhân viên nhập muộn) — đúng business
+    //
+    //   Cả 2 rule: nếu Admin/Manager → có thể bypass (cho nhập backdate hợp lệ)
+    {
+      const nowMs = nowForCreate.getTime()
+      const tolerance = 60 * 1000  // 60s tolerance
+
+      if (!willCheckInNow) {
+        // Đặt trước: cả checkIn và checkOut phải tương lai
+        if (checkInDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKIN',
+            message: `Không thể đặt phòng với giờ nhận phòng (${checkInDate.toLocaleString('vi-VN')}) đã qua. Vui lòng chọn giờ nhận phòng từ ${nowForCreate.toLocaleString('vi-VN')} trở đi, hoặc chuyển sang "Nhận phòng ngay" nếu khách đã đến.`,
+            data: { now: nowForCreate, requestedCheckIn: checkInDate },
+          })
+        }
+        if (checkOutDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKOUT',
+            message: `Không thể đặt phòng với giờ trả phòng (${checkOutDate.toLocaleString('vi-VN')}) đã qua. Vui lòng chọn giờ trả phòng sau ${nowForCreate.toLocaleString('vi-VN')}.`,
+            data: { now: nowForCreate, requestedCheckOut: checkOutDate },
+          })
+        }
+      } else {
+        // Nhận phòng ngay: checkOut bắt buộc tương lai
+        if (checkOutDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKOUT',
+            message: `Không thể nhận phòng với giờ trả phòng dự kiến (${checkOutDate.toLocaleString('vi-VN')}) đã qua so với hiện tại (${nowForCreate.toLocaleString('vi-VN')}). Vui lòng chọn giờ trả phòng trong tương lai.`,
+            data: { now: nowForCreate, requestedCheckOut: checkOutDate },
+          })
+        }
+        // checkIn quá khứ thì OK cho status='checked_in' (backdate)
+      }
+    }
+
     const conflictIntervalStart = willCheckInNow && nowForCreate < checkInDate
       ? nowForCreate
       : checkInDate
@@ -648,6 +697,51 @@ const changeDates = async (req, res, next) => {
     if (newCheckOut <= newCheckIn)
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
 
+    // ⭐ FIX 07/05/2026: Nếu booking đã `checked_in`, newCheckIn KHÔNG được ở tương lai
+    //   Lý do: booking đã `checked_in` → `actualCheckIn` phải ≤ hiện tại (khách đã nhận phòng)
+    //   Code dưới sẽ set actualCheckIn = newCheckIn nếu status='checked_in',
+    //   nên ta phải block trước khi tới đoạn đó.
+    //   Ngược lại nếu booking 'reserved/confirmed', newCheckIn ở tương lai OK.
+    if (booking.status === 'checked_in') {
+      const now = new Date()
+      if (newCheckIn.getTime() > now.getTime() + 60 * 1000) {  // 60s tolerance
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_FUTURE_ACTUAL_CHECKIN',
+          message: `Phòng đã nhận — giờ nhận phòng thực tế (${newCheckIn.toLocaleString('vi-VN')}) không được ở tương lai so với hiện tại (${now.toLocaleString('vi-VN')}). Vui lòng chọn giờ trong quá khứ hoặc hiện tại.`,
+          data: {
+            now,
+            requestedCheckIn:    newCheckIn,
+            currentStatus:       booking.status,
+            currentActualCheckIn: booking.actualCheckIn,
+          },
+        })
+      }
+    } else {
+      // Booking chưa check-in (reserved/confirmed): newCheckIn không được ở quá khứ
+      const now = new Date()
+      if (newCheckIn.getTime() < now.getTime() - 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PAST_CHECKIN',
+          message: `Không thể đổi giờ nhận phòng sang quá khứ (${newCheckIn.toLocaleString('vi-VN')}). Vui lòng chọn giờ từ ${now.toLocaleString('vi-VN')} trở đi.`,
+          data: { now, requestedCheckIn: newCheckIn },
+        })
+      }
+    }
+    // Cả 2 trường hợp: newCheckOut phải > now (không cho đổi sang quá khứ)
+    {
+      const now = new Date()
+      if (newCheckOut.getTime() < now.getTime() - 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PAST_CHECKOUT',
+          message: `Không thể đổi giờ trả phòng sang quá khứ (${newCheckOut.toLocaleString('vi-VN')}). Vui lòng chọn giờ sau ${now.toLocaleString('vi-VN')}.`,
+          data: { now, requestedCheckOut: newCheckOut },
+        })
+      }
+    }
+
     const allRoomIds = [booking.roomId]
     if (Array.isArray(booking.rooms)) {
       for (const sr of booking.rooms) {
@@ -792,6 +886,50 @@ const changeDatesRoom = async (req, res, next) => {
     const newCheckOut = new Date(checkOut)
     if (newCheckOut <= newCheckIn) {
       return res.status(400).json({ success: false, message: 'Ngày check-out phải sau check-in' })
+    }
+
+    // ⭐ FIX 07/05/2026: Cùng logic như changeDates()
+    //   - Sub-room đã `checked_in` → newCheckIn không được tương lai
+    //   - Sub-room `reserved/confirmed` → newCheckIn không được quá khứ
+    //   - newCheckOut không được quá khứ (cả 2 trường hợp)
+    {
+      const now = new Date()
+      const nowMs = now.getTime()
+      const tolerance = 60 * 1000
+
+      if (subRoom.status === 'checked_in') {
+        if (newCheckIn.getTime() > nowMs + tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_FUTURE_ACTUAL_CHECKIN',
+            message: `Phòng ${subRoom.roomNumber} đã nhận — giờ nhận phòng thực tế (${newCheckIn.toLocaleString('vi-VN')}) không được ở tương lai so với hiện tại (${now.toLocaleString('vi-VN')}).`,
+            data: {
+              now, requestedCheckIn: newCheckIn,
+              roomNumber: subRoom.roomNumber,
+              currentStatus: subRoom.status,
+              currentActualCheckIn: subRoom.actualCheckIn,
+            },
+          })
+        }
+      } else {
+        if (newCheckIn.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKIN',
+            message: `Không thể đổi giờ nhận phòng ${subRoom.roomNumber} sang quá khứ (${newCheckIn.toLocaleString('vi-VN')}).`,
+            data: { now, requestedCheckIn: newCheckIn, roomNumber: subRoom.roomNumber },
+          })
+        }
+      }
+
+      if (newCheckOut.getTime() < nowMs - tolerance) {
+        return res.status(400).json({
+          success: false,
+          code: 'INVALID_PAST_CHECKOUT',
+          message: `Không thể đổi giờ trả phòng ${subRoom.roomNumber} sang quá khứ (${newCheckOut.toLocaleString('vi-VN')}).`,
+          data: { now, requestedCheckOut: newCheckOut, roomNumber: subRoom.roomNumber },
+        })
+      }
     }
 
     const conflictResult = await findOverlapForNewBooking({
@@ -1566,6 +1704,25 @@ const checkin = async (req, res, next) => {
 
     const now = new Date()
 
+    // ⭐ FIX 07/05/2026: Không cho check-in nếu giờ trả phòng dự kiến đã qua
+    //   Vd: booking 07/05 14:00 → 07/05 20:00, hiện tại 22:00 → KHÔNG cho check-in
+    //   Lý do: check-in vào giờ này = booking đã hoàn toàn ở quá khứ, vô nghĩa
+    //   Cách xử lý: cần đổi giờ trả phòng (changeDates) trước rồi mới check-in được
+    if (booking.checkOut && new Date(booking.checkOut) < now) {
+      return res.status(400).json({
+        success: false,
+        code: 'CHECKOUT_IN_PAST',
+        message: `Không thể nhận phòng — giờ trả phòng dự kiến (${new Date(booking.checkOut).toLocaleString('vi-VN')}) đã qua so với hiện tại (${now.toLocaleString('vi-VN')}). Vui lòng đổi giờ trả phòng (Đổi ngày ở) sang tương lai trước khi nhận phòng.`,
+        data: {
+          now,
+          scheduledCheckOut: booking.checkOut,
+          bookingId: booking._id,
+          customerName: booking.customerName,
+          roomNumber: booking.roomNumber,
+        },
+      })
+    }
+
     const intervalStart = now < booking.checkIn ? now : booking.checkIn
     const intervalEnd   = booking.checkOut
 
@@ -1703,6 +1860,23 @@ const checkinRoom = async (req, res, next) => {
 
     const subCheckIn  = sub.checkIn  ?? booking.checkIn
     const subCheckOut = sub.checkOut ?? booking.checkOut
+
+    // ⭐ FIX 07/05/2026: Không cho check-in nếu giờ trả phòng dự kiến đã qua
+    if (subCheckOut && new Date(subCheckOut) < now) {
+      return res.status(400).json({
+        success: false,
+        code: 'CHECKOUT_IN_PAST',
+        message: `Không thể nhận phòng ${sub.roomNumber} — giờ trả phòng dự kiến (${new Date(subCheckOut).toLocaleString('vi-VN')}) đã qua so với hiện tại (${now.toLocaleString('vi-VN')}). Vui lòng đổi giờ trả phòng (Đổi ngày ở) sang tương lai trước khi nhận phòng.`,
+        data: {
+          now,
+          scheduledCheckOut: subCheckOut,
+          bookingId: booking._id,
+          customerName: booking.customerName,
+          roomNumber: sub.roomNumber,
+        },
+      })
+    }
+
     const intervalStart = now < subCheckIn ? now : subCheckIn
     const intervalEnd   = subCheckOut
 
@@ -2053,6 +2227,23 @@ const checkout = async (req, res, next) => {
         data: { remaining: owed, totalAmount: newTotal, paidAmount: invPaid },
       })
     }
+    // ⭐ FIX 11/05/2026: Chặn nếu khách trả DƯ (paid > total)
+    //   Trước đây code chỉ check owed > 0. Khi paid > total (vd nợ 300 khách
+    //   đưa 500 dư 200), owed = -200 (âm) → cho qua bug.
+    //   Đúng business: bắt buộc hoàn trả phần dư cho khách trước khi trả phòng.
+    if (owed < 0) {
+      const overpaid = Math.abs(owed)
+      return res.status(400).json({
+        success: false,
+        message: `Không thể trả phòng — khách đã trả DƯ ${overpaid.toLocaleString('vi-VN')} VND. Vui lòng hoàn trả ${overpaid.toLocaleString('vi-VN')} VND cho khách trước khi trả phòng.`,
+        code: 'OVERPAID',
+        data: {
+          overpaid,
+          totalAmount: newTotal,
+          paidAmount:  invPaid,
+        },
+      })
+    }
 
     booking.status         = 'checked_out'
     booking.actualCheckOut = actualCO
@@ -2323,6 +2514,20 @@ const checkoutRoom = async (req, res, next) => {
           data: { remaining: invoiceRemaining, totalAmount: newTotalAmount, paidAmount: invoicePaid },
         })
       }
+      // ⭐ FIX 11/05/2026: Chặn nếu đoàn trả DƯ (paid > total)
+      const overpaidGroup = invoicePaid - newTotalAmount
+      if (overpaidGroup > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Đây là phòng cuối — đoàn đã trả DƯ ${overpaidGroup.toLocaleString('vi-VN')} VND. Vui lòng hoàn trả phần dư cho khách trước khi trả phòng.`,
+          code: 'OVERPAID',
+          data: {
+            overpaid:    overpaidGroup,
+            totalAmount: newTotalAmount,
+            paidAmount:  invoicePaid,
+          },
+        })
+      }
     } else {
       const subTotalAmount     = (sub.roomAmount ?? 0) + (sub.servicesAmount ?? 0) - (sub.discountAmount ?? 0)
       const subPaidAmount      = sub.paidAmount ?? 0
@@ -2339,6 +2544,22 @@ const checkoutRoom = async (req, res, next) => {
             subTotalAmount,
             subPaidAmount,
             subRemainingAmount,
+          },
+        })
+      }
+      // ⭐ FIX 11/05/2026: Chặn nếu phòng đã trả DƯ
+      const overpaidSub = subPaidAmount - subTotalAmount
+      if (overpaidSub > 0 && !skipPayment) {
+        return res.status(400).json({
+          success: false,
+          message: `Phòng ${sub.roomNumber} đã trả DƯ ${overpaidSub.toLocaleString('vi-VN')} VND. Vui lòng hoàn trả phần dư cho khách trước khi trả phòng.`,
+          code: 'OVERPAID_FOR_ROOM',
+          data: {
+            roomId:        String(sub.roomId?._id ?? sub.roomId),
+            roomNumber:    sub.roomNumber,
+            overpaid:      overpaidSub,
+            subTotalAmount,
+            subPaidAmount,
           },
         })
       }
@@ -3432,6 +3653,41 @@ const createGroup = async (req, res, next) => {
 
     const willCheckInNowGrp = initialStatus === 'checked_in'
     const nowForGrp = new Date()
+
+    // ⭐ FIX 07/05/2026: Chặn đặt đoàn / nhận đoàn ở quá khứ (giống create())
+    {
+      const nowMs = nowForGrp.getTime()
+      const tolerance = 60 * 1000
+
+      if (!willCheckInNowGrp) {
+        if (checkInDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKIN',
+            message: `Không thể đặt đoàn với giờ nhận phòng (${checkInDate.toLocaleString('vi-VN')}) đã qua. Vui lòng chọn giờ nhận phòng từ ${nowForGrp.toLocaleString('vi-VN')} trở đi.`,
+            data: { now: nowForGrp, requestedCheckIn: checkInDate },
+          })
+        }
+        if (checkOutDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKOUT',
+            message: `Không thể đặt đoàn với giờ trả phòng (${checkOutDate.toLocaleString('vi-VN')}) đã qua.`,
+            data: { now: nowForGrp, requestedCheckOut: checkOutDate },
+          })
+        }
+      } else {
+        if (checkOutDate.getTime() < nowMs - tolerance) {
+          return res.status(400).json({
+            success: false,
+            code: 'INVALID_PAST_CHECKOUT',
+            message: `Không thể nhận đoàn với giờ trả phòng dự kiến (${checkOutDate.toLocaleString('vi-VN')}) đã qua so với hiện tại (${nowForGrp.toLocaleString('vi-VN')}).`,
+            data: { now: nowForGrp, requestedCheckOut: checkOutDate },
+          })
+        }
+      }
+    }
+
     const grpIntervalStart = willCheckInNowGrp && nowForGrp < checkInDate
       ? nowForGrp
       : checkInDate
@@ -3618,6 +3874,680 @@ const createGroup = async (req, res, next) => {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ FEATURE 11/05/2026: GỘP ĐOÀN / TÁCH ĐOÀN
+// ════════════════════════════════════════════════════════════════════════════
+
+// ⭐ POST /bookings/:id/merge-group
+//   body: { targetBookingIds: [id1, id2, ...], groupName?: '' }
+//
+//   Gộp các booking đơn (hoặc đoàn) vào booking `:id` thành 1 đoàn duy nhất.
+//   - `:id` là booking gốc (sẽ thành đoàn chính)
+//   - `targetBookingIds` là các booking sẽ được gộp vào (sẽ bị cancel với reason)
+//   - Cho phép gộp cross-customer (khách khác nhau cũng OK)
+//   - Validate: cùng branchId, không có booking checked_out/cancelled,
+//     không trùng room
+const mergeGroup = async (req, res, next) => {
+  try {
+    const { targetBookingIds = [], groupName = '' } = req.body
+
+    if (!Array.isArray(targetBookingIds) || targetBookingIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cần chọn ít nhất 1 booking để gộp vào đoàn',
+      })
+    }
+
+    const mainBooking = await Booking.findById(req.params.id)
+    if (!mainBooking) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy booking gốc' })
+    }
+    if (['cancelled', 'checked_out'].includes(mainBooking.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Không thể gộp đoàn — booking gốc đang ở trạng thái: ${mainBooking.status}`,
+      })
+    }
+
+    // Load tất cả target bookings
+    const targets = await Booking.find({ _id: { $in: targetBookingIds } })
+    if (targets.length !== targetBookingIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Không tìm thấy đủ ${targetBookingIds.length} booking — chỉ tìm được ${targets.length}`,
+      })
+    }
+
+    // Validate từng target
+    for (const t of targets) {
+      if (String(t._id) === String(mainBooking._id)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Không thể gộp booking với chính nó',
+        })
+      }
+      if (['cancelled', 'checked_out'].includes(t.status)) {
+        return res.status(400).json({
+          success: false,
+          message: `Booking ${t._id} (${t.customerName}) đang ở trạng thái ${t.status}, không thể gộp`,
+        })
+      }
+      if (String(t.branchId) !== String(mainBooking.branchId)) {
+        return res.status(400).json({
+          success: false,
+          message: `Booking ${t.customerName} thuộc chi nhánh khác — không thể gộp`,
+        })
+      }
+    }
+
+    // Build danh sách roomIds hiện có của mainBooking
+    // ⭐ FIX 11/05/2026: CHỈ tính phòng đang active (không phải cancelled/checked_out)
+    //   Phòng cancelled/checked_out vẫn còn record trong rooms[] nhưng không còn
+    //   chiếm chỗ → cho phép gộp booking khác có phòng đó.
+    const existingRoomIds = new Set()
+    const isSingleActive = !Array.isArray(mainBooking.rooms) || mainBooking.rooms.length === 0
+    if (isSingleActive && mainBooking.roomId
+        && !['cancelled', 'checked_out'].includes(mainBooking.status)) {
+      existingRoomIds.add(String(mainBooking.roomId))
+    }
+    if (Array.isArray(mainBooking.rooms)) {
+      for (const sr of mainBooking.rooms) {
+        if (!sr.roomId) continue
+        if (['cancelled', 'checked_out'].includes(sr.status)) continue  // ⭐ skip
+        existingRoomIds.add(String(sr.roomId?._id ?? sr.roomId))
+      }
+    }
+
+    // Check trùng room với targets
+    for (const t of targets) {
+      const tRoomIds = []
+      // ⭐ FIX 11/05/2026: Cũng skip phòng cancelled/checked_out của target
+      const tIsSingle = !Array.isArray(t.rooms) || t.rooms.length === 0
+      if (tIsSingle && t.roomId
+          && !['cancelled', 'checked_out'].includes(t.status)) {
+        tRoomIds.push(String(t.roomId))
+      }
+      if (Array.isArray(t.rooms)) {
+        for (const sr of t.rooms) {
+          if (!sr.roomId) continue
+          if (['cancelled', 'checked_out'].includes(sr.status)) continue  // ⭐ skip
+          tRoomIds.push(String(sr.roomId?._id ?? sr.roomId))
+        }
+      }
+      for (const rid of tRoomIds) {
+        if (existingRoomIds.has(rid)) {
+          // Lookup room number để báo lỗi rõ hơn
+          let roomNumber = rid
+          if (Array.isArray(t.rooms)) {
+            const sr = t.rooms.find(r => String(r.roomId?._id ?? r.roomId) === rid)
+            if (sr?.roomNumber) roomNumber = sr.roomNumber
+          } else if (t.roomNumber && String(t.roomId) === rid) {
+            roomNumber = t.roomNumber
+          }
+          return res.status(400).json({
+            success: false,
+            code: 'DUPLICATE_ROOM_IN_MERGE',
+            message: `Phòng ${roomNumber} có trong cả booking gốc và booking ${t.customerName} — không thể gộp. Hãy chọn booking khác.`,
+            data: {
+              roomNumber,
+              targetBookingId: t._id,
+              targetCustomerName: t.customerName,
+            },
+          })
+        }
+        existingRoomIds.add(rid)
+      }
+    }
+
+    // Convert mainBooking → group (nếu chưa)
+    if (!Array.isArray(mainBooking.rooms) || mainBooking.rooms.length === 0) {
+      // Promote single → group: tạo sub-room đầu từ data hiện tại
+      mainBooking.rooms = [{
+        roomId:         mainBooking.roomId,
+        roomNumber:     mainBooking.roomNumber,
+        roomType:       mainBooking.roomType,
+        checkIn:        mainBooking.checkIn,
+        checkOut:       mainBooking.checkOut,
+        nights:         mainBooking.nights,
+        priceType:      mainBooking.priceType,
+        adults:         mainBooking.adults,
+        children:       mainBooking.children,
+        policyId:       mainBooking.policyId,
+        policyName:     mainBooking.policyName,
+        roomAmount:     mainBooking.roomAmount ?? 0,
+        servicesAmount: mainBooking.servicesAmount ?? 0,
+        discountAmount: 0,
+        paidAmount:     0,
+        priceBreakdown: (mainBooking.priceBreakdown ?? []).map(b => {
+          const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
+          const lbl = String(item.label ?? '')
+          const hasPrefix = /^\[[^\]]+\]\s/.test(lbl)
+          return {
+            label:  hasPrefix ? lbl : `[${mainBooking.roomNumber}] ${lbl}`,
+            amount: Number(item.amount ?? 0),
+            type:   item.type === 'surcharge' ? 'surcharge' : 'base',
+            meta:   { ...(item.meta || {}), roomNumber: mainBooking.roomNumber },
+          }
+        }),
+        status:         mainBooking.status,
+        actualCheckIn:  mainBooking.actualCheckIn,
+        actualCheckOut: mainBooking.actualCheckOut,
+      }]
+      mainBooking.isGroup = true
+    }
+
+    // Push từng phòng của targets vào mainBooking.rooms[]
+    const mergedRoomInfos = []  // để log
+    for (const t of targets) {
+      const tSubRooms = (Array.isArray(t.rooms) && t.rooms.length > 0)
+        ? t.rooms
+        : [{
+            roomId:         t.roomId,
+            roomNumber:     t.roomNumber,
+            roomType:       t.roomType,
+            checkIn:        t.checkIn,
+            checkOut:       t.checkOut,
+            nights:         t.nights,
+            priceType:      t.priceType,
+            adults:         t.adults,
+            children:       t.children,
+            policyId:       t.policyId,
+            policyName:     t.policyName,
+            roomAmount:     t.roomAmount ?? 0,
+            servicesAmount: t.servicesAmount ?? 0,
+            discountAmount: 0,
+            paidAmount:     0,
+            priceBreakdown: (t.priceBreakdown ?? []).map(b => {
+              const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
+              const lbl = String(item.label ?? '')
+              const hasPrefix = /^\[[^\]]+\]\s/.test(lbl)
+              return {
+                label:  hasPrefix ? lbl : `[${t.roomNumber}] ${lbl}`,
+                amount: Number(item.amount ?? 0),
+                type:   item.type === 'surcharge' ? 'surcharge' : 'base',
+                meta:   { ...(item.meta || {}), roomNumber: t.roomNumber },
+              }
+            }),
+            status:         t.status,
+            actualCheckIn:  t.actualCheckIn,
+            actualCheckOut: t.actualCheckOut,
+          }]
+
+      for (const sr of tSubRooms) {
+        if (['cancelled', 'checked_out'].includes(sr.status)) continue
+        const srObj = (sr && typeof sr.toObject === 'function') ? sr.toObject() : sr
+        // Reset paid/discount của target — sẽ track ở mainBooking level
+        srObj.paidAmount     = srObj.paidAmount     ?? 0
+        srObj.discountAmount = srObj.discountAmount ?? 0
+        mainBooking.rooms.push(srObj)
+        mergedRoomInfos.push({
+          bookingId:   String(t._id),
+          customerName: t.customerName,
+          roomNumber:  srObj.roomNumber,
+        })
+      }
+    }
+
+    // Recalc tổng
+    const totalRoomAmount    = mainBooking.rooms.reduce((s, r) => {
+      if (['cancelled'].includes(r.status)) return s
+      return s + (r.roomAmount ?? 0)
+    }, 0)
+    const totalServicesAmount = mainBooking.rooms.reduce((s, r) => s + (r.servicesAmount ?? 0), 0)
+                              + (mainBooking.servicesAmount ?? 0)
+
+    mainBooking.roomAmount     = totalRoomAmount
+    mainBooking.servicesAmount = totalServicesAmount
+
+    const subtotal = totalRoomAmount + totalServicesAmount
+    const pctDisc  = Math.round(subtotal * (mainBooking.discountPercent ?? 0) / 100)
+    mainBooking.discount    = pctDisc + (mainBooking.discountAmount ?? 0)
+    mainBooking.totalAmount = Math.max(0, subtotal - mainBooking.discount + (mainBooking.transferFee ?? 0))
+
+    // Update checkIn/checkOut bao trùm
+    const allCheckIns  = mainBooking.rooms.map(sr => sr.checkIn  ?? mainBooking.checkIn)
+    const allCheckOuts = mainBooking.rooms.map(sr => sr.checkOut ?? mainBooking.checkOut)
+    mainBooking.checkIn  = new Date(Math.min(...allCheckIns.map(d => new Date(d).getTime())))
+    mainBooking.checkOut = new Date(Math.max(...allCheckOuts.map(d => new Date(d).getTime())))
+
+    // Set groupName nếu được truyền
+    if (groupName) mainBooking.groupName = groupName
+    mainBooking.isGroup = true
+
+    // Recalc status booking: nếu có phòng nào checked_in → đoàn checked_in
+    const anyCheckedIn = mainBooking.rooms.some(r => r.status === 'checked_in')
+    const anyReserved  = mainBooking.rooms.some(r => r.status === 'reserved' || r.status === 'confirmed')
+    if (anyCheckedIn) {
+      mainBooking.status = 'checked_in'
+    } else if (anyReserved) {
+      mainBooking.status = mainBooking.status === 'confirmed' ? 'confirmed' : 'reserved'
+    }
+
+    mainBooking.markModified('rooms')
+    await mainBooking.save()
+
+    // Cancel các target booking với reason
+    for (const t of targets) {
+      t.status       = 'cancelled'
+      t.cancelReason = `Gộp vào đoàn ${mainBooking.customerName}${mainBooking.groupName ? ` (${mainBooking.groupName})` : ''} — booking #${mainBooking._id}`
+      t.cancelledAt  = new Date()
+      t.cancelledBy  = req.user?.id ?? req.user?._id ?? null
+      await t.save()
+    }
+
+    // Update Room.currentBookingId của các phòng đã merge sang mainBooking
+    const allMergedRoomIds = []
+    for (const t of targets) {
+      if (t.roomId) allMergedRoomIds.push(t.roomId)
+      if (Array.isArray(t.rooms)) {
+        for (const sr of t.rooms) {
+          if (sr.roomId && !['cancelled', 'checked_out'].includes(sr.status)) {
+            allMergedRoomIds.push(sr.roomId?._id ?? sr.roomId)
+          }
+        }
+      }
+    }
+    if (allMergedRoomIds.length > 0) {
+      await Room.updateMany(
+        { _id: { $in: allMergedRoomIds } },
+        {
+          currentBookingId: mainBooking._id,
+          currentGuestName: mainBooking.customerName,
+        }
+      )
+    }
+
+    // Sync invoice nếu có
+    try {
+      const invoice = await Invoice.findOne({ bookingId: mainBooking._id })
+      if (invoice) {
+        invoice.roomAmount      = mainBooking.roomAmount
+        invoice.servicesAmount  = mainBooking.servicesAmount ?? 0
+        invoice.discount        = mainBooking.discount ?? 0
+        invoice.totalAmount     = mainBooking.totalAmount
+        invoice.remainingAmount = Math.max(0, mainBooking.totalAmount - (invoice.paidAmount ?? 0))
+        invoice.items           = buildInvoiceItemsFromBooking(mainBooking)
+        await invoice.save()
+      }
+    } catch (e) {
+      console.error('[mergeGroup] sync invoice failed (non-fatal):', e.message)
+    }
+
+    await logAction({
+      entityType: 'Booking', entityId: mainBooking._id,
+      action: 'merge_group',
+      description: `Gộp ${targets.length} booking vào đoàn ${mainBooking.customerName}: ${mergedRoomInfos.map(r => `${r.roomNumber} (${r.customerName})`).join(', ')}`,
+      user: req.user, branchId: mainBooking.branchId,
+      metadata: {
+        mergedCount:        targets.length,
+        mergedRoomInfos,
+        targetBookingIds:   targets.map(t => String(t._id)),
+        newTotalAmount:     mainBooking.totalAmount,
+        newRoomCount:       mainBooking.rooms.length,
+        groupName:          mainBooking.groupName ?? null,
+      },
+    })
+
+    res.json({
+      success: true,
+      message: `Đã gộp ${targets.length} booking vào đoàn (${mainBooking.rooms.length} phòng)`,
+      data: { booking: mainBooking, mergedCount: targets.length },
+    })
+  } catch (err) {
+    console.error('[mergeGroup] error:', err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+}
+
+// ⭐ POST /bookings/:id/split-room
+//   body: { roomId, newCustomerName?, newCustomerPhone? }
+//
+//   Tách 1 phòng khỏi đoàn `:id` → tạo booking single mới.
+//   - Phòng cần tách: status phải là `reserved/confirmed/checked_in`
+//     (không phải checked_out/cancelled)
+//   - Nếu đoàn cũ chỉ còn 1 phòng sau tách → degrade thành single booking
+//   - paidAmount của sub-room → chuyển sang booking mới (giữ track)
+//   - Có thể tách với customer khác (newCustomerName/Phone) — nếu không truyền
+//     thì dùng customer của booking gốc
+const splitRoom = async (req, res, next) => {
+  try {
+    const { roomId, newCustomerName, newCustomerPhone, groupName = '' } = req.body
+
+    if (!roomId) {
+      return res.status(400).json({ success: false, message: 'Thiếu roomId cần tách' })
+    }
+
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+    }
+    if (!Array.isArray(booking.rooms) || booking.rooms.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Booking này không phải đoàn — không thể tách',
+      })
+    }
+    if (booking.rooms.length === 1) {
+      return res.status(400).json({
+        success: false,
+        message: 'Đoàn chỉ còn 1 phòng — không thể tách nữa',
+      })
+    }
+    if (['cancelled', 'checked_out'].includes(booking.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Không thể tách phòng — booking đang ở trạng thái: ${booking.status}`,
+      })
+    }
+
+    const subIdx = booking.rooms.findIndex(sr =>
+      String(sr.roomId?._id ?? sr.roomId) === String(roomId)
+    )
+    if (subIdx < 0) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy phòng trong đoàn' })
+    }
+    const sub = booking.rooms[subIdx]
+    if (['cancelled', 'checked_out'].includes(sub.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Không thể tách phòng đang ở trạng thái: ${sub.status}`,
+      })
+    }
+
+    // Customer cho booking mới
+    let newCustomerId
+    let useNewName = newCustomerName?.trim()
+    let useNewPhone = newCustomerPhone?.toString().trim() ?? ''
+    if (useNewName) {
+      // Tách sang khách khác
+      let customer
+      if (useNewPhone) {
+        customer = await Customer.findOne({ phone: useNewPhone })
+        if (!customer) customer = await Customer.create({ name: useNewName, phone: useNewPhone })
+      } else {
+        customer = await Customer.create({ name: useNewName })
+      }
+      newCustomerId = customer._id
+    } else {
+      // Dùng customer của booking gốc
+      newCustomerId = booking.customerId
+      useNewName    = booking.customerName
+      useNewPhone   = booking.customerPhone
+    }
+
+    const subObj = (sub && typeof sub.toObject === 'function') ? sub.toObject() : sub
+
+    // Tạo booking mới (single) từ sub-room
+    const newBooking = await Booking.create({
+      customerId:      newCustomerId,
+      customerName:    useNewName,
+      customerPhone:   useNewPhone || '0000000000',
+      roomId:          subObj.roomId,
+      roomNumber:      subObj.roomNumber,
+      roomType:        subObj.roomType,
+      branchId:        booking.branchId,
+      checkIn:         subObj.checkIn  ?? booking.checkIn,
+      checkOut:        subObj.checkOut ?? booking.checkOut,
+      nights:          subObj.nights   ?? booking.nights,
+      priceType:       subObj.priceType ?? booking.priceType,
+      adults:          subObj.adults   ?? booking.adults,
+      children:        subObj.children ?? booking.children,
+      roomAmount:      subObj.roomAmount ?? 0,
+      servicesAmount:  subObj.servicesAmount ?? 0,
+      discount:        subObj.discountAmount ?? 0,
+      discountPercent: 0,
+      discountAmount:  subObj.discountAmount ?? 0,
+      isFreeRoom:      false,
+      totalAmount:     Math.max(0, (subObj.roomAmount ?? 0) + (subObj.servicesAmount ?? 0) - (subObj.discountAmount ?? 0)),
+      priceBreakdown:  (subObj.priceBreakdown ?? []).map(b => {
+        const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
+        const lbl = String(item.label ?? '').replace(/^\[[^\]]+\]\s*/, '')
+        return {
+          label:  lbl,
+          amount: Number(item.amount ?? 0),
+          type:   item.type === 'surcharge' ? 'surcharge' : 'base',
+          meta:   { ...(item.meta || {}), roomNumber: subObj.roomNumber },
+        }
+      }),
+      policyId:        subObj.policyId   ?? booking.policyId,
+      policyName:      subObj.policyName ?? booking.policyName,
+      policySnapshot:  booking.policySnapshot,  // snapshot kế thừa
+      status:          subObj.status,
+      actualCheckIn:   subObj.actualCheckIn  ?? null,
+      actualCheckOut:  subObj.actualCheckOut ?? null,
+      source:          booking.source ?? 'Trực tiếp',
+      isGroup:         false,
+      rooms:           [],
+      // ⭐ Note: paidAmount của sub không copy thẳng — sẽ tạo invoice riêng
+      //   nếu cần. Tạm thời paidAmount của newBooking = 0, sub.paidAmount sẽ
+      //   chuyển vào invoice mới ở bước tiếp theo (xem block sync invoice).
+    })
+
+    // Trừ phòng đã tách khỏi đoàn cũ
+    const subPaidAmount = subObj.paidAmount ?? 0
+    booking.rooms.splice(subIdx, 1)
+    booking.markModified('rooms')
+
+    // Nếu sau tách đoàn cũ chỉ còn 1 phòng → degrade thành single booking
+    let degradedToSingle = false
+    if (booking.rooms.length === 1) {
+      const remaining = booking.rooms[0]
+      const remObj = (remaining && typeof remaining.toObject === 'function') ? remaining.toObject() : remaining
+      booking.roomId         = remObj.roomId
+      booking.roomNumber     = remObj.roomNumber
+      booking.roomType       = remObj.roomType
+      booking.checkIn        = remObj.checkIn  ?? booking.checkIn
+      booking.checkOut       = remObj.checkOut ?? booking.checkOut
+      booking.nights         = remObj.nights   ?? booking.nights
+      booking.priceType      = remObj.priceType ?? booking.priceType
+      booking.adults         = remObj.adults   ?? booking.adults
+      booking.children       = remObj.children ?? booking.children
+      booking.roomAmount     = remObj.roomAmount ?? 0
+      booking.actualCheckIn  = remObj.actualCheckIn  ?? booking.actualCheckIn
+      booking.actualCheckOut = remObj.actualCheckOut ?? booking.actualCheckOut
+      booking.priceBreakdown = (remObj.priceBreakdown ?? []).map(b => {
+        const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
+        const lbl = String(item.label ?? '').replace(/^\[[^\]]+\]\s*/, '')
+        return {
+          label:  lbl,
+          amount: Number(item.amount ?? 0),
+          type:   item.type === 'surcharge' ? 'surcharge' : 'base',
+          meta:   { ...(item.meta || {}), roomNumber: remObj.roomNumber },
+        }
+      })
+      booking.policyId   = remObj.policyId   ?? booking.policyId
+      booking.policyName = remObj.policyName ?? booking.policyName
+      booking.status     = remObj.status
+      booking.isGroup    = false
+      booking.rooms      = []
+      degradedToSingle = true
+    }
+
+    // Recalc tổng cho booking gốc
+    if (!degradedToSingle) {
+      const newTotalRoom = booking.rooms.reduce((s, r) => {
+        if (r.status === 'cancelled') return s
+        return s + (r.roomAmount ?? 0)
+      }, 0)
+      booking.roomAmount = newTotalRoom
+      const newSubtotal = newTotalRoom + (booking.servicesAmount ?? 0)
+      const newPctDisc  = Math.round(newSubtotal * (booking.discountPercent ?? 0) / 100)
+      booking.discount    = newPctDisc + (booking.discountAmount ?? 0)
+      booking.totalAmount = Math.max(0, newSubtotal - booking.discount + (booking.transferFee ?? 0))
+
+      // Update checkIn/checkOut bao trùm
+      const allCheckIns  = booking.rooms.map(sr => sr.checkIn  ?? booking.checkIn)
+      const allCheckOuts = booking.rooms.map(sr => sr.checkOut ?? booking.checkOut)
+      if (allCheckIns.length > 0)  booking.checkIn  = new Date(Math.min(...allCheckIns.map(d => new Date(d).getTime())))
+      if (allCheckOuts.length > 0) booking.checkOut = new Date(Math.max(...allCheckOuts.map(d => new Date(d).getTime())))
+
+      // Update booking.roomId nếu đang trỏ tới phòng vừa tách
+      if (String(booking.roomId) === String(roomId)) {
+        const firstRemaining = booking.rooms[0]
+        if (firstRemaining) {
+          booking.roomId     = firstRemaining.roomId
+          booking.roomNumber = firstRemaining.roomNumber
+          booking.roomType   = firstRemaining.roomType
+        }
+      }
+    } else {
+      // Đã degrade — recalc totalAmount cho single
+      const newSubtotal = (booking.roomAmount ?? 0) + (booking.servicesAmount ?? 0)
+      const newPctDisc  = Math.round(newSubtotal * (booking.discountPercent ?? 0) / 100)
+      booking.discount    = newPctDisc + (booking.discountAmount ?? 0)
+      booking.totalAmount = Math.max(0, newSubtotal - booking.discount + (booking.transferFee ?? 0))
+    }
+
+    if (groupName && !degradedToSingle) booking.groupName = groupName
+    await booking.save()
+
+    // Update Room.currentBookingId của phòng vừa tách → newBooking
+    await Room.findByIdAndUpdate(roomId, {
+      currentBookingId: newBooking._id,
+      currentGuestName: useNewName,
+    })
+
+    // Sync invoice: tạo invoice mới cho booking tách, deduct số tiền của sub
+    // ra khỏi invoice gốc nếu có
+    try {
+      const oldInvoice = await Invoice.findOne({ bookingId: booking._id })
+      if (oldInvoice) {
+        // Trừ phần đã trả của sub khỏi paidAmount của invoice cũ
+        const newOldPaid = Math.max(0, (oldInvoice.paidAmount ?? 0) - subPaidAmount)
+        oldInvoice.paidAmount      = newOldPaid
+        oldInvoice.roomAmount      = booking.roomAmount
+        oldInvoice.servicesAmount  = booking.servicesAmount ?? 0
+        oldInvoice.discount        = booking.discount ?? 0
+        oldInvoice.totalAmount     = booking.totalAmount
+        oldInvoice.remainingAmount = Math.max(0, booking.totalAmount - newOldPaid)
+        oldInvoice.paymentStatus   = newOldPaid >= booking.totalAmount ? 'paid' :
+                                     newOldPaid > 0 ? 'partial' : 'unpaid'
+        oldInvoice.items           = buildInvoiceItemsFromBooking(booking)
+        await oldInvoice.save()
+      }
+
+      // Tạo invoice mới cho newBooking nếu sub có paidAmount > 0
+      if (subPaidAmount > 0) {
+        await Invoice.create({
+          bookingId:       newBooking._id,
+          customerId:      newBooking.customerId,
+          customerName:    newBooking.customerName,
+          roomNumber:      newBooking.roomNumber,
+          roomAmount:      newBooking.roomAmount,
+          servicesAmount:  newBooking.servicesAmount ?? 0,
+          discount:        newBooking.discount ?? 0,
+          totalAmount:     newBooking.totalAmount,
+          paidAmount:      subPaidAmount,
+          remainingAmount: Math.max(0, newBooking.totalAmount - subPaidAmount),
+          paymentStatus:   subPaidAmount >= newBooking.totalAmount ? 'paid' :
+                           subPaidAmount > 0 ? 'partial' : 'unpaid',
+          issuedBy:        req.user?.id,
+          items:           buildInvoiceItemsFromBooking(newBooking),
+          branchId:        newBooking.branchId,
+        })
+      }
+    } catch (e) {
+      console.error('[splitRoom] sync invoice failed (non-fatal):', e.message)
+    }
+
+    await logAction({
+      entityType: 'Booking', entityId: booking._id,
+      action: 'split_room',
+      description: `Tách phòng ${subObj.roomNumber} khỏi đoàn ${booking.customerName}${useNewName !== booking.customerName ? ` → tạo booking mới cho ${useNewName}` : ''}${degradedToSingle ? ' (đoàn còn 1 phòng → trở thành booking đơn)' : ''}`,
+      user: req.user, branchId: booking.branchId,
+      metadata: {
+        splitRoomNumber: subObj.roomNumber,
+        splitRoomId:     String(roomId),
+        newBookingId:    String(newBooking._id),
+        newCustomerName: useNewName,
+        degradedToSingle,
+        subPaidTransferred: subPaidAmount,
+      },
+    })
+
+    res.json({
+      success: true,
+      message: `Đã tách phòng ${subObj.roomNumber} thành booking riêng${degradedToSingle ? ' — đoàn cũ còn 1 phòng đã chuyển thành booking đơn' : ''}`,
+      data: {
+        booking,            // booking gốc (đã update)
+        newBooking,         // booking mới được tạo từ phòng tách
+        degradedToSingle,
+      },
+    })
+  } catch (err) {
+    console.error('[splitRoom] error:', err)
+    res.status(500).json({ success: false, message: err.message })
+  }
+}
+
+// ⭐ GET /bookings/:id/group-merge-candidates
+//   Trả về danh sách booking có thể gộp vào booking `:id`:
+//   - Cùng branchId
+//   - Status: reserved/confirmed/checked_in
+//   - Không phải bản thân nó
+//   - Không trùng room với booking hiện tại
+const getMergeCandidates = async (req, res, next) => {
+  try {
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+    }
+
+    // Build set roomIds của booking hiện tại để loại
+    const myRoomIds = new Set()
+    if (booking.roomId) myRoomIds.add(String(booking.roomId))
+    if (Array.isArray(booking.rooms)) {
+      for (const sr of booking.rooms) {
+        if (sr.roomId) myRoomIds.add(String(sr.roomId?._id ?? sr.roomId))
+      }
+    }
+
+    const candidates = await Booking.find({
+      _id:      { $ne: booking._id },
+      branchId: booking.branchId,
+      status:   { $in: ['reserved', 'confirmed', 'checked_in'] },
+    }).sort({ checkIn: 1 }).limit(100)
+
+    // Filter: loại bỏ booking có room trùng
+    const filtered = candidates.filter(c => {
+      const cRoomIds = []
+      if (c.roomId) cRoomIds.push(String(c.roomId))
+      if (Array.isArray(c.rooms)) {
+        for (const sr of c.rooms) {
+          if (sr.roomId) cRoomIds.push(String(sr.roomId?._id ?? sr.roomId))
+        }
+      }
+      return cRoomIds.every(rid => !myRoomIds.has(rid))
+    })
+
+    res.json({
+      success: true,
+      data: {
+        candidates: filtered.map(c => ({
+          _id:           c._id,
+          customerName:  c.customerName,
+          customerPhone: c.customerPhone,
+          roomNumber:    c.roomNumber,
+          checkIn:       c.checkIn,
+          checkOut:      c.checkOut,
+          status:        c.status,
+          isGroup:       c.isGroup,
+          totalRooms:    Array.isArray(c.rooms) ? c.rooms.length : 1,
+          rooms:         Array.isArray(c.rooms) ? c.rooms.map(sr => ({
+            roomNumber: sr.roomNumber,
+            status:     sr.status,
+          })) : [],
+          totalAmount:   c.totalAmount,
+        })),
+        total: filtered.length,
+      },
+    })
+  } catch (err) {
+    console.error('[getMergeCandidates] error:', err)
+    next(err)
+  }
+}
+
 // ⭐ GET /bookings/:id/can-set-past?roomId=xxx
 const getCanSetPast = async (req, res, next) => {
   try {
@@ -3668,4 +4598,8 @@ module.exports = {
   checkoutRoom,
   undoRoom,
   getCanSetPast,
+  // ⭐ NEW 11/05/2026
+  mergeGroup,
+  splitRoom,
+  getMergeCandidates,
 }

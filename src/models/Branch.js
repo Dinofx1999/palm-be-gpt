@@ -1,3 +1,4 @@
+// backend/src/models/Branch.js (hoặc tương đương)
 const mongoose = require('mongoose');
 
 const branchSchema = new mongoose.Schema({
@@ -36,6 +37,12 @@ const branchSchema = new mongoose.Schema({
   hourBookingCutoffEnabled: { type: Boolean, default: false },
   hourBookingCutoffStart:   { type: String,  default: '20:00' },   // giờ bắt đầu cấm
   hourBookingCutoffEnd:     { type: String,  default: '06:00' },   // giờ kết thúc cấm (exclusive)
+
+  // ⭐ NEW 11/05/2026: Giới hạn % lương ứng (so với tổng lương cố định của NV)
+  //   Mỗi NV có thể ứng nhiều lần trong tháng nhưng TỔNG ≤ maxAmount
+  //   maxAmount = fixedTotal × advanceMaxPercent / 100
+  //   Default 30% là chuẩn ngành VN
+  advanceMaxPercent: { type: Number, default: 30, min: 0, max: 100 },
 
   status: { type: String, enum: ['active', 'inactive'], default: 'active' },
   // ⭐ NEW: Config cho báo giá - chỉ chứa quy định CHUNG của chi nhánh

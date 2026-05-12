@@ -1,3 +1,4 @@
+//index.js
 require('dotenv').config();
 const express     = require('express');
 const cors        = require('cors');
@@ -7,27 +8,26 @@ const compression = require('compression');
 const path = require('path');
 
 const app  = express();
-app.set('trust proxy', 1);                     // ⭐ THAY ĐỔI 1
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 4000;
 
 const { connect } = require('./config/database');
 const { seedAdminIfEmpty } = require('./utils/seedAdmin');
 
 // ── Middleware ─────────────────────────────────────────
-app.use(helmet({ 
+app.use(helmet({
   crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: 'cross-origin' },   // ⭐ THAY ĐỔI 2
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 app.use(compression());
 
-// ⭐ THAY ĐỔI 3: CORS với allowlist (thay vì single string)
 const allowedOrigins = [
   'https://palmhotel.com.vn',
   'https://www.palmhotel.com.vn',
   'http://localhost:5173',
   'http://192.168.1.33:5174',
-   'http://localhost:5174',  // ⭐ THÊM
-  'http://localhost:5175',  // ⭐ THÊM (phòng hờ)
+  'http://localhost:5174',
+  'http://localhost:5175',
   'http://localhost:3000',
 ];
 
@@ -52,29 +52,31 @@ app.get('/health', (_req, res) => res.json({
   timestamp: new Date().toISOString(),
 }));
 
-// ── Routes (giữ nguyên) ────────────────────────────────
-app.use('/api/auth',            require('./routes/auth'));
-app.use('/api/rooms',           require('./routes/rooms'));
-app.use('/api/bookings',        require('./routes/bookings'));
-app.use('/api/customers',       require('./routes/customers'));
-app.use('/api/services',        require('./routes/services'));
-app.use('/api/invoices',        require('./routes/invoices'));
-app.use('/api/dashboard',       require('./routes/dashboard'));
-app.use('/api/users',           require('./routes/users'));
-app.use('/api/branches',        require('./routes/branche'));
-app.use('/api/room-types',      require('./routes/roomTypes'));
-app.use('/api/floors',          require('./routes/floors'));
-app.use('/api/price-configs',   require('./routes/priceConfigs'));
-app.use('/api/payment-methods', require('./routes/paymentMethods'));
-app.use('/api/amenities',       require('./routes/amenities'));
-app.use('/api/price-policies',  require('./routes/pricePolicies'));
-app.use('/api/audit-logs',      require('./routes/auditLogs'));
-app.use('/api/quotes',          require('./routes/quotes'));
-app.use('/api/salary',          require('./routes/salaryy'));
-app.use('/api/penalty',         require('./routes/penalty'));
-app.use('/api/workshift',       require('./routes/workshift'));
-app.use('/api/attendance',      require('./routes/attendance'));
-app.use('/api/admin',           require('./routes/device-security'));   // ⭐ NEW: Device Binding (admin only)
+// ── Routes ────────────────────────────────────────────
+app.use('/api/auth',              require('./routes/auth'));
+app.use('/api/rooms',             require('./routes/rooms'));
+app.use('/api/bookings',          require('./routes/bookings'));
+app.use('/api/customers',         require('./routes/customers'));
+app.use('/api/services',          require('./routes/services'));
+app.use('/api/service-categories', require('./routes/serviceCategoryRoutes'));  // ⭐ NEW 11/05/2026
+app.use('/api/invoices',          require('./routes/invoices'));
+app.use('/api/dashboard',         require('./routes/dashboard'));
+app.use('/api/users',             require('./routes/users'));
+app.use('/api/branches',          require('./routes/branche'));
+app.use('/api/room-types',        require('./routes/roomTypes'));
+app.use('/api/floors',            require('./routes/floors'));
+app.use('/api/price-configs',     require('./routes/priceConfigs'));
+app.use('/api/payment-methods',   require('./routes/paymentMethods'));
+app.use('/api/amenities',         require('./routes/amenities'));
+app.use('/api/price-policies',    require('./routes/pricePolicies'));
+app.use('/api/audit-logs',        require('./routes/auditLogs'));
+app.use('/api/quotes',            require('./routes/quotes'));
+app.use('/api/salary',            require('./routes/salaryy'));
+app.use('/api/salary-advances',   require('./routes/salaryAdvanceRoutes'));  // ⭐ NEW 11/05/2026
+app.use('/api/penalty',           require('./routes/penalty'));
+app.use('/api/workshift',         require('./routes/workshift'));
+app.use('/api/attendance',        require('./routes/attendance'));
+app.use('/api/admin',             require('./routes/device-security'));
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

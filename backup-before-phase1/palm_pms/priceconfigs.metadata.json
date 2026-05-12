@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"roomTypeId":{"$numberInt":"1"},"priceType":{"$numberInt":"1"},"branchId":{"$numberInt":"1"}},"name":"roomTypeId_1_priceType_1_branchId_1","unique":true}],"uuid":"df8351e6ccfd40389f57ca84c0856ef8","collectionName":"priceconfigs","type":"collection"}

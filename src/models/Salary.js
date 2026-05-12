@@ -103,6 +103,10 @@ const SalaryRecordSchema = new Schema(
 
     total: { type: Number, default: 0 },
 
+      // ⭐ NEW 11/05/2026: Snapshot lương ứng tại thời điểm chốt lương
+    advanceTotal:    { type: Number, default: 0 },
+    remainingToPay:  { type: Number, default: 0 },
+
     paidStatus: { type: String, enum: ['paid', 'unpaid'], default: 'paid', index: true },
     paidAt: { type: Date, default: Date.now },
     paymentMethod: { type: String, enum: ['cash', 'transfer'], default: 'cash' },

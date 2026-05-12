@@ -2,28 +2,19 @@ const Room    = require('../models/Room');
 const Booking = require('../models/Booking');
 
 // ── Tính trạng thái động theo booking.status ──────────
-// ⭐ subRoomStatus: nếu là phòng trong đoàn, dùng status RIÊNG của sub-room
 const computeRealStatus = (room, activeBooking, subRoom = null) => {
-  // Trạng thái quản lý của phòng (override)
   if (room.roomStatus === 'maintenance') return 'maintenance'
   if (room.roomStatus === 'inactive')    return 'cleaning'
 
-  // Không có booking → phòng trống
   if (!activeBooking)                       return 'available'
   if (activeBooking.status === 'cancelled') return 'available'
 
-  // ⭐ Nếu là phòng trong đoàn (sub-room), ưu tiên status riêng
   const effectiveStatus = subRoom?.status ?? activeBooking.status
 
   if (effectiveStatus === 'checked_in') {
-    // ⭐ Ưu tiên dates per-room (sub-room) — fallback booking root
     const refCheckOut = subRoom?.checkOut ?? activeBooking.checkOut
     const now = new Date()
     if (refCheckOut && now >= new Date(refCheckOut)) return 'occupied'
-    // ⭐ NOTE: trả 'occupied' luôn (không trả 'checkout') — FE sẽ tự classify
-    //   thành 'overdue' (Chưa đi) khi now > checkOut.
-    //   Lý do: trạng thái phòng vẫn là "Có khách" / "Đang ở", chỉ là quá giờ.
-    //   FE extStatus() phân biệt: occupied + now>checkOut → 'overdue'
     return 'occupied'
   }
 
@@ -42,16 +33,12 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
   return 'available'
 }
 
-// ⭐ HELPER: tìm booking đang active cho 1 phòng (check cả root + sub-rooms)
-// Trả về { booking, subRoom } — subRoom có giá trị khi phòng là member của đoàn (KHÔNG phải primary)
 const findActiveBookingForRoom = (allBookings, roomId) => {
   const ridStr = roomId.toString()
   for (const bk of allBookings) {
-    // Check root
     if (bk.roomId && bk.roomId.toString() === ridStr) {
       return { booking: bk, subRoom: null }
     }
-    // Check sub-rooms (đoàn)
     if (Array.isArray(bk.rooms) && bk.rooms.length > 0) {
       const sub = bk.rooms.find(r => r.roomId && r.roomId.toString() === ridStr)
       if (sub) return { booking: bk, subRoom: sub }
@@ -73,9 +60,6 @@ const getAll = async (req, res, next) => {
     const roomIds = rooms.map(r => r._id)
     const now     = new Date()
 
-    // ⭐ FIX: Query 2 nhóm booking riêng để xử lý đúng overstay/overdue
-    //   1) checked_in: KHÔNG filter checkOut (để hiển thị "Chưa đi" khi quá giờ)
-    //   2) reserved/confirmed: filter checkOut >= now (để ẩn booking quá hạn không tới)
     const activeBookings = await Booking.find({
       $or: [
         { roomId:         { $in: roomIds } },
@@ -84,9 +68,7 @@ const getAll = async (req, res, next) => {
       $and: [
         {
           $or: [
-            // Nhóm 1: đang ở (lấy hết, không cần checkOut filter)
             { status: 'checked_in' },
-            // Nhóm 2: chưa nhận phòng (chỉ lấy booking chưa hết hạn)
             {
               status:   { $in: ['confirmed', 'reserved'] },
               checkOut: { $gte: now },
@@ -96,16 +78,10 @@ const getAll = async (req, res, next) => {
       ],
     })
 
-    // ⭐ Build map: roomId → { booking, subRoom }
-    // Nếu 1 phòng có nhiều booking active, ưu tiên: checked_in > reserved
     const bookingMap = {}
     for (const bk of activeBookings) {
-      // Tất cả phòng liên quan đến booking này
       const relatedRooms = []
 
-      // ⭐ Phòng root: phải LINK với sub-room tương ứng trong rooms[] (nếu có)
-      // Vì sub-room có status RIÊNG (vd: phòng root đã checkout nhưng booking root vẫn checked_in
-      //  vì còn phòng khác đang ở). Nếu subRoom=null thì sẽ fallback về bk.status → SAI.
       if (bk.roomId) {
         const rootRidStr = bk.roomId.toString()
         const matchingSub = Array.isArray(bk.rooms)
@@ -117,7 +93,6 @@ const getAll = async (req, res, next) => {
       if (Array.isArray(bk.rooms)) {
         for (const sr of bk.rooms) {
           if (sr.roomId) {
-            // Nếu phòng đã có ở root rồi (đã link sub-room ở trên) thì skip
             const ridStr = sr.roomId.toString()
             if (bk.roomId && bk.roomId.toString() === ridStr) continue
             relatedRooms.push({ roomId: ridStr, subRoom: sr })
@@ -126,9 +101,6 @@ const getAll = async (req, res, next) => {
       }
 
       for (const { roomId: rid, subRoom } of relatedRooms) {
-        // ⭐ Skip nếu sub-room đã checkout/cancelled
-        // (Booking root vẫn 'checked_in' vì còn phòng khác đang ở,
-        //  nhưng phòng cụ thể này đã trả → KHÔNG được hiển thị "Đang ở")
         const effectiveStatus = subRoom?.status ?? bk.status
         if (effectiveStatus === 'checked_out' || effectiveStatus === 'cancelled') {
           continue
@@ -140,7 +112,6 @@ const getAll = async (req, res, next) => {
           const cur = bookingMap[rid]
           const curStatus = cur.subRoom?.status ?? cur.booking.status
           const newStatus = effectiveStatus
-          // Ưu tiên checked_in
           if (curStatus !== 'checked_in' && newStatus === 'checked_in') {
             bookingMap[rid] = { booking: bk, subRoom }
           } else if (curStatus === newStatus && new Date(bk.checkIn) < new Date(cur.booking.checkIn)) {
@@ -160,24 +131,22 @@ const getAll = async (req, res, next) => {
       obj.activeBooking = booking ? {
         id:           booking._id,
         customerName: booking.customerName,
-        // ⭐ Ưu tiên dates per-room (sub.checkIn) — fallback booking root
-        //   Mỗi phòng trong đoàn có thể có dates khác nhau sau khi đổi ngày per-room
         checkIn:      subRoom?.checkIn  ?? booking.checkIn,
         checkOut:     subRoom?.checkOut ?? booking.checkOut,
-        // ⭐ NEW: Giờ check-in/out THỰC TẾ (sub-room ưu tiên cho đoàn)
         actualCheckIn:  subRoom?.actualCheckIn  ?? booking.actualCheckIn  ?? null,
         actualCheckOut: subRoom?.actualCheckOut ?? booking.actualCheckOut ?? null,
         nights:       subRoom?.nights ?? booking.nights,
-        // ⭐ Status RIÊNG của sub-room nếu là phòng đoàn, fallback root status
         status:       subRoom?.status ?? booking.status,
-        // ⭐ Info đoàn (FE có thể dùng để hiển thị icon/badge "đoàn")
         isGroup:      booking.isGroup ?? false,
         groupName:    booking.groupName ?? '',
-        isGroupMember: !!subRoom,            // true = phòng trong đoàn (không phải primary)
-        // Tổng số phòng của booking (đoàn)
+        isGroupMember: !!subRoom,
         totalRoomsInBooking: Array.isArray(booking.rooms) ? booking.rooms.length : 1,
+        // ⭐ NEW 11/05/2026: Tên chính sách giá để FE hiển thị trong card grid
+        //   Ưu tiên sub-room.policyName (đoàn — mỗi phòng có policy riêng)
+        //   Fallback booking.policyName (đơn)
+        policyName:   subRoom?.policyName ?? booking.policyName ?? '',
+        priceType:    subRoom?.priceType  ?? booking.priceType  ?? '',
       } : null
-      // ⭐ Để tương thích với code hiện có dùng currentBookingId
       obj.currentBookingId = booking?._id ?? null
       return obj
     })
@@ -199,7 +168,6 @@ const getOne = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy phòng' })
 
     const now = new Date()
-    // ⭐ FIX: Query giống getAll — checked_in không filter checkOut
     const activeBooking = await Booking.findOne({
       $or: [
         { roomId: room._id },
@@ -220,7 +188,6 @@ const getOne = async (req, res, next) => {
 
     let subRoom = null
     if (activeBooking) {
-      // Check xem phòng này là primary hay sub
       if (activeBooking.roomId.toString() !== room._id.toString()) {
         subRoom = (activeBooking.rooms ?? []).find(r =>
           r.roomId && r.roomId.toString() === room._id.toString()
@@ -251,7 +218,6 @@ const getAvailable = async (req, res, next) => {
       const checkInDate  = new Date(checkIn)
       const checkOutDate = new Date(checkOut)
 
-      // ⭐ Conflict check cho cả root + rooms[]
       const conflictBookings = await Booking.find({
         $or: [
           { roomId:         { $in: roomIds } },
@@ -262,7 +228,6 @@ const getAvailable = async (req, res, next) => {
         checkOut: { $gt: checkInDate },
       })
 
-      // ⭐ Build set chứa tất cả roomId bị conflict (cả primary + sub-rooms)
       const conflictIds = new Set()
       for (const b of conflictBookings) {
         if (b.roomId) conflictIds.add(b.roomId.toString())
@@ -277,7 +242,6 @@ const getAvailable = async (req, res, next) => {
       return res.json({ success: true, data: { data: available, total: available.length } })
     }
 
-    // ⭐ FIX: Không có date → check booking active (checked_in lấy hết, reserved/confirmed lấy chưa hết hạn)
     const now = new Date()
     const activeBookings = await Booking.find({
       $or: [
@@ -310,7 +274,6 @@ const getAvailable = async (req, res, next) => {
     }
 
     const available = rooms.filter(r => {
-      // Phòng có roomStatus override
       if (r.roomStatus !== 'active') return false
       return !occupiedIds.has(r._id.toString())
     })
@@ -319,7 +282,6 @@ const getAvailable = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ── CREATE ────────────────────────────────────────────
 const create = async (req, res, next) => {
   try {
     const { number, typeId, floorId, branchId } = req.body
@@ -335,7 +297,6 @@ const create = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ── UPDATE ────────────────────────────────────────────
 const update = async (req, res, next) => {
   try {
     const room = await Room.findByIdAndUpdate(
@@ -347,7 +308,6 @@ const update = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ── UPDATE STATUS (manual override) ──────────────────
 const updateStatus = async (req, res, next) => {
   try {
     const { status, notes } = req.body
@@ -364,7 +324,6 @@ const updateStatus = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ── DELETE ────────────────────────────────────────────
 const remove = async (req, res, next) => {
   try {
     const room = await Room.findById(req.params.id)
@@ -372,7 +331,6 @@ const remove = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy phòng' })
 
     const now = new Date()
-    // ⭐ Check cả root + rooms[]
     const activeBooking = await Booking.findOne({
       $or: [
         { roomId: room._id },

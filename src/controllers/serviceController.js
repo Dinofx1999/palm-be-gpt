@@ -1,77 +1,126 @@
-const Service        = require('../models/Service');
-const BookingService = require('../models/BookingService');
-const Booking        = require('../models/Booking');
-const { logAction }  = require('../utils/auditLogger');
+// src/controllers/serviceController.js
+// ⭐ UPDATE 11/05/2026:
+//   - getAll: populate categoryId
+//   - create/update: nhận categoryId → tự lookup name → fill snapshot `category` string
+//   - getAll: filter theo categoryId (thay vì category string)
+
+const Service         = require('../models/Service')
+const ServiceCategory = require('../models/ServiceCategory')
+const BookingService  = require('../models/BookingService')
+const Booking         = require('../models/Booking')
+const { logAction }   = require('../utils/auditLogger')
 
 // ── GET ALL SERVICES ──
 const getAll = async (req, res, next) => {
   try {
-    const { status, branchId, category, search } = req.query
+    const { status, branchId, categoryId, category, search } = req.query
     const filter = {}
-    if (status)   filter.status   = status
-    if (branchId) filter.branchId = branchId
-    if (category && category !== 'all') filter.category = category
+    if (status)    filter.status   = status
+    if (branchId)  filter.branchId = branchId
+
+    // ⭐ Filter theo categoryId (mới) hoặc category string (legacy)
+    if (categoryId && categoryId !== 'all') {
+      if (categoryId === 'uncategorized') {
+        filter.categoryId = null
+      } else {
+        filter.categoryId = categoryId
+      }
+    } else if (category && category !== 'all') {
+      filter.category = category
+    }
+
     if (search && search.trim()) {
       const q = search.trim()
       const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
       filter.$or = [{ name: re }, { category: re }, { unit: re }]
     }
-    const data = await Service.find(filter).sort({ name: 1 })
+
+    const data = await Service.find(filter)
+      .populate('categoryId', 'name icon sortOrder')   // ⭐ populate
+      .sort({ name: 1 })
+
     res.json({ success: true, data: { data, total: data.length } })
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: GET ONE
+// GET ONE
 const getOne = async (req, res, next) => {
   try {
     const service = await Service.findById(req.params.id)
+      .populate('categoryId', 'name icon')
     if (!service) return res.status(404).json({ success: false, message: 'Không tìm thấy dịch vụ' })
     res.json({ success: true, data: { service } })
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: CREATE
+// CREATE
 const create = async (req, res, next) => {
   try {
-    const { name, category = 'Khác', price, unit = 'lần', description = '', status = 'active', branchId } = req.body
+    const {
+      name, categoryId = null, category, price, unit = 'lần',
+      description = '', status = 'active', branchId,
+    } = req.body
+
     if (!name || !name.trim())
       return res.status(400).json({ success: false, message: 'Tên dịch vụ bắt buộc' })
     if (price === undefined || price === null || isNaN(Number(price)) || Number(price) < 0)
       return res.status(400).json({ success: false, message: 'Đơn giá không hợp lệ' })
 
-    // Check trùng tên (case-insensitive) trong cùng branch (nếu có)
-    const dupFilter = { name: new RegExp(`^${name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }
+    // ⭐ Resolve category: nếu có categoryId → lookup name; nếu chỉ có category string → giữ nguyên
+    let categoryName = (category ?? '').trim() || 'Khác'
+    if (categoryId) {
+      const cat = await ServiceCategory.findById(categoryId)
+      if (!cat) {
+        return res.status(400).json({ success: false, message: 'Danh mục không tồn tại' })
+      }
+      categoryName = cat.name
+      // Nếu service có branchId, check category cùng branch
+      if (branchId && String(cat.branchId) !== String(branchId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Danh mục không thuộc chi nhánh của dịch vụ này',
+        })
+      }
+    }
+
+    // Check trùng tên (case-insensitive) trong cùng branch
+    const dupFilter = {
+      name: new RegExp(`^${name.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i'),
+    }
     if (branchId) dupFilter.branchId = branchId
     const dup = await Service.findOne(dupFilter)
     if (dup) return res.status(400).json({ success: false, message: `Dịch vụ "${name}" đã tồn tại` })
 
     const service = await Service.create({
-      name:     name.trim(),
-      category: category.trim(),
-      price:    Number(price),
-      unit:     unit.trim(),
+      name:       name.trim(),
+      categoryId: categoryId || null,
+      category:   categoryName,
+      price:      Number(price),
+      unit:       unit.trim(),
       description, status,
-      branchId: branchId ?? null,
-      createdBy: req.user?.id,
-      updatedBy: req.user?.id,
+      branchId:   branchId ?? null,
+      createdBy:  req.user?.id,
+      updatedBy:  req.user?.id,
     })
 
     await logAction({
       entityType: 'Service', entityId: service._id,
       action: 'create',
       description: `Tạo dịch vụ "${service.name}" — ${(service.price ?? 0).toLocaleString('vi-VN')}đ/${service.unit}`,
-      user: req.user,
-      metadata: { name: service.name, price: service.price, category: service.category },
+      user: req.user, branchId,
+      metadata: { name: service.name, price: service.price, category: service.category, categoryId: service.categoryId },
     })
 
-    res.status(201).json({ success: true, message: 'Đã tạo dịch vụ', data: { service } })
+    // Populate trước khi trả
+    const populated = await Service.findById(service._id).populate('categoryId', 'name icon')
+    res.status(201).json({ success: true, message: 'Đã tạo dịch vụ', data: { service: populated } })
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: UPDATE
+// UPDATE
 const update = async (req, res, next) => {
   try {
-    const allowed = ['name', 'category', 'price', 'unit', 'description', 'status', 'branchId']
+    const allowed = ['name', 'categoryId', 'category', 'price', 'unit', 'description', 'status', 'branchId']
     const payload = { updatedBy: req.user?.id }
     allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })
 
@@ -86,14 +135,29 @@ const update = async (req, res, next) => {
       payload.price = Number(payload.price)
     }
 
+    // ⭐ Nếu đổi categoryId → auto sync `category` string
+    if (payload.categoryId !== undefined) {
+      if (payload.categoryId === null || payload.categoryId === '') {
+        payload.categoryId = null
+        // Không reset category string — giữ snapshot cũ
+      } else {
+        const cat = await ServiceCategory.findById(payload.categoryId)
+        if (!cat) {
+          return res.status(400).json({ success: false, message: 'Danh mục không tồn tại' })
+        }
+        payload.category = cat.name
+      }
+    }
+
     const service = await Service.findByIdAndUpdate(req.params.id, payload, { new: true })
+      .populate('categoryId', 'name icon')
     if (!service) return res.status(404).json({ success: false, message: 'Không tìm thấy dịch vụ' })
 
     await logAction({
       entityType: 'Service', entityId: service._id,
       action: 'update',
       description: `Cập nhật dịch vụ "${service.name}"`,
-      user: req.user,
+      user: req.user, branchId: service.branchId,
       metadata: { changedFields: Object.keys(payload).filter(k => k !== 'updatedBy'), payload },
     })
 
@@ -101,8 +165,7 @@ const update = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ⭐ NEW: DELETE
-// Quy tắc: nếu DV đã được dùng trong booking nào → không cho xoá, gợi ý "Tạm dừng"
+// DELETE — giữ logic cũ
 const remove = async (req, res, next) => {
   try {
     const used = await BookingService.countDocuments({ serviceId: req.params.id })
@@ -119,7 +182,7 @@ const remove = async (req, res, next) => {
       entityType: 'Service', entityId: service._id,
       action: 'delete',
       description: `Xoá dịch vụ "${service.name}"`,
-      user: req.user,
+      user: req.user, branchId: service.branchId,
       metadata: { name: service.name, price: service.price },
     })
 
@@ -127,20 +190,18 @@ const remove = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ── ADD SERVICE TO BOOKING ──
-// ⭐ Helper: Sync servicesAmount + totalAmount của booking và sub-room (nếu có)
-//   Tính lại từ tất cả BookingService liên quan
+// ──────────────────────────────────────────────────────
+// BOOKING SERVICE OPERATIONS — giữ nguyên y như cũ
+// ──────────────────────────────────────────────────────
+
 async function syncBookingAfterServiceChange(bookingId) {
   const booking = await Booking.findById(bookingId)
   if (!booking) return null
 
   const allServices = await BookingService.find({ bookingId })
-
-  // Tổng dịch vụ toàn booking
   const servicesAmount = allServices.reduce((s, x) => s + (x.totalPrice ?? 0), 0)
   booking.servicesAmount = servicesAmount
 
-  // ⭐ Tổng dịch vụ PER-ROOM (chỉ tính subRoomId match)
   if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
     for (const sr of booking.rooms) {
       const srSubId = String(sr.roomId?._id ?? sr.roomId)
@@ -154,7 +215,6 @@ async function syncBookingAfterServiceChange(bookingId) {
   booking.totalAmount = (booking.roomAmount ?? 0) + servicesAmount - (booking.discount ?? 0) + (booking.transferFee ?? 0)
   await booking.save()
 
-  // Đồng bộ Invoice
   const Invoice = require('../models/Invoice')
   const invoice = await Invoice.findOne({ bookingId })
   if (invoice) {
@@ -171,8 +231,6 @@ async function syncBookingAfterServiceChange(bookingId) {
 
 const addToBooking = async (req, res, next) => {
   try {
-    // ⭐ NEW: subRoomId = roomId của phòng cụ thể (mode single-in-group)
-    //   Nếu không truyền → dịch vụ thuộc về booking chung (booking đơn hoặc dịch vụ chung của đoàn)
     const { bookingId, serviceId, quantity = 1, notes = '', subRoomId = null } = req.body
     if (!bookingId || !serviceId)
       return res.status(400).json({ success: false, message: 'Thiếu bookingId hoặc serviceId' })
@@ -186,7 +244,6 @@ const addToBooking = async (req, res, next) => {
     const qty = Math.max(1, Number(quantity) || 1)
     const totalPrice = (service.price ?? 0) * qty
 
-    // ⭐ Validate subRoomId nếu có — phải thuộc booking.rooms
     let subRoomNumber = ''
     if (subRoomId) {
       const sr = (booking.rooms ?? []).find(r => String(r.roomId?._id ?? r.roomId) === String(subRoomId))
@@ -211,7 +268,6 @@ const addToBooking = async (req, res, next) => {
 
     await syncBookingAfterServiceChange(bookingId)
 
-    // Mô tả audit
     const roomLabel = subRoomNumber ? `phòng ${subRoomNumber}` : `phòng ${booking.roomNumber}`
     await logAction({
       entityType: 'Booking', entityId: bookingId,
@@ -225,10 +281,6 @@ const addToBooking = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// ⭐ GET dịch vụ của 1 booking — hỗ trợ filter theo subRoomId
-//   Query: ?subRoomId=xxx (chỉ dịch vụ phòng đó)
-//          ?subRoomId=null (chỉ dịch vụ chung — chưa gắn phòng nào)
-//          (không truyền) → tất cả
 const getByBooking = async (req, res, next) => {
   try {
     const filter = { bookingId: req.params.bookingId }
@@ -246,7 +298,6 @@ const getByBooking = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// REMOVE dịch vụ khỏi booking
 const removeFromBooking = async (req, res, next) => {
   try {
     const bs = await BookingService.findById(req.params.id)
@@ -273,7 +324,6 @@ const removeFromBooking = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-// UPDATE quantity của dịch vụ
 const updateBookingService = async (req, res, next) => {
   try {
     const { quantity, notes } = req.body
@@ -305,8 +355,6 @@ const updateBookingService = async (req, res, next) => {
 }
 
 module.exports = {
-  // CRUD Service
   getAll, getOne, create, update, remove,
-  // BookingService operations
   addToBooking, getByBooking, removeFromBooking, updateBookingService,
 }

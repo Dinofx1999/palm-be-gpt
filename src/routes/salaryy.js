@@ -1,4 +1,10 @@
-// backend/src/routes/salary.js
+// backend/src/routes/salary.js (tên file: salaryy.js)
+//
+// ⭐ UPDATED 11/05/2026: Tích hợp lương ứng (SalaryAdvance)
+//   - POST /calculate: return thêm `advanceTotal` + `remainingToPay`
+//   - POST /pay/:userId: snapshot `advanceTotal` + `advances[]` vào SalaryRecord
+//   - GET /history/:userId: return thêm `advanceTotal` + `remainingToPay`
+//
 const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
@@ -6,6 +12,7 @@ const router = express.Router();
 const User = require('../models/User');
 const { SalaryConfig, KpiConfig, SalaryRecord } = require('../models/Salary');
 const { PenaltyRecord } = require('../models/Penalty');
+const SalaryAdvance = require('../models/SalaryAdvance');                       // ⭐ NEW
 const { calculateSalary } = require('../utils/Salarycalculator');
 const { getEmployeeRevenue } = require('../services/revenueService');
 const { authenticate } = require('../middleware/auth');
@@ -71,7 +78,23 @@ async function getPenaltiesForPeriod(userId, year, month) {
   }));
 }
 
-// Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt)
+// ⭐ NEW 11/05/2026: Lấy danh sách lương ứng của user trong tháng
+async function getAdvancesForPeriod(userId, year, month) {
+  const records = await SalaryAdvance.find({ user: userId, year, month })
+    .sort({ advancedAt: -1, createdAt: -1 })
+    .lean();
+  return records.map((r) => ({
+    _id: r._id,
+    amount: r.amount,
+    reason: r.reason,
+    paymentMethod: r.paymentMethod,
+    note: r.note,
+    advancedAt: r.advancedAt,
+    createdBy: r.createdBy,
+  }));
+}
+
+// Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt + lương ứng)
 async function computeSnapshot(userId, year, month) {
   const [cfg, user] = await Promise.all([
     SalaryConfig.findOne({ user: userId }).lean(),
@@ -93,7 +116,15 @@ async function computeSnapshot(userId, year, month) {
     revenue
   );
 
-  return { user, cfg, kpi, revenue, result, penalties };
+  // ⭐ NEW 11/05/2026: Thêm advance vào snapshot
+  const advances = await getAdvancesForPeriod(userId, year, month);
+  const advanceTotal = advances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
+  const remainingToPay = Math.max(0, (result.total || 0) - advanceTotal);
+
+  return {
+    user, cfg, kpi, revenue, result, penalties,
+    advances, advanceTotal, remainingToPay,
+  };
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -337,6 +368,10 @@ router.post('/calculate', authenticate, async (req, res) => {
       // Nếu đã có SalaryRecord (đã chốt) → trả snapshot
       const existing = await SalaryRecord.findOne({ user: userId, year: y, month: m }).lean();
       if (existing) {
+        // ⭐ NEW 11/05/2026: Đọc advanceTotal từ snapshot (đã chốt thì giữ nguyên)
+        const existingAdvanceTotal   = existing.advanceTotal   || 0;
+        const existingRemainingToPay = existing.remainingToPay ?? Math.max(0, existing.total - existingAdvanceTotal);
+
         return res.json({
           fixedTotal: existing.fixedTotal,
           kpiBase: existing.kpiBase,
@@ -344,6 +379,10 @@ router.post('/calculate', authenticate, async (req, res) => {
           penaltyTotal: existing.penaltyTotal || 0,
           penalties: existing.penalties || [],
           total: existing.total,
+          // ⭐ NEW
+          advanceTotal:   existingAdvanceTotal,
+          remainingToPay: existingRemainingToPay,
+          advances:       existing.advances || [],
           breakdown: {
             target: existing.target,
             revenue: existing.revenue,
@@ -372,12 +411,19 @@ router.post('/calculate', authenticate, async (req, res) => {
         });
       }
 
-      // Chưa chốt → tính realtime
-      const { user, kpi, revenue: rev, result, penalties } = await computeSnapshot(userId, y, m);
+      // Chưa chốt → tính realtime (đã có sẵn advance trong computeSnapshot)
+      const {
+        user, kpi, revenue: rev, result, penalties,
+        advances, advanceTotal, remainingToPay,
+      } = await computeSnapshot(userId, y, m);
 
       return res.json({
         ...result,
         penalties,
+        // ⭐ NEW
+        advanceTotal,
+        remainingToPay,
+        advances,
         revenue: rev,
         year: y,
         month: m,
@@ -443,7 +489,10 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Kỳ lương này đã được đánh dấu trả rồi' });
     }
 
-    const { user, cfg, kpi, revenue, result, penalties } = await computeSnapshot(userId, year, month);
+    const {
+      user, cfg, kpi, revenue, result, penalties,
+      advances, advanceTotal, remainingToPay,
+    } = await computeSnapshot(userId, year, month);
 
     const record = await SalaryRecord.findOneAndUpdate(
       { user: userId, year, month },
@@ -474,6 +523,19 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
           })),
           penaltyTotal: result.penaltyTotal,
           total: result.total,
+
+          // ⭐ NEW 11/05/2026: Snapshot lương ứng
+          advanceTotal,
+          remainingToPay,
+          advances: advances.map((a) => ({
+            advanceId: a._id,
+            amount: a.amount,
+            reason: a.reason,
+            paymentMethod: a.paymentMethod,
+            note: a.note,
+            advancedAt: a.advancedAt,
+          })),
+
           paidStatus: 'paid',
           paidAt: new Date(),
           paymentMethod,
@@ -559,6 +621,10 @@ router.get('/history/:userId', authenticate, async (req, res) => {
       const record = recordMap.get(key);
 
       if (record) {
+        // ⭐ NEW 11/05/2026: Đọc advanceTotal từ snapshot
+        const recAdvanceTotal   = record.advanceTotal   || 0;
+        const recRemainingToPay = record.remainingToPay ?? Math.max(0, record.total - recAdvanceTotal);
+
         history.push({
           year: p.year,
           month: p.month,
@@ -567,6 +633,8 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           kpiExceed: record.kpiExceed,
           penaltyTotal: record.penaltyTotal || 0,
           total: record.total,
+          advanceTotal:   recAdvanceTotal,
+          remainingToPay: recRemainingToPay,
           revenue: record.revenue,
           target: record.target,
           paidStatus: record.paidStatus,
@@ -578,7 +646,8 @@ router.get('/history/:userId', authenticate, async (req, res) => {
         });
       } else if (p.year === currentYear && p.month === currentMonth) {
         try {
-          const { result, revenue, kpi } = await computeSnapshot(userId, p.year, p.month);
+          const { result, revenue, kpi, advanceTotal, remainingToPay } =
+            await computeSnapshot(userId, p.year, p.month);
           history.push({
             year: p.year,
             month: p.month,
@@ -587,6 +656,8 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             kpiExceed: result.kpiExceed,
             penaltyTotal: result.penaltyTotal || 0,
             total: result.total,
+            advanceTotal,
+            remainingToPay,
             revenue,
             target: kpi?.target || 0,
             paidStatus: 'unpaid',
@@ -602,6 +673,8 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             kpiExceed: 0,
             penaltyTotal: 0,
             total: 0,
+            advanceTotal: 0,
+            remainingToPay: 0,
             revenue: 0,
             target: 0,
             paidStatus: 'unpaid',
@@ -618,6 +691,8 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           kpiExceed: 0,
           penaltyTotal: 0,
           total: 0,
+          advanceTotal: 0,
+          remainingToPay: 0,
           revenue: 0,
           target: 0,
           paidStatus: 'unpaid',

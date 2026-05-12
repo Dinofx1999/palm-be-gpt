@@ -1,0 +1,1 @@
+{"indexes":[{"v":{"$numberInt":"2"},"key":{"_id":{"$numberInt":"1"}},"name":"_id_"},{"v":{"$numberInt":"2"},"key":{"user":{"$numberInt":"1"}},"name":"user_1","unique":true},{"v":{"$numberInt":"2"},"key":{"branchId":{"$numberInt":"1"}},"name":"branchId_1"}],"uuid":"69da320798874ddfab1f651c54120b1d","collectionName":"salaryconfigs","type":"collection"}
