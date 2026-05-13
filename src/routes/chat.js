@@ -26,6 +26,13 @@ const PricePolicy = require('../models/PricePolicy');
 // ⭐ Dùng cùng calculator như booking thật → giá khớp 100%
 const { calculatePrice } = require('../utils/priceCalculator');
 
+// ⭐ Dùng cùng audit logger + policy snapshot như controller booking
+//   (đảm bảo audit log nhất quán, ai tạo booking đều có log)
+let logAction = async () => {};
+let buildPolicySnapshot = () => null;
+try { logAction = require('../utils/auditLogger').logAction || logAction; } catch (e) { console.warn('[chat] auditLogger not found, skip audit'); }
+try { buildPolicySnapshot = require('../utils/policySnapshot').buildPolicySnapshot || buildPolicySnapshot; } catch (e) { console.warn('[chat] policySnapshot not found'); }
+
 // ⭐ Services mới: prompt builder + context cache
 const {
   buildFullSystemPrompt,
@@ -35,6 +42,27 @@ const {
   getOrCreateCache,
   getStats: getCacheStats,
 } = require('../services/chatCache');
+
+// ⭐ Module phân tích kinh doanh (KPI, trend, chiến lược)
+const businessAnalytics = require('../services/chatBusinessAnalytics');
+
+// ⭐ Module phân tích KPI + Lương cho AI
+const salaryAnalytics = require('../services/chatSalaryAnalytics');
+
+// ⭐ Sinh suggestion buttons mẫu chuẩn + parse từ reply
+const {
+  buildStandardSuggestions,
+  parseAiSuggestions,
+  mergeSuggestions,
+} = require('../services/chatSuggestions');
+
+// ⭐ Service lưu chat vào DB (audit + đa thiết bị)
+let persistence = null;
+try {
+  persistence = require('../services/chatPersistence');
+} catch (e) {
+  console.warn('[chat] chatPersistence not available, skip DB save:', e.message);
+}
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -256,6 +284,20 @@ const tools = [{
     },
 
     {
+      name: 'check_specific_room',
+      description: 'Kiểm tra trạng thái + tình trạng trống của MỘT PHÒNG CỤ THỂ theo số phòng. Dùng cho mọi câu hỏi về 1 phòng cụ thể có số phòng như: "phòng 603 còn không", "phòng 603 còn phòng k", "phòng 201 trống không", "tình trạng phòng 305", "phòng 102 có ai đang ở", "check phòng X", "phòng X đang sao", "phòng 401 thuộc loại nào", "thông tin phòng X", "giá phòng X" (gọi tool này TRƯỚC để biết loại phòng, RỒI gọi get_price_policies với roomTypeName đó). Mọi câu có "phòng" + số → DÙNG TOOL NÀY. CHỈ Internal user (nhân viên).',
+      parameters: {
+        type: 'object',
+        properties: {
+          roomNumber: { type: 'string', description: 'Số phòng cần check (vd "603", "201", "305", "401")' },
+          checkIn:    { type: 'string', description: 'ISO date/datetime (tuỳ chọn). Truyền khi user hỏi kèm thời gian "ngày mai", "tuần sau".' },
+          checkOut:   { type: 'string', description: 'ISO date/datetime (tuỳ chọn).' },
+        },
+        required: ['roomNumber'],
+      },
+    },
+
+    {
       name: 'get_room_types',
       description: 'Danh sách loại phòng và sức chứa.',
       parameters: {
@@ -268,11 +310,11 @@ const tools = [{
 
     {
       name: 'get_price_policies',
-      description: 'Lấy danh sách chính sách giá theo loại phòng. Dùng khi hỏi "giá phòng deluxe", "bảng giá".',
+      description: 'Lấy chính sách giá theo TÊN LOẠI PHÒNG (không phải số phòng). Dùng khi user hỏi giá theo LOẠI: "giá phòng deluxe", "bảng giá", "giá Standard City View". Nếu user hỏi giá theo SỐ PHÒNG (vd "giá phòng 401") → gọi check_specific_room TRƯỚC để lấy roomType, rồi mới gọi tool này.',
       parameters: {
         type: 'object',
         properties: {
-          roomTypeName: { type: 'string', description: 'Tên loại phòng (vd Deluxe, Standard)' },
+          roomTypeName: { type: 'string', description: 'Tên loại phòng (vd "Standard City View Room", "Deluxe"). KHÔNG truyền số phòng.' },
           branchName: { type: 'string' },
         },
       },
@@ -280,7 +322,7 @@ const tools = [{
 
     {
       name: 'search_bookings',
-      description: 'Tìm danh sách booking theo điều kiện. Dùng khi hỏi "booking hôm nay", "khách check-in", "đặt phòng tuần này".',
+      description: 'Tìm danh sách booking. Dùng khi hỏi "booking hôm nay", "khách check-in", "đặt phòng tuần này", "danh sách mã đặt phòng". Response trả về bookingCode (mã ngắn dễ đọc) + bookingId (full _id).',
       parameters: {
         type: 'object',
         properties: {
@@ -297,25 +339,231 @@ const tools = [{
 
     {
       name: 'get_booking_detail',
-      description: 'Chi tiết 1 booking theo customerName hoặc roomNumber hoặc bookingId.',
+      description: 'Chi tiết 1 booking. Tìm theo bookingCode (mã ngắn user gõ), customerName, roomNumber, hoặc bookingId (full _id). Response có bookingCode để hiển thị cho user.',
       parameters: {
         type: 'object',
         properties: {
           customerName: { type: 'string' },
           roomNumber: { type: 'string' },
-          bookingId: { type: 'string' },
+          bookingCode: { type: 'string', description: 'Mã booking ngắn (vd "A3F8B2C1"). Tìm match cuối _id hoặc field bookingCode.' },
+          bookingId: { type: 'string', description: 'Full MongoDB _id (24 ký tự hex)' },
         },
       },
     },
 
     {
       name: 'get_today_arrivals_departures',
-      description: 'Khách check-in / check-out hôm nay. Dùng khi hỏi "ai check-in hôm nay", "ai trả phòng hôm nay".',
+      description: 'Khách check-in / check-out hôm nay. Dùng khi hỏi "ai check-in hôm nay", "ai trả phòng hôm nay", "mã đặt phòng hôm nay". Response trả về bookingCode để hiển thị.',
       parameters: {
         type: 'object',
         properties: {
           type: { type: 'string', description: 'arrivals (check-in) hoặc departures (check-out) hoặc both' },
           branchName: { type: 'string' },
+        },
+      },
+    },
+
+    {
+      name: 'calculate_late_checkout_fee',
+      description: 'Tính phí TRẢ PHÒNG TRỄ cho 1 booking đã có. Dùng khi user hỏi "phí trả muộn", "trả phòng trễ", "kéo dài giờ ở", "muốn trả phòng lúc XX:XX". Cần bookingCode + giờ trả mới.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingCode: { type: 'string', description: 'Mã booking, vd BK_W8X6UE (có thể chỉ có phần sau prefix)' },
+          newCheckoutTime: { type: 'string', description: 'Giờ trả mới HH:mm (vd "14:00") - giờ trên cùng ngày trả phòng. Nếu user nói giờ khác ngày, hỏi lại.' },
+        },
+        required: ['bookingCode', 'newCheckoutTime'],
+      },
+    },
+
+    {
+      name: 'prepare_booking_confirmation',
+      description: 'BƯỚC 1 của đặt phòng. Tạo bản XÁC NHẬN (KHÔNG tạo booking thật) để user review. CHỈ Internal user. Có 2 cách chọn phòng: (A) Theo SỐ PHÒNG cụ thể — truyền roomNumber; (B) Theo LOẠI PHÒNG — truyền roomTypeName, tool tự tìm phòng trống đầu tiên cùng loại. Ưu tiên roomNumber nếu được cung cấp.',
+      parameters: {
+        type: 'object',
+        properties: {
+          customerName:  { type: 'string', description: 'Tên khách (bắt buộc)' },
+          customerPhone: { type: 'string', description: 'SĐT khách (bắt buộc)' },
+          checkIn:       { type: 'string', description: 'ISO datetime, vd "2026-05-14T14:00:00"' },
+          checkOut:      { type: 'string', description: 'ISO datetime, vd "2026-05-15T12:00:00"' },
+          roomNumber:    { type: 'string', description: 'Số phòng cụ thể (vd "201", "305"). Dùng khi user chỉ định "đặt phòng 201", "đặt phòng số 305". Ưu tiên hơn roomTypeName nếu cả 2 đều có.' },
+          roomTypeName:  { type: 'string', description: 'Tên loại phòng (vd "Standard City View Room"). Dùng khi user chỉ chọn loại không chọn phòng cụ thể.' },
+          adults:        { type: 'number', description: 'Số người lớn (mặc định 2)' },
+          children:      { type: 'number', description: 'Số trẻ em (mặc định 0)' },
+          priceType:     { type: 'string', description: '"day", "night" hoặc "hour" (mặc định "day")' },
+          notes:         { type: 'string', description: 'Ghi chú (tuỳ chọn)' },
+        },
+        required: ['customerName', 'customerPhone', 'checkIn', 'checkOut'],
+      },
+    },
+
+    {
+      name: 'create_booking',
+      description: 'BƯỚC 2 của đặt phòng — TẠO BOOKING THẬT trên hệ thống PMS. CHỈ Internal. CHỈ gọi sau khi: (1) đã gọi prepare_booking_confirmation, (2) user đã xác nhận rõ ràng ("ok chốt", "đặt đi", "xác nhận", "đồng ý"). KHÔNG tự gọi tool này nếu user chưa xác nhận. Sau khi tạo, trả về bookingCode để hiển thị cho user.',
+      parameters: {
+        type: 'object',
+        properties: {
+          customerName:  { type: 'string' },
+          customerPhone: { type: 'string' },
+          checkIn:       { type: 'string', description: 'ISO datetime' },
+          checkOut:      { type: 'string', description: 'ISO datetime' },
+          roomNumber:    { type: 'string', description: 'Số phòng cụ thể nếu user chọn theo phòng' },
+          roomTypeName:  { type: 'string', description: 'Loại phòng nếu chọn theo loại' },
+          adults:        { type: 'number' },
+          children:      { type: 'number' },
+          priceType:     { type: 'string', description: '"day"/"night"/"hour" mặc định "day"' },
+          notes:         { type: 'string' },
+          confirmed:     { type: 'boolean', description: 'BẮT BUỘC = true. Flag bảo vệ để chắc chắn user đã confirm.' },
+        },
+        required: ['customerName', 'customerPhone', 'checkIn', 'checkOut', 'confirmed'],
+      },
+    },
+
+    // ════════════════════════════════════════
+    // ⭐ KPI + PHÂN TÍCH KINH DOANH (Internal only)
+    // ════════════════════════════════════════
+    {
+      name: 'get_business_kpi',
+      description: 'Lấy KPI kinh doanh khách sạn: Occupancy (công suất), ADR (giá phòng TB), RevPAR, ALOS, repeat rate, cancel rate. Dùng khi user hỏi "KPI tháng này", "công suất khách sạn", "RevPAR", "doanh thu kèm chỉ số". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          fromDate: { type: 'string', description: 'YYYY-MM-DD. Nếu thiếu → đầu tháng hiện tại' },
+          toDate:   { type: 'string', description: 'YYYY-MM-DD. Nếu thiếu → hôm nay' },
+          branchName: { type: 'string', description: 'Tên chi nhánh (Admin có thể truyền, Manager/Staff tự lọc theo branch của họ)' },
+        },
+      },
+    },
+
+    {
+      name: 'analyze_revenue_trend',
+      description: 'Phân tích xu hướng doanh thu trong N tháng gần đây. Trả về data từng tháng + insights so sánh. Dùng khi user hỏi "xu hướng doanh thu", "so sánh các tháng", "trend 6 tháng". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          months: { type: 'number', description: 'Số tháng quay lui (mặc định 6, tối đa 12)' },
+          branchName: { type: 'string' },
+        },
+      },
+    },
+
+    {
+      name: 'analyze_room_performance',
+      description: 'Phân tích hiệu quả từng loại phòng: loại nào hot, loại nào ế, doanh thu / công suất từng loại. Dùng khi user hỏi "loại phòng nào bán chạy", "phòng nào ế", "phân tích từng loại phòng". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          fromDate: { type: 'string', description: 'YYYY-MM-DD (mặc định đầu tháng)' },
+          toDate:   { type: 'string', description: 'YYYY-MM-DD (mặc định hôm nay)' },
+          branchName: { type: 'string' },
+        },
+      },
+    },
+
+    {
+      name: 'analyze_weekday_pattern',
+      description: 'Phân tích pattern theo ngày tuần: thứ mấy đông, thứ mấy vắng. Dùng khi user hỏi "ngày nào đông khách", "cuối tuần vs đầu tuần", "phân bố theo ngày". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          fromDate: { type: 'string' },
+          toDate:   { type: 'string' },
+          branchName: { type: 'string' },
+        },
+      },
+    },
+
+    {
+      name: 'get_strategy_recommendations',
+      description: 'Tổng hợp phân tích + đề xuất CHIẾN LƯỢC kinh doanh cụ thể. Dùng khi user hỏi "đề xuất chiến lược", "tháng này lỗ sao khắc phục", "làm sao tăng doanh thu", "gợi ý cải thiện". Tool sẽ tự gọi các phân tích KPI + room performance + weekday pattern và đưa ra recommendation. Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          fromDate: { type: 'string' },
+          toDate:   { type: 'string' },
+          branchName: { type: 'string' },
+        },
+      },
+    },
+
+    // ════════════════════════════════════════
+    // ⭐ KPI + LƯƠNG NHÂN VIÊN (Internal only)
+    // ════════════════════════════════════════
+    {
+      name: 'get_my_salary',
+      description: 'Xem lương cá nhân của user đang chat (hoặc của 1 user khác nếu có quyền). Dùng khi user hỏi "lương em tháng này", "lương của em bao nhiêu", "lương tháng X năm Y". Mặc định lấy của bản thân user đang chat. Admin/Manager có thể truyền targetUserId để xem của người khác. Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number', description: 'Năm (mặc định năm hiện tại)' },
+          month: { type: 'number', description: 'Tháng 1-12 (mặc định tháng hiện tại)' },
+          targetUserId: { type: 'string', description: 'ID user cần xem (chỉ Admin/Manager). Bỏ qua nếu xem của bản thân.' },
+        },
+      },
+    },
+
+    {
+      name: 'get_my_kpi',
+      description: 'Xem chi tiết KPI realtime: doanh thu hiện tại, target, % đạt được, tiers thưởng, số ngày còn lại để đạt mục tiêu, doanh thu/ngày cần làm. Dùng khi user hỏi "em đạt KPI bao nhiêu", "KPI tháng này", "% KPI của em", "em còn cách target bao xa". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number' },
+          month: { type: 'number' },
+          targetUserId: { type: 'string', description: 'Admin/Manager có thể xem của user khác' },
+        },
+      },
+    },
+
+    {
+      name: 'get_salary_history',
+      description: 'Xem lịch sử lương N tháng gần đây (mặc định 6 tháng). Dùng khi user hỏi "lương 3 tháng vừa rồi", "lịch sử lương", "lương các tháng trước", "lương từ đầu năm". Trả về data từng tháng + summary (TB tháng, tỉ lệ đạt KPI). Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          months: { type: 'number', description: 'Số tháng quay lui (1-12, mặc định 6)' },
+          targetUserId: { type: 'string', description: 'Admin/Manager xem của user khác' },
+        },
+      },
+    },
+
+    {
+      name: 'get_branch_kpi_overview',
+      description: 'Xem tổng quan KPI toàn chi nhánh: % đạt KPI, danh sách nhân viên + KPI từng người. Dùng khi user hỏi "KPI cả branch", "tình hình nhân viên branch", "ai đạt KPI cao nhất branch", "tổng doanh thu nhân viên". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number' },
+          month: { type: 'number' },
+          branchName: { type: 'string', description: 'Tên branch (Manager tự lọc theo branch của mình, không cần truyền)' },
+        },
+      },
+    },
+
+    {
+      name: 'get_top_employees',
+      description: 'Xếp hạng top nhân viên theo doanh thu, % KPI hoặc lương. Dùng khi user hỏi "top 5 nhân viên", "nhân viên bán giỏi nhất", "ai có lương cao nhất tháng này", "xếp hạng KPI nhân viên". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number' },
+          month: { type: 'number' },
+          branchName: { type: 'string' },
+          limit: { type: 'number', description: 'Số nhân viên hiển thị (1-20, mặc định 5)' },
+          sortBy: { type: 'string', description: '"revenue" (doanh thu), "kpi" (% KPI), "salary" (lương). Mặc định "revenue".' },
+        },
+      },
+    },
+
+    {
+      name: 'get_kpi_improvement_suggestions',
+      description: 'Đề xuất chiến lược để CẢI THIỆN KPI cá nhân (hoặc user khác). Dùng khi user hỏi "làm sao em đạt KPI", "em cần làm gì để vượt target", "gợi ý đạt KPI", "tháng này em làm sao kịp KPI". Tool tự phân tích % hiện tại + số ngày còn lại và đưa ra gợi ý hành động cụ thể. Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number' },
+          month: { type: 'number' },
+          targetUserId: { type: 'string', description: 'Admin/Manager: gợi ý cho user khác' },
         },
       },
     },
@@ -429,6 +677,13 @@ const makeHandlers = (ctx) => ({
 
   // ── 1. Tổng quan phòng ──
   async get_rooms_overview({ branchName, status }) {
+    // ⭐ External: chỉ thấy "còn phòng hay không", không có chi tiết
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng vui lòng cho em biết ngày nhận & trả phòng để em kiểm tra phòng trống cho ạ.',
+      };
+    }
     const branchId = await resolveBranchId(ctx, branchName);
     const rooms = await computeRoomRealStatus(branchId);
 
@@ -467,8 +722,37 @@ const makeHandlers = (ctx) => ({
   // ── 2. Kiểm tra phòng trống + ĐỀ XUẤT GÓI PHÒNG TỐI ƯU ──
   async check_room_availability({ checkIn, checkOut, branchName, adults = 2, children = 0, priceType = 'day', groups = [] }) {
     const branchId = await resolveBranchId(ctx, branchName);
-    const ci = new Date(checkIn);
-    const co = new Date(checkOut);
+    let ci = new Date(checkIn);
+    let co = new Date(checkOut);
+
+    // ⭐ FIX: Nếu user chỉ truyền NGÀY (không có giờ), tự gán giờ CHUẨN của khách sạn
+    //   Vd: "2026-05-14" → 2026-05-14 14:00 (giờ check-in chuẩn)
+    //        "2026-05-15" → 2026-05-15 12:00 (giờ check-out chuẩn)
+    //   Tránh tình huống AI bịa "Nhận phòng sớm X giờ" vì Date('2026-05-14') = 00:00.
+    const branchForTime = branchId
+      ? await Branch.findById(branchId).lean()
+      : await Branch.findOne().lean();
+    const ciTimeStr = branchForTime?.checkInTime || '14:00';
+    const coTimeStr = branchForTime?.checkOutTime || '12:00';
+
+    const isOnlyDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
+    const setTime = (date, hhmm) => {
+      const [h, m] = String(hhmm).split(':').map(Number);
+      const d = new Date(date);
+      d.setHours(h || 14, m || 0, 0, 0);
+      return d;
+    };
+    if (isOnlyDate(checkIn)) ci = setTime(checkIn + 'T00:00:00', ciTimeStr);
+    if (isOnlyDate(checkOut)) co = setTime(checkOut + 'T00:00:00', coTimeStr);
+
+    // Nếu user truyền datetime nhưng giờ = 00:00 → cũng coi là không có giờ, gán chuẩn
+    if (!isOnlyDate(checkIn) && ci.getHours() === 0 && ci.getMinutes() === 0) {
+      ci = setTime(ci, ciTimeStr);
+    }
+    if (!isOnlyDate(checkOut) && co.getHours() === 0 && co.getMinutes() === 0) {
+      co = setTime(co, coTimeStr);
+    }
+
     const nights = Math.max(1, Math.ceil((co - ci) / 86400000));
 
     // ⭐ Normalize groups
@@ -806,6 +1090,7 @@ const makeHandlers = (ctx) => ({
 
         recommendations.push({
           optionLabel: `⭐ Đề xuất chia theo ${validGroups.length} nhóm`,
+          optionSummary: `${totalRooms} phòng cho ${validGroups.length} nhóm + đoàn còn lại`,
           rooms,
           totalRooms,
           grandTotal,
@@ -838,7 +1123,8 @@ const makeHandlers = (ctx) => ({
     for (const cand of candidatesSingleRoom.slice(0, 3)) {
       const idx = recommendations.length;
       recommendations.push({
-        optionLabel: `${labelMap[idx]}: 1 phòng ${cand.group.type.name}`,
+        optionLabel: labelMap[idx],                         // ⭐ Chỉ "⭐ Đề xuất tốt nhất" / "Tuỳ chọn 2"
+        optionSummary: `1 phòng ${cand.group.type.name}`,   // ⭐ NEW: subtitle hiển thị dưới label
         rooms: [{
           typeName: cand.group.type.name,
           maxAdults: cand.group.type.maxAdults,
@@ -972,7 +1258,8 @@ const makeHandlers = (ctx) => ({
         }
 
         recommendations.push({
-          optionLabel: `${labelMap[idx]}: ${q} phòng ${cand.group.type.name}`,
+          optionLabel: labelMap[idx],                              // ⭐ Chỉ "⭐ Đề xuất tốt nhất" / "Tuỳ chọn 2"
+          optionSummary: `${q} phòng ${cand.group.type.name}`,     // ⭐ Subtitle riêng
           rooms: [{
             typeName: cand.group.type.name,
             maxAdults: cand.group.type.maxAdults,
@@ -980,7 +1267,7 @@ const makeHandlers = (ctx) => ({
             area: cand.group.type.area ? `${cand.group.type.area}m²` : null,
             quantity: q,
             availableCount: cand.group.rooms.length,
-            roomBreakdown,                          // ⭐ Chi tiết từng phòng
+            roomBreakdown,
             ...cand.firstPrice,
             totalForQuantity: cand.totalPrice,
             totalForQuantityFormatted: fmt(cand.totalPrice),
@@ -1101,8 +1388,11 @@ const makeHandlers = (ctx) => ({
 
           if (canBuild) {
             const totalRoomsInMix = mixedRoomDetails.reduce((s, r) => s + r.quantity, 0);
+            // Build summary từng loại: vd "2 phòng Superior + 1 phòng Standard"
+            const summaryParts = mixedRoomDetails.map(r => `${r.quantity} phòng ${r.typeName}`);
             recommendations.push({
-              optionLabel: `⭐ Đề xuất kết hợp ${mixedRoomDetails.length} loại phòng`,
+              optionLabel: '⭐ Đề xuất kết hợp nhiều loại phòng',
+              optionSummary: summaryParts.join(' + '),
               rooms: mixedRoomDetails,
               totalRooms: totalRoomsInMix,
               grandTotal: mixedTotal,
@@ -1132,6 +1422,184 @@ const makeHandlers = (ctx) => ({
       _hint: validGroups.length > 0
         ? 'Phương án đã chia theo các nhóm/gia đình user yêu cầu. Hiển thị MỖI nhóm 1 block (dùng groupLabel để tiêu đề), kèm giá riêng từng nhóm. Cuối cùng có TỔNG chung.'
         : 'CHỈ hiển thị các option trong recommendations[]. Mỗi option có grandTotalFormatted là tổng cuối cùng. KHÔNG cộng nhiều option lại với nhau. KHÔNG liệt kê inventory như một gói đề xuất. Nếu recommendations rỗng → báo "Không có phòng phù hợp với số lượng khách này".',
+    };
+  },
+
+  // ── 2b. Kiểm tra 1 phòng cụ thể (Internal only) ──
+  async check_specific_room({ roomNumber, checkIn, checkOut }) {
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Thông tin chi tiết phòng chỉ dành cho nhân viên ạ.',
+      };
+    }
+    if (!roomNumber?.toString().trim()) return { error: 'Thiếu số phòng' };
+
+    const numClean = String(roomNumber).trim();
+    const roomFilter = { number: numClean };
+    if (ctx.userBranchId && ctx.role !== 'Admin') {
+      roomFilter.branchId = ctx.userBranchId;
+    }
+
+    const room = await Room.findOne(roomFilter)
+      .populate('typeId', 'name maxAdults maxChildren area')
+      .populate('branchId', 'name')
+      .lean();
+
+    if (!room) {
+      return {
+        notFound: true,
+        roomNumber: numClean,
+        message: `Không tìm thấy phòng số ${numClean}`,
+      };
+    }
+
+    const status = room.roomStatus;
+    const statusLabel = {
+      active: 'Đang hoạt động',
+      inactive: 'Tạm ngưng',
+      maintenance: 'Đang bảo trì',
+    }[status] || status;
+
+    // Booking hiện tại của phòng (nếu có)
+    let currentBookingInfo = null;
+    if (room.currentBookingId) {
+      const cb = await Booking.findById(room.currentBookingId)
+        .select('customerName customerPhone checkIn checkOut status bookingCode')
+        .lean();
+      if (cb) {
+        currentBookingInfo = {
+          customerName: cb.customerName,
+          status: cb.status,
+          checkIn: cb.checkIn,
+          checkOut: cb.checkOut,
+          bookingCode: cb.bookingCode || `BK_${String(cb._id).slice(-6).toUpperCase()}`,
+        };
+      }
+    }
+
+    // Nếu user truyền khoảng thời gian → check conflict
+    let availabilityCheck = null;
+    if (checkIn && checkOut) {
+      let ci = new Date(checkIn);
+      let co = new Date(checkOut);
+      if (!isNaN(ci.getTime()) && !isNaN(co.getTime())) {
+        // Tự gán giờ chuẩn nếu chỉ có ngày
+        const branch = room.branchId;
+        const ciTimeStr = branch?.checkInTime || '14:00';
+        const coTimeStr = branch?.checkOutTime || '12:00';
+        const isOnlyDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
+        const setTime = (d, hhmm) => {
+          const [h, m] = String(hhmm).split(':').map(Number);
+          const dt = new Date(d);
+          dt.setHours(h || 14, m || 0, 0, 0);
+          return dt;
+        };
+        if (isOnlyDate(checkIn)) ci = setTime(checkIn + 'T00:00:00', ciTimeStr);
+        if (isOnlyDate(checkOut)) co = setTime(checkOut + 'T00:00:00', coTimeStr);
+
+        const conflicts = await Booking.find({
+          $or: [{ roomId: room._id }, { 'rooms.roomId': room._id }],
+          status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+          checkIn: { $lt: co },
+          checkOut: { $gt: ci },
+        })
+          .select('customerName checkIn checkOut status bookingCode')
+          .lean();
+
+        availabilityCheck = {
+          requestedCheckIn: ci,
+          requestedCheckOut: co,
+          isAvailable: conflicts.length === 0 && status === 'active',
+          conflicts: conflicts.map(c => ({
+            customerName: c.customerName,
+            checkIn: c.checkIn,
+            checkOut: c.checkOut,
+            status: c.status,
+            bookingCode: c.bookingCode || `BK_${String(c._id).slice(-6).toUpperCase()}`,
+          })),
+        };
+      }
+    }
+
+    // ⭐ Kèm chính sách giá của loại phòng này (để user hỏi giá khỏi phải gọi 2 tool)
+    //   CHỈ hiển thị loại giá đang ENABLED và có giá > 0
+    //   (tránh AI bịa "giá đêm 200.000đ" khi khách sạn không bán theo đêm)
+    let pricePolicy = null;
+    if (room.typeId?._id) {
+      const policy = await PricePolicy.findOne({
+        roomTypeId: room.typeId._id,
+        branchId: room.branchId?._id || room.branchId,
+        isActive: true,
+      }).lean();
+      if (policy) {
+        const hasDay   = policy.dayEnabled   && policy.dayPrice   > 0;
+        const hasNight = policy.nightEnabled && policy.nightPrice > 0;
+        const hasHour  = policy.hourEnabled  && policy.hourPrice  > 0;
+
+        pricePolicy = {
+          name: policy.name,
+          // ⭐ CHỈ set giá khi enabled — nếu không thì null (AI sẽ bỏ qua)
+          dayPrice:   hasDay   ? policy.dayPrice   : null,
+          dayPriceFormatted:   hasDay   ? fmt(policy.dayPrice)   : null,
+          nightPrice: hasNight ? policy.nightPrice : null,
+          nightPriceFormatted: hasNight ? fmt(policy.nightPrice) : null,
+          hourPrice:  hasHour  ? policy.hourPrice  : null,
+          hourPriceFormatted:  hasHour  ? fmt(policy.hourPrice)  : null,
+          // ⭐ Liệt kê các loại giá enabled (để AI biết khách sạn bán theo cách nào)
+          availableTypes: [
+            hasDay   && 'day',
+            hasNight && 'night',
+            hasHour  && 'hour',
+          ].filter(Boolean),
+        };
+      }
+    }
+
+    // ⭐ Kèm giờ chuẩn + chính sách phụ thu của chi nhánh
+    let branchPolicy = null;
+    const branchFull = room.branchId?._id
+      ? await Branch.findById(room.branchId._id).lean()
+      : await Branch.findById(room.branchId).lean();
+    if (branchFull) {
+      const tolerance = branchFull.toleranceMinutes ?? 30;
+      const hourThreshold = branchFull.hourToDayThreshold ?? 6;
+      const ciTime = branchFull.checkInTime  || '14:00';
+      const coTime = branchFull.checkOutTime || '12:00';
+
+      // ⭐ Build mô tả phụ thu dựa trên giá có sẵn (không bịa giá giờ nếu không enabled)
+      const hourPriceStr = pricePolicy?.hourPriceFormatted
+        ? `theo giá giờ (${pricePolicy.hourPriceFormatted}/giờ)`
+        : 'theo giá phụ thu của khách sạn';
+
+      branchPolicy = {
+        checkInTime:  ciTime,
+        checkOutTime: coTime,
+        toleranceMinutes: tolerance,
+        hourToDayThreshold: hourThreshold,
+        dayEquivalentHours: branchFull.dayEquivalentHours ?? 24,
+        surchargeRules: {
+          earlyCheckIn: `Nhận phòng sớm trước ${ciTime}: miễn phí trong ${tolerance} phút, sau đó tính ${hourPriceStr}. Nếu sớm trên ${hourThreshold} giờ → tính nguyên 1 ngày.`,
+          lateCheckOut: `Trả phòng muộn sau ${coTime}: miễn phí trong ${tolerance} phút, sau đó tính ${hourPriceStr}. Nếu trễ trên ${hourThreshold} giờ → tính nguyên 1 ngày.`,
+          extraGuest: `Vượt sức chứa tiêu chuẩn (>${room.typeId?.maxAdults || 2} NL hoặc >${room.typeId?.maxChildren || 0} TE) → tính phụ thu theo chính sách giá.`,
+        },
+      };
+    }
+
+    return {
+      roomNumber: room.number,
+      roomType: room.typeId?.name || '—',
+      capacity: `${room.typeId?.maxAdults || 2} NL + ${room.typeId?.maxChildren || 0} TE`,
+      area: room.typeId?.area ? `${room.typeId.area}m²` : null,
+      branch: room.branchId?.name || null,
+      status,
+      statusLabel,
+      currentGuest: room.currentGuestName || null,
+      currentBooking: currentBookingInfo,
+      availabilityCheck,
+      pricePolicy,            // ⭐ giá phòng
+      branchPolicy,           // ⭐ NEW: giờ chuẩn + phụ thu
+      _hint: 'Hiển thị thông tin phòng đầy đủ: số phòng, loại, sức chứa, diện tích, trạng thái. NẾU pricePolicy có → hiển thị giá NGÀY/ĐÊM/GIỜ. NẾU branchPolicy có → hiển thị giờ check-in/check-out chuẩn + tóm tắt phụ thu (CI sớm, CO muộn). Nếu availabilityCheck.isAvailable=true → "Phòng còn trống". Nếu có conflicts → liệt kê khách đang giữ.',
     };
   },
 
@@ -1197,6 +1665,14 @@ const makeHandlers = (ctx) => ({
 
   // ── 5. Tìm booking ──
   async search_bookings({ status, fromDate, toDate, dateField = 'checkIn', branchName, customerName, limit = 20 }) {
+    // ⭐ External user: KHÔNG cho tra cứu danh sách booking
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng không thể tra cứu danh sách booking. Anh/chị vui lòng liên hệ lễ tân hoặc cho biết mã đặt phòng cụ thể (BK_XXXXXX) để em tra giúp ạ.',
+      };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const q = {};
     if (status) q.status = status;
@@ -1217,7 +1693,7 @@ const makeHandlers = (ctx) => ({
 
     const bookings = await Booking.find(q)
       .populate('branchId', 'name')
-      .select('customerName customerPhone roomNumber roomType checkIn checkOut status totalAmount paymentStatus nights groupName isGroup branchId')
+      .select('_id bookingCode customerName customerPhone roomNumber roomType checkIn checkOut status totalAmount paymentStatus nights groupName isGroup branchId')
       .sort({ checkIn: -1 })
       .limit(Math.min(limit, 50))
       .lean();
@@ -1226,6 +1702,8 @@ const makeHandlers = (ctx) => ({
       scope: branchId ? 'Theo chi nhánh' : 'Tất cả chi nhánh',
       count: bookings.length,
       bookings: bookings.map(b => ({
+        bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
+        bookingId: String(b._id),
         customer: b.customerName,
         phone: b.customerPhone,
         room: b.roomNumber,
@@ -1245,21 +1723,44 @@ const makeHandlers = (ctx) => ({
   },
 
   // ── 6. Chi tiết booking ──
-  async get_booking_detail({ customerName, roomNumber, bookingId }) {
-    if (!customerName && !roomNumber && !bookingId) {
-      return { error: 'Cần ít nhất 1 trong: customerName, roomNumber, bookingId' };
+  async get_booking_detail({ customerName, roomNumber, bookingId, bookingCode }) {
+    if (!customerName && !roomNumber && !bookingId && !bookingCode) {
+      return { error: 'Cần ít nhất 1 trong: customerName, roomNumber, bookingId, bookingCode' };
     }
 
     const q = {};
     if (bookingId && mongoose.Types.ObjectId.isValid(bookingId)) q._id = bookingId;
+
+    // ⭐ Tra cứu theo bookingCode (format DB: BK_XXXXXX)
+    //   User có thể gõ:
+    //     - "BK_W8X6UE" (full)
+    //     - "W8X6UE" (chỉ phần ngẫu nhiên)
+    //     - "bk_w8x6ue" (lowercase) → auto convert
+    if (bookingCode && !q._id) {
+      const raw = String(bookingCode).trim().toUpperCase();
+      // Nếu user gõ chỉ phần sau "BK_", auto thêm prefix
+      const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+      const withoutPrefix = raw.replace(/^BK_/, '');
+
+      q.$or = [
+        { bookingCode: raw },              // exact: BK_W8X6UE
+        { bookingCode: withPrefix },        // thêm prefix nếu thiếu: BK_W8X6UE
+        // partial match: vẫn match được khi user gõ ngắn
+        { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+      ];
+    }
+
     if (customerName) q.customerName = new RegExp(customerName, 'i');
     if (roomNumber) {
       q.$or = [
+        ...(q.$or || []),
         { roomNumber: String(roomNumber) },
         { 'rooms.roomNumber': String(roomNumber) },
       ];
     }
-    q.status = { $in: ['confirmed', 'reserved', 'checked_in', 'checked_out'] };
+    if (!q._id && !q.$or) {
+      q.status = { $in: ['confirmed', 'reserved', 'checked_in', 'checked_out'] };
+    }
 
     // Non-admin: chỉ thấy booking của branch mình
     if (ctx.role !== 'Admin' && ctx.userBranchId) {
@@ -1274,6 +1775,9 @@ const makeHandlers = (ctx) => ({
     if (!b) return { error: 'Không tìm thấy booking phù hợp' };
 
     return {
+      // ⭐ MÃ ĐẶT PHÒNG để AI hiển thị cho user
+      bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
+      bookingId: String(b._id),
       customer: b.customerName,
       phone: b.customerPhone,
       branch: b.branchId?.name,
@@ -1307,6 +1811,14 @@ const makeHandlers = (ctx) => ({
 
   // ── 7. Check-in / check-out hôm nay ──
   async get_today_arrivals_departures({ type = 'both', branchName }) {
+    // ⭐ External user: KHÔNG cho xem
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng không xem được thông tin nội bộ này ạ.',
+      };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const start = today();
     const end = endOfToday();
@@ -1325,13 +1837,15 @@ const makeHandlers = (ctx) => ({
         checkIn: { $gte: start, $lte: end },
         status: { $in: ['reserved', 'confirmed', 'checked_in'] },
       })
-        .select('customerName customerPhone roomNumber checkIn status')
+        .select('_id bookingCode customerName customerPhone roomNumber checkIn status')
         .sort({ checkIn: 1 })
         .lean();
 
       result.arrivals = {
         count: arrivals.length,
         list: arrivals.map(b => ({
+          // ⭐ Mã đặt phòng
+          bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
           customer: b.customerName,
           phone: b.customerPhone,
           room: b.roomNumber,
@@ -1347,13 +1861,15 @@ const makeHandlers = (ctx) => ({
         checkOut: { $gte: start, $lte: end },
         status: { $in: ['checked_in', 'checked_out'] },
       })
-        .select('customerName customerPhone roomNumber checkOut actualCheckOut status totalAmount')
+        .select('_id bookingCode customerName customerPhone roomNumber checkOut actualCheckOut status totalAmount')
         .sort({ checkOut: 1 })
         .lean();
 
       result.departures = {
         count: departures.length,
         list: departures.map(b => ({
+          // ⭐ Mã đặt phòng
+          bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
           customer: b.customerName,
           phone: b.customerPhone,
           room: b.roomNumber,
@@ -1366,6 +1882,757 @@ const makeHandlers = (ctx) => ({
     }
 
     return result;
+  },
+
+  // ── 7b. Tính phí trả phòng trễ ──
+  async calculate_late_checkout_fee({ bookingCode, newCheckoutTime }) {
+    if (!bookingCode || !newCheckoutTime) {
+      return { error: 'Cần bookingCode + newCheckoutTime (HH:mm)' };
+    }
+
+    // Parse "14:00" → { hour: 14, minute: 0 }
+    const timeMatch = String(newCheckoutTime).match(/^(\d{1,2}):(\d{1,2})$/);
+    if (!timeMatch) {
+      return { error: 'Giờ không hợp lệ. Format: HH:mm (vd "14:00")' };
+    }
+    const newHour = parseInt(timeMatch[1], 10);
+    const newMinute = parseInt(timeMatch[2], 10);
+    if (newHour < 0 || newHour > 23 || newMinute < 0 || newMinute > 59) {
+      return { error: 'Giờ không hợp lệ' };
+    }
+
+    // Tìm booking
+    const raw = String(bookingCode).trim().toUpperCase();
+    const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+    const withoutPrefix = raw.replace(/^BK_/, '');
+
+    const findQuery = {
+      $or: [
+        { bookingCode: raw },
+        { bookingCode: withPrefix },
+        { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+      ],
+      status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+    };
+    if (!ctx.isInternal) {
+      // External: không cho query booking khác, cần thêm bước xác minh SĐT (skip ở đây)
+      return {
+        error: 'external_not_allowed',
+        message: 'Để tính phí trả phòng trễ, anh/chị vui lòng liên hệ lễ tân hoặc đăng nhập tài khoản nội bộ ạ.',
+      };
+    }
+    if (ctx.role !== 'Admin' && ctx.userBranchId) {
+      findQuery.branchId = ctx.userBranchId;
+    }
+
+    const booking = await Booking.findOne(findQuery)
+      .populate('branchId', 'name checkOutTime toleranceMinutes hourToDayThreshold dayEquivalentHours')
+      .lean();
+
+    if (!booking) {
+      return { error: 'Không tìm thấy booking với mã ' + raw };
+    }
+
+    // Lấy giờ trả chuẩn
+    const standardCO = new Date(booking.checkOut);
+
+    // Build giờ trả mới — cùng ngày với standardCO
+    const newCO = new Date(standardCO);
+    newCO.setHours(newHour, newMinute, 0, 0);
+
+    // Nếu newCO < standardCO → user muốn trả SỚM HƠN, không phải trễ
+    if (newCO.getTime() <= standardCO.getTime()) {
+      return {
+        bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+        standardCheckOut: standardCO,
+        newCheckOut: newCO,
+        isEarlier: true,
+        message: 'Giờ trả mới sớm hơn hoặc bằng giờ chuẩn, không phát sinh phí trả trễ.',
+      };
+    }
+
+    // Tính chênh lệch giờ
+    const diffMs = newCO.getTime() - standardCO.getTime();
+    const diffHours = diffMs / (60 * 60 * 1000);
+    const diffMinutes = Math.round(diffMs / 60000);
+
+    // Lấy policy giá theo loại phòng
+    let hourPrice = 0;
+    let dayPrice = 0;
+    let policyName = '';
+
+    if (booking.roomId) {
+      const room = await Room.findById(booking.roomId).lean();
+      if (room?.typeId) {
+        const policy = await PricePolicy.findOne({
+          roomTypeId: room.typeId,
+          branchId: booking.branchId?._id || booking.branchId,
+          isActive: true,
+        })
+          .sort({ displayOrder: 1 })
+          .lean();
+        if (policy) {
+          hourPrice = policy.hourPrice || 0;
+          dayPrice = policy.dayPrice || 0;
+          policyName = policy.name;
+        }
+      }
+    }
+
+    // Logic tính phí trả trễ (theo branch config)
+    const branch = booking.branchId;
+    const tolerance = branch?.toleranceMinutes || 30;        // miễn phí trong khoảng dung sai
+    const hourThreshold = branch?.hourToDayThreshold || 6;   // nếu trễ > X giờ → tính nguyên ngày
+    const dayEquivHours = branch?.dayEquivalentHours || 24;
+
+    let fee = 0;
+    let calcMethod = '';
+    const effectiveLateMinutes = Math.max(0, diffMinutes - tolerance);
+    const effectiveLateHours = effectiveLateMinutes / 60;
+
+    if (effectiveLateMinutes <= 0) {
+      fee = 0;
+      calcMethod = `Trễ ${diffMinutes} phút (trong dung sai ${tolerance} phút) — miễn phí`;
+    } else if (effectiveLateHours > hourThreshold) {
+      // Trễ quá nhiều → tính nguyên 1 ngày
+      fee = dayPrice;
+      calcMethod = `Trễ ${effectiveLateHours.toFixed(1)} giờ (> ngưỡng ${hourThreshold} giờ) — tính phí 1 ngày`;
+    } else {
+      // Tính theo giờ
+      fee = Math.ceil(effectiveLateHours) * hourPrice;
+      calcMethod = `Trễ ${effectiveLateHours.toFixed(1)} giờ × ${hourPrice}đ/giờ`;
+    }
+
+    return {
+      bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+      customer: booking.customerName,
+      roomNumber: ctx.isInternal ? booking.roomNumber : undefined,
+      roomType: booking.roomType,
+      standardCheckOut: standardCO,
+      standardCheckOutFormatted: standardCO.toLocaleString('vi-VN', { hour12: false }),
+      newCheckOut: newCO,
+      newCheckOutFormatted: newCO.toLocaleString('vi-VN', { hour12: false }),
+      lateHours: Number(diffHours.toFixed(2)),
+      lateMinutes: diffMinutes,
+      toleranceMinutes: tolerance,
+      effectiveLateMinutes,
+      hourPrice,
+      hourPriceFormatted: fmt(hourPrice),
+      dayPrice,
+      dayPriceFormatted: fmt(dayPrice),
+      policyName,
+      fee,
+      feeFormatted: fmt(fee),
+      calcMethod,
+      currentTotal: fmt(booking.totalAmount || 0),
+      newTotal: fmt((booking.totalAmount || 0) + fee),
+      _hint: 'Hiển thị cho user: giờ chuẩn, giờ mới, số giờ trễ, cách tính, phí phụ thu, tổng mới. Đề xuất "anh/chị có muốn em ghi nhận để báo lễ tân không?"',
+    };
+  },
+
+  // ════════════════════════════════════════════════════
+  // ── 7c. AI TỰ ĐẶT PHÒNG — 2 BƯỚC ──
+  // ════════════════════════════════════════════════════
+  //   BƯỚC 1: prepare_booking_confirmation — preview, KHÔNG tạo
+  //   BƯỚC 2: create_booking — tạo thật (chỉ khi confirmed=true)
+  // ════════════════════════════════════════════════════
+
+  async prepare_booking_confirmation({
+    customerName, customerPhone, checkIn, checkOut,
+    roomNumber, roomTypeName, adults = 2, children = 0,
+    priceType = 'day', notes = '',
+  }) {
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng không thể đặt phòng trực tiếp qua chat ạ. Anh/chị vui lòng để lại SĐT, lễ tân sẽ liên hệ chốt giúp ạ.',
+      };
+    }
+
+    // Validate input
+    if (!customerName?.trim()) return { error: 'Thiếu tên khách' };
+    if (!customerPhone?.trim()) return { error: 'Thiếu SĐT' };
+    if (!checkIn || !checkOut) return { error: 'Thiếu ngày check-in/check-out' };
+    if (!roomNumber?.toString().trim() && !roomTypeName?.trim()) {
+      return { error: 'Cần ít nhất 1: roomNumber HOẶC roomTypeName' };
+    }
+
+    let ci = new Date(checkIn);
+    let co = new Date(checkOut);
+    if (isNaN(ci.getTime()) || isNaN(co.getTime())) {
+      return { error: 'Ngày không hợp lệ (cần ISO format)' };
+    }
+
+    // Tìm branchId trước (để lấy giờ chuẩn nếu cần)
+    let branchId = ctx.userBranchId;
+    if (!branchId && ctx.role === 'Admin') {
+      const firstBranch = await Branch.findOne().lean();
+      branchId = firstBranch?._id;
+    }
+    if (!branchId) {
+      return { error: 'Không xác định được chi nhánh' };
+    }
+
+    // ⭐ FIX: Tự gán giờ chuẩn của khách sạn nếu user chỉ truyền NGÀY (không giờ)
+    //   Tránh AI bịa "Nhận phòng sớm X giờ" khi parse "2026-05-14" → 00:00
+    const branchForTime = await Branch.findById(branchId).lean();
+    const ciTimeStr = branchForTime?.checkInTime || '14:00';
+    const coTimeStr = branchForTime?.checkOutTime || '12:00';
+    const isOnlyDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
+    const setTime = (date, hhmm) => {
+      const [h, m] = String(hhmm).split(':').map(Number);
+      const d = new Date(date);
+      d.setHours(h || 14, m || 0, 0, 0);
+      return d;
+    };
+    if (isOnlyDate(checkIn)) ci = setTime(checkIn + 'T00:00:00', ciTimeStr);
+    if (isOnlyDate(checkOut)) co = setTime(checkOut + 'T00:00:00', coTimeStr);
+    if (!isOnlyDate(checkIn) && ci.getHours() === 0 && ci.getMinutes() === 0) ci = setTime(ci, ciTimeStr);
+    if (!isOnlyDate(checkOut) && co.getHours() === 0 && co.getMinutes() === 0) co = setTime(co, coTimeStr);
+
+    if (co <= ci) return { error: 'Check-out phải sau check-in' };
+
+    let availableRoom = null;
+    let roomType = null;
+
+    // ═══════════════════════════════════════════════
+    // CÁCH A: User chỉ định SỐ PHÒNG cụ thể
+    // ═══════════════════════════════════════════════
+    if (roomNumber?.toString().trim()) {
+      const numClean = String(roomNumber).trim();
+      const room = await Room.findOne({
+        number: numClean,
+        branchId,
+      }).populate('typeId').lean();
+
+      if (!room) {
+        return {
+          error: 'room_not_found',
+          message: `Không tìm thấy phòng số "${numClean}" tại chi nhánh này ạ.`,
+        };
+      }
+      if (room.roomStatus === 'maintenance') {
+        return {
+          error: 'room_under_maintenance',
+          message: `Phòng ${numClean} đang bảo trì ạ. Anh/chị chọn phòng khác giúp em nhé?`,
+        };
+      }
+      if (room.roomStatus === 'inactive') {
+        return {
+          error: 'room_inactive',
+          message: `Phòng ${numClean} hiện không hoạt động. Anh/chị chọn phòng khác giúp em ạ.`,
+        };
+      }
+
+      // Check conflict
+      const conflict = await Booking.findOne({
+        $or: [{ roomId: room._id }, { 'rooms.roomId': room._id }],
+        status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+        checkIn: { $lt: co },
+        checkOut: { $gt: ci },
+      }).select('customerName checkIn checkOut status').lean();
+
+      if (conflict) {
+        return {
+          error: 'room_busy',
+          message: `Phòng ${numClean} đã có khách ${conflict.customerName} đặt từ ${new Date(conflict.checkIn).toLocaleString('vi-VN')} đến ${new Date(conflict.checkOut).toLocaleString('vi-VN')}. Anh/chị chọn phòng khác hoặc đổi giờ nhé?`,
+          conflict: {
+            customer: conflict.customerName,
+            checkIn: conflict.checkIn,
+            checkOut: conflict.checkOut,
+          },
+        };
+      }
+
+      availableRoom = room;
+      roomType = room.typeId;
+    }
+    // ═══════════════════════════════════════════════
+    // CÁCH B: User chỉ chọn LOẠI PHÒNG
+    // ═══════════════════════════════════════════════
+    else {
+      const typeNameNorm = roomTypeName.trim().toLowerCase().replace(/\s+/g, ' ');
+      const allTypes = await RoomType.find({}).lean();
+      roomType = allTypes.find(t => {
+        const dbName = String(t.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        return dbName === typeNameNorm;
+      });
+      if (!roomType) {
+        roomType = allTypes.find(t => {
+          const dbName = String(t.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          return dbName.includes(typeNameNorm) || typeNameNorm.includes(dbName);
+        });
+      }
+      if (!roomType) {
+        return {
+          error: 'room_type_not_found',
+          message: `Không tìm thấy loại phòng "${roomTypeName}". Các loại phòng hiện có: ${allTypes.map(t => t.name).join(', ')}`,
+          availableTypes: allTypes.map(t => t.name),
+        };
+      }
+
+      // Tìm 1 phòng trống cùng loại
+      const roomsOfType = await Room.find({
+        typeId: roomType._id,
+        branchId,
+        roomStatus: 'active',
+      }).populate('typeId').lean();
+
+      if (roomsOfType.length === 0) {
+        return {
+          error: 'no_rooms_of_type',
+          message: `Hiện chưa có phòng loại "${roomType.name}" tại chi nhánh này ạ.`,
+        };
+      }
+
+      for (const room of roomsOfType) {
+        const conflict = await Booking.findOne({
+          $or: [{ roomId: room._id }, { 'rooms.roomId': room._id }],
+          status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+          checkIn: { $lt: co },
+          checkOut: { $gt: ci },
+        }).lean();
+        if (!conflict) {
+          availableRoom = room;
+          break;
+        }
+      }
+
+      if (!availableRoom) {
+        return {
+          error: 'all_rooms_busy',
+          message: `Toàn bộ phòng loại "${roomType.name}" đã được đặt trong khoảng thời gian này ạ. Anh/chị thử chọn loại khác hoặc đổi ngày.`,
+        };
+      }
+    }
+
+    // ═══════════════════════════════════════════════
+    // Tính giá
+    // ═══════════════════════════════════════════════
+    const branch = await Branch.findById(branchId).lean();
+    const policy = await PricePolicy.findOne({
+      roomTypeId: roomType._id,
+      branchId,
+      isActive: true,
+    }).lean();
+
+    const priceResult = calculatePrice({
+      checkIn: ci,
+      checkOut: co,
+      priceType,
+      policy,
+      branch,
+      adults,
+      children,
+      maxAdults: roomType.maxAdults || roomType.capacity || 2,
+      maxChildren: roomType.maxChildren || 0,
+    });
+
+    if (priceResult.error) {
+      return {
+        error: 'price_calc_error',
+        message: priceResult.error.message || 'Không tính được giá',
+      };
+    }
+
+    const nights = priceResult.nights;
+    const roomAmount = priceResult.roomAmount;
+
+    const formatDateTime = (d) => new Date(d).toLocaleString('vi-VN', { hour12: false });
+
+    return {
+      _previewOnly: true,
+      _selectionMode: roomNumber ? 'by_room_number' : 'by_room_type',
+      summary: {
+        customerName: customerName.trim(),
+        customerPhone: customerPhone.trim(),
+        roomNumber: availableRoom.number,
+        roomType: roomType.name,
+        capacity: `${roomType.maxAdults || roomType.capacity || 2} NL + ${roomType.maxChildren || 0} TE`,
+        area: roomType.area ? `${roomType.area}m²` : null,
+        checkIn: ci,
+        checkInFormatted: formatDateTime(ci),
+        checkOut: co,
+        checkOutFormatted: formatDateTime(co),
+        nights,
+        adults,
+        children,
+        priceType: priceResult.finalPriceType,
+        roomAmount,
+        roomAmountFormatted: fmt(roomAmount),
+        breakdown: priceResult.breakdown,
+        totalAmount: roomAmount,
+        totalAmountFormatted: fmt(roomAmount),
+        branch: branch?.name,
+        notes: notes?.trim() || null,
+      },
+      _hint: 'ĐÂY LÀ PREVIEW. HIỂN THỊ cho user toàn bộ thông tin trong summary để xác nhận. SAU ĐÓ phải hỏi: "Anh/chị xác nhận chốt đặt phòng nhé?". CHỈ gọi create_booking khi user trả lời rõ ràng "ok", "chốt", "đặt đi", "xác nhận", "đồng ý".',
+    };
+  },
+
+  async create_booking({
+    customerName, customerPhone, checkIn, checkOut,
+    roomNumber, roomTypeName, adults = 2, children = 0,
+    priceType = 'day', notes = '',
+    confirmed = false,
+  }) {
+    // ═══════════════════════════════════
+    // GUARD 1: Internal only
+    // ═══════════════════════════════════
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng không thể đặt phòng trực tiếp qua chat ạ.',
+      };
+    }
+
+    // ═══════════════════════════════════
+    // GUARD 2: Bắt buộc confirmed=true
+    // ═══════════════════════════════════
+    if (!confirmed) {
+      return {
+        error: 'not_confirmed',
+        message: 'Cần user xác nhận rõ ràng trước khi tạo booking. Hãy gọi prepare_booking_confirmation trước, hỏi user xác nhận, rồi mới gọi create_booking với confirmed=true.',
+      };
+    }
+
+    // ═══════════════════════════════════
+    // Validate
+    // ═══════════════════════════════════
+    if (!customerName?.trim() || !customerPhone?.trim() || !checkIn || !checkOut) {
+      return { error: 'Thiếu thông tin bắt buộc' };
+    }
+    if (!roomNumber?.toString().trim() && !roomTypeName?.trim()) {
+      return { error: 'Cần ít nhất 1: roomNumber HOẶC roomTypeName' };
+    }
+
+    let ci = new Date(checkIn);
+    let co = new Date(checkOut);
+    if (isNaN(ci.getTime()) || isNaN(co.getTime())) return { error: 'Ngày không hợp lệ' };
+
+    // ═══════════════════════════════════
+    // Tìm branchId (cần trước để lấy giờ chuẩn)
+    // ═══════════════════════════════════
+    let branchId = ctx.userBranchId;
+    if (!branchId && ctx.role === 'Admin') {
+      const firstBranch = await Branch.findOne();
+      branchId = firstBranch?._id;
+    }
+    if (!branchId) return { error: 'no_branch', message: 'Không xác định được chi nhánh' };
+
+    // ⭐ FIX: Tự gán giờ chuẩn nếu user chỉ truyền NGÀY (không giờ)
+    const branchForTime = await Branch.findById(branchId).lean();
+    const ciTimeStr = branchForTime?.checkInTime || '14:00';
+    const coTimeStr = branchForTime?.checkOutTime || '12:00';
+    const isOnlyDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.trim());
+    const setTime = (date, hhmm) => {
+      const [h, m] = String(hhmm).split(':').map(Number);
+      const d = new Date(date);
+      d.setHours(h || 14, m || 0, 0, 0);
+      return d;
+    };
+    if (isOnlyDate(checkIn)) ci = setTime(checkIn + 'T00:00:00', ciTimeStr);
+    if (isOnlyDate(checkOut)) co = setTime(checkOut + 'T00:00:00', coTimeStr);
+    if (!isOnlyDate(checkIn) && ci.getHours() === 0 && ci.getMinutes() === 0) ci = setTime(ci, ciTimeStr);
+    if (!isOnlyDate(checkOut) && co.getHours() === 0 && co.getMinutes() === 0) co = setTime(co, coTimeStr);
+
+    if (co <= ci) return { error: 'Check-out phải sau check-in' };
+
+    const now = new Date();
+    const tolerance = 60 * 1000;
+    if (ci.getTime() < now.getTime() - tolerance) {
+      return {
+        error: 'INVALID_PAST_CHECKIN',
+        message: `Không thể đặt phòng với giờ nhận phòng (${ci.toLocaleString('vi-VN')}) đã qua ạ.`,
+      };
+    }
+    if (co.getTime() < now.getTime() - tolerance) {
+      return {
+        error: 'INVALID_PAST_CHECKOUT',
+        message: `Không thể đặt phòng với giờ trả phòng (${co.toLocaleString('vi-VN')}) đã qua ạ.`,
+      };
+    }
+
+    let availableRoom = null;
+    let roomType = null;
+
+    // ═══════════════════════════════════
+    // CÁCH A: User chỉ định SỐ PHÒNG
+    // ═══════════════════════════════════
+    if (roomNumber?.toString().trim()) {
+      const numClean = String(roomNumber).trim();
+      const room = await Room.findOne({
+        number: numClean,
+        branchId,
+      }).populate('typeId');
+
+      if (!room) {
+        return { error: 'room_not_found', message: `Không tìm thấy phòng số "${numClean}"` };
+      }
+      if (room.roomStatus !== 'active') {
+        return {
+          error: 'room_unavailable',
+          message: `Phòng ${numClean} hiện không khả dụng (${room.roomStatus}).`,
+        };
+      }
+
+      // Re-check conflict (RACE CONDITION protection)
+      const conflict = await Booking.findOne({
+        $or: [{ roomId: room._id }, { 'rooms.roomId': room._id }],
+        status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+        checkIn: { $lt: co },
+        checkOut: { $gt: ci },
+      });
+      if (conflict) {
+        return {
+          error: 'room_busy',
+          message: `Phòng ${numClean} vừa bị đặt mất. Anh/chị thử lại với phòng khác ạ.`,
+        };
+      }
+
+      availableRoom = room;
+      roomType = room.typeId;
+    }
+    // ═══════════════════════════════════
+    // CÁCH B: User chỉ chọn LOẠI PHÒNG — tự tìm phòng trống
+    // ═══════════════════════════════════
+    else {
+      const typeNameNorm2 = roomTypeName.trim().toLowerCase().replace(/\s+/g, ' ');
+      const allTypes2 = await RoomType.find({});
+      roomType = allTypes2.find(t => {
+        const dbName = String(t.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        return dbName === typeNameNorm2;
+      });
+      if (!roomType) {
+        roomType = allTypes2.find(t => {
+          const dbName = String(t.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          return dbName.includes(typeNameNorm2) || typeNameNorm2.includes(dbName);
+        });
+      }
+      if (!roomType) {
+        return { error: 'room_type_not_found', message: `Không tìm thấy loại phòng "${roomTypeName}"` };
+      }
+
+      const roomsOfType = await Room.find({
+        typeId: roomType._id,
+        branchId,
+        roomStatus: 'active',
+      }).populate('typeId');
+
+      for (const room of roomsOfType) {
+        const conflict = await Booking.findOne({
+          $or: [{ roomId: room._id }, { 'rooms.roomId': room._id }],
+          status: { $in: ['confirmed', 'reserved', 'checked_in'] },
+          checkIn: { $lt: co },
+          checkOut: { $gt: ci },
+        });
+        if (!conflict) {
+          availableRoom = room;
+          break;
+        }
+      }
+
+      if (!availableRoom) {
+        return {
+          error: 'all_rooms_busy',
+          message: `Phòng loại "${roomType.name}" vừa bị đặt hết. Anh/chị thử lại với loại khác ạ.`,
+        };
+      }
+    }
+
+    // ═══════════════════════════════════
+    // Tính giá
+    // ═══════════════════════════════════
+    const branch = await Branch.findById(branchId);
+    const policy = await PricePolicy.findOne({
+      roomTypeId: roomType._id,
+      branchId,
+      isActive: true,
+    });
+
+    const priceResult = calculatePrice({
+      checkIn: ci,
+      checkOut: co,
+      priceType,
+      policy,
+      branch,
+      adults,
+      children,
+      maxAdults: roomType.maxAdults || roomType.capacity || 2,
+      maxChildren: roomType.maxChildren || 0,
+    });
+
+    if (priceResult.error) {
+      return { error: 'price_calc_error', message: priceResult.error.message };
+    }
+
+    const roomAmount = priceResult.roomAmount;
+    const totalAmount = roomAmount;     // discount=0 mặc định cho AI booking
+
+    // ═══════════════════════════════════
+    // Tạo/tìm Customer (theo phone)
+    // ═══════════════════════════════════
+    const phoneClean = customerPhone.trim();
+    let customer = await Customer.findOne({ phone: phoneClean });
+    if (!customer) {
+      customer = await Customer.create({
+        name: customerName.trim(),
+        phone: phoneClean,
+      });
+    }
+
+    // ═══════════════════════════════════
+    // Tạo Booking — copy theo controller create()
+    // ═══════════════════════════════════
+    let booking;
+    try {
+      booking = await Booking.create({
+        customerId: customer._id,
+        customerName: customerName.trim(),
+        customerPhone: phoneClean,
+        roomId: availableRoom._id,
+        roomNumber: availableRoom.number,
+        roomType: availableRoom.typeName || roomType.name,
+        branchId,
+        checkIn: ci,
+        checkOut: co,
+        nights: priceResult.nights,
+        priceType: priceResult.finalPriceType,
+        adults,
+        children,
+        notes: notes?.trim() || `[AI Chat] Tạo bởi ${ctx.role}`,
+        source: 'AI Chat',           // ⭐ Đánh dấu nguồn để track
+        discount: 0,
+        discountPercent: 0,
+        discountAmount: 0,
+        isFreeRoom: false,
+        roomAmount,
+        totalAmount,
+        servicesAmount: 0,
+        priceBreakdown: priceResult.breakdown,
+        policyId: policy?._id ?? null,
+        policyName: policy?.name ?? '',
+        policySnapshot: policy ? buildPolicySnapshot(policy, roomType.capacity ?? null) : null,
+        status: 'reserved',           // ⭐ Mặc định đặt trước (không tự check-in)
+        actualCheckIn: null,
+      });
+    } catch (e) {
+      console.error('[create_booking] error:', e);
+      return {
+        error: 'db_error',
+        message: 'Không tạo được booking: ' + e.message,
+      };
+    }
+
+    // Update Room
+    try {
+      await Room.findByIdAndUpdate(availableRoom._id, {
+        currentBookingId: booking._id,
+        currentGuestName: customerName.trim(),
+      });
+    } catch (e) {
+      console.warn('[create_booking] update room failed (non-fatal):', e.message);
+    }
+
+    // Audit log
+    try {
+      await logAction({
+        entityType: 'Booking',
+        entityId: booking._id,
+        action: 'create',
+        description: `[AI Chat] Tạo đặt phòng ${availableRoom.number} cho ${customerName}`,
+        user: { id: ctx.userId, role: ctx.role, _id: ctx.userId },
+        branchId,
+        metadata: {
+          source: 'AI Chat',
+          roomNumber: availableRoom.number,
+          customerName,
+          checkIn: ci,
+          checkOut: co,
+          totalAmount,
+          createdByAI: true,
+        },
+      });
+    } catch (e) {
+      console.warn('[create_booking] audit log failed (non-fatal):', e.message);
+    }
+
+    // ═══════════════════════════════════
+    // Trả kết quả thành công
+    // ═══════════════════════════════════
+    const finalBookingCode = booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`;
+    return {
+      success: true,
+      bookingCode: finalBookingCode,
+      bookingId: String(booking._id),
+      customerName,
+      customerPhone: phoneClean,
+      roomNumber: availableRoom.number,
+      roomType: roomType.name,
+      checkIn: ci,
+      checkInFormatted: ci.toLocaleString('vi-VN', { hour12: false }),
+      checkOut: co,
+      checkOutFormatted: co.toLocaleString('vi-VN', { hour12: false }),
+      nights: priceResult.nights,
+      adults,
+      children,
+      totalAmount,
+      totalAmountFormatted: fmt(totalAmount),
+      status: 'reserved',
+      branch: branch?.name,
+      _hint: 'BOOKING ĐÃ TẠO THÀNH CÔNG. Hiển thị bookingCode + thông tin cho user với tone vui mừng. Kết thúc bằng "Anh/chị cần em hỗ trợ thêm gì không ạ?"',
+    };
+  },
+
+  // ════════════════════════════════════════════════════
+  // ⭐ KPI + PHÂN TÍCH KINH DOANH (gọi module riêng)
+  // ════════════════════════════════════════════════════
+  async get_business_kpi(args) {
+    return businessAnalytics.getBusinessKPI({ ...args, ctx });
+  },
+
+  async analyze_revenue_trend(args) {
+    const months = Math.min(12, Math.max(1, args.months || 6));
+    return businessAnalytics.analyzeRevenueTrend({ ...args, months, ctx });
+  },
+
+  async analyze_room_performance(args) {
+    return businessAnalytics.analyzeRoomPerformance({ ...args, ctx });
+  },
+
+  async analyze_weekday_pattern(args) {
+    return businessAnalytics.analyzeWeekdayPattern({ ...args, ctx });
+  },
+
+  async get_strategy_recommendations(args) {
+    return businessAnalytics.getStrategyRecommendations({ ...args, ctx });
+  },
+
+  // ════════════════════════════════════════════════════
+  // ⭐ KPI + LƯƠNG (gọi module riêng)
+  // ════════════════════════════════════════════════════
+  async get_my_salary(args) {
+    return salaryAnalytics.getMySalary({ ...args, ctx });
+  },
+
+  async get_my_kpi(args) {
+    return salaryAnalytics.getMyKPI({ ...args, ctx });
+  },
+
+  async get_salary_history(args) {
+    return salaryAnalytics.getSalaryHistory({ ...args, ctx });
+  },
+
+  async get_branch_kpi_overview(args) {
+    return salaryAnalytics.getBranchKPIOverview({ ...args, ctx });
+  },
+
+  async get_top_employees(args) {
+    return salaryAnalytics.getTopEmployees({ ...args, ctx });
+  },
+
+  async get_kpi_improvement_suggestions(args) {
+    return salaryAnalytics.getKPIImprovementSuggestions({ ...args, ctx });
   },
 
   // ── 8. Tìm khách hàng ──
@@ -1403,6 +2670,11 @@ const makeHandlers = (ctx) => ({
 
   // ── 9. Doanh thu ──
   async get_revenue_stats({ fromDate, toDate, branchName }) {
+    // ⭐ External: chặn
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Thông tin này chỉ dành cho nhân viên ạ.' };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const from = new Date(fromDate);
     const to = new Date(toDate);
@@ -1475,6 +2747,11 @@ const makeHandlers = (ctx) => ({
 
   // ── 10. Doanh thu hôm nay ──
   async get_today_revenue({ branchName }) {
+    // ⭐ External: chặn
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Thông tin này chỉ dành cho nhân viên ạ.' };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const start = today();
     const end = endOfToday();
@@ -1512,6 +2789,11 @@ const makeHandlers = (ctx) => ({
 
   // ── 11. Công suất phòng ──
   async get_occupancy_rate({ branchName }) {
+    // ⭐ External: chặn
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Thông tin này chỉ dành cho nhân viên ạ.' };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const rooms = await computeRoomRealStatus(branchId);
 
@@ -1533,6 +2815,11 @@ const makeHandlers = (ctx) => ({
 
   // ── 12. Top phòng bán chạy ──
   async get_top_rooms({ fromDate, toDate, branchName, limit = 5 }) {
+    // ⭐ External: chặn
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Thông tin này chỉ dành cho nhân viên ạ.' };
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const from = new Date(fromDate);
     const to = new Date(toDate);
@@ -1739,7 +3026,7 @@ const makeHandlers = (ctx) => ({
 // ============================================================
 router.post('/message', async (req, res) => {
   try {
-    const { message, history = [], userRole, userBranchId } = req.body;
+    const { message, history = [], userRole, userBranchId, userName: bodyUserName, sessionId: clientSessionId } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ reply: 'Vui lòng nhập tin nhắn hợp lệ.' });
@@ -1756,7 +3043,19 @@ router.post('/message', async (req, res) => {
       userBranchId: req.user?.branchId
         ? String(req.user.branchId._id || req.user.branchId)
         : (userBranchId || null),
+      userId: req.user?.id || req.user?._id || null,    // ⭐ Cho audit log
+      // ⭐ Tên user — ưu tiên từ JWT (đáng tin hơn body), fallback body
+      userName: req.user?.fullName
+        || req.user?.displayName
+        || req.user?.name
+        || req.user?.username
+        || bodyUserName
+        || '',
     };
+    // ⭐ Phân loại internal/external
+    const INTERNAL_ROLES = ['Admin', 'Manager', 'Receptionist', 'Staff'];
+    ctx.isInternal = INTERNAL_ROLES.includes(ctx.role);
+    ctx.userType = ctx.isInternal ? 'internal' : 'external';
 
     // ⭐ Rate limit per user: 6 msg/phút, 60 msg/giờ
     const userKey = req.user?._id
@@ -1777,7 +3076,7 @@ router.post('/message', async (req, res) => {
 
     const geminiHistory = history
       .filter(h => h.text && (h.role === 'user' || h.role === 'assistant'))
-      .slice(-10)                          // ⭐ Chỉ giữ 10 messages cuối (tiết kiệm token)
+      .slice(-20)                          // ⭐ Giữ 20 messages cuối (đủ context cho flow đặt phòng đa lượt)
       .map(h => ({
         role: h.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: h.text }],
@@ -1804,23 +3103,20 @@ router.post('/message', async (req, res) => {
       'gemini-2.5-pro',
     ];
 
-    // ⭐ Helper tạo model với cache (nếu có) hoặc fallback regular
-    async function buildModel(modelName) {
-      // Thử dùng cache trước
-      const { cache } = await getOrCreateCache(genAI, systemPrompt, tools, ctx, modelName);
-
-      if (cache) {
-        // Có cache → dùng cached content (tiết kiệm ~75% input token)
-        try {
-          return genAI.getGenerativeModelFromCachedContent(cache, {
-            generationConfig: { temperature: 0.4, maxOutputTokens: 2000 },
-          });
-        } catch (err) {
-          console.warn(`[Chat] Cached model failed, fallback to regular:`, err.message);
-        }
-      }
-
-      // Fallback: model thường (gửi full system prompt mỗi lần)
+    // ⭐ Helper tạo model — dùng IMPLICIT CACHE của Gemini 2.5
+    //   Gemini 2.5 Flash tự động cache prefix prompt (min 1024 token)
+    //   nếu request shares common prefix với request trước.
+    //   Cost: cached tokens chỉ tính 25% giá gốc → tiết kiệm 75%.
+    //
+    //   ĐIỀU KIỆN cache hit:
+    //   1. Prefix prompt giống nhau (đã tổ chức ở chatPromptBuilder)
+    //   2. Tools giống nhau (giữ thứ tự ổn định)
+    //   3. Trong vòng 3-5 phút sau request trước
+    //
+    //   KHÔNG dùng explicit cache vì:
+    //   - SDK @google/generative-ai cũ không có genAI.caches.create()
+    //   - Explicit cache yêu cầu min 32,768 token — prompt hiện tại nhỏ hơn
+    function buildModel(modelName) {
       return genAI.getGenerativeModel({
         model: modelName,
         systemInstruction: systemPrompt,
@@ -1838,7 +3134,7 @@ router.post('/message', async (req, res) => {
         let activeChat = currentChat;
         if (modelIdx > 0) {
           console.log(`[Chat] Fallback to ${modelName}`);
-          const fallbackModel = await buildModel(modelName);
+          const fallbackModel = buildModel(modelName);
           const currentHistory = await currentChat.getHistory().catch(() => geminiHistory);
           activeChat = fallbackModel.startChat({ history: currentHistory });
         }
@@ -1874,14 +3170,28 @@ router.post('/message', async (req, res) => {
       throw lastError || new Error('Tất cả model AI đều không khả dụng');
     }
 
-    const model = await buildModel(MODEL_FALLBACKS[0]);
+    const model = buildModel(MODEL_FALLBACKS[0]);
 
     let chat = model.startChat({ history: geminiHistory });
     let { result, chat: activeChat, model: usedModel } = await sendWithFallback(message, chat);
     chat = activeChat;
 
+    // ⭐ Log token usage để verify implicit cache đang hoạt động
+    //   Nếu cachedContentTokenCount > 0 → cache hit, đang tiết kiệm 75% phần đó
+    //   Nếu = 0 sau vài request → cache miss, cần check prefix có ổn định không
+    try {
+      const usage = result?.response?.usageMetadata;
+      if (usage) {
+        const cached = usage.cachedContentTokenCount || 0;
+        const total = usage.promptTokenCount || 0;
+        const cacheRate = total > 0 ? ((cached / total) * 100).toFixed(0) : 0;
+        console.log(`[Chat] Tokens: prompt=${total}, cached=${cached} (${cacheRate}%), output=${usage.candidatesTokenCount || 0}, model=${usedModel}`);
+      }
+    } catch (e) { /* ignore */ }
+
     let iterations = 0;
     const MAX_ITER = 5;                    // ⭐ Tier 1: cho phép câu hỏi phức tạp hơn
+    const allToolCalls = [];               // ⭐ Track để lưu DB
 
     while (iterations < MAX_ITER) {
       const calls = result.response.functionCalls?.() || [];
@@ -1892,6 +3202,7 @@ router.post('/message', async (req, res) => {
       const toolResults = await Promise.all(calls.map(async (call) => {
         const handler = handlers[call.name];
         if (!handler) {
+          allToolCalls.push({ name: call.name, args: call.args, error: 'Unknown tool' });
           return {
             functionResponse: {
               name: call.name,
@@ -1905,16 +3216,22 @@ router.post('/message', async (req, res) => {
         const cached = getCachedTool(cacheKey);
         if (cached) {
           console.log(`[Chat] Tool ${call.name} CACHE HIT`);
+          allToolCalls.push({ name: call.name, args: call.args, result: cached, durationMs: 0 });
           return { functionResponse: { name: call.name, response: cached } };
         }
 
+        const t0 = Date.now();
         try {
           const data = await handler(call.args || {});
           setCachedTool(cacheKey, data);   // ⭐ Cache 60s
+          const durationMs = Date.now() - t0;
           console.log(`[Chat] Tool ${call.name} OK:`, JSON.stringify(data).slice(0, 200));
+          allToolCalls.push({ name: call.name, args: call.args, result: data, durationMs });
           return { functionResponse: { name: call.name, response: data } };
         } catch (err) {
+          const durationMs = Date.now() - t0;
           console.error(`[Chat] Tool ${call.name} ERROR:`, err.message);
+          allToolCalls.push({ name: call.name, args: call.args, error: err.message, durationMs });
           return {
             functionResponse: {
               name: call.name,
@@ -1932,14 +3249,75 @@ router.post('/message', async (req, res) => {
       iterations++;
     }
 
-    const replyText = result.response.text?.() || 'Xin lỗi, tôi không hiểu câu hỏi.';
+    let replyText = result.response.text?.() || '';
+    if (!replyText.trim()) {
+      // ⭐ Log để debug khi response rỗng
+      console.warn('[Chat] Empty response from Gemini. User msg:', message.slice(0, 100));
+      console.warn('[Chat] Last function calls:', result.response.functionCalls?.() || 'none');
+      replyText = 'Dạ em chưa hiểu rõ câu hỏi của anh/chị ạ. Anh/chị có thể diễn đạt lại được không ạ?';
+    }
 
     // ⭐ Sinh messageId để FE track + submit feedback sau này
     const messageId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+    // ⭐ SUGGESTIONS — sinh từ 2 nguồn rồi merge
+    //   1. AI tự đề xuất qua block [SUGGESTIONS]...[/SUGGESTIONS] trong reply
+    //   2. Mẫu chuẩn dựa trên tool gần nhất
+    let cleanReply = replyText;
+    let suggestions = [];
+    try {
+      const aiParsed = parseAiSuggestions(replyText);
+      cleanReply = aiParsed.cleanReply;
+      const standardSugs = buildStandardSuggestions(allToolCalls, ctx);
+      suggestions = mergeSuggestions(aiParsed.suggestions, standardSugs, 5);
+    } catch (e) {
+      console.warn('[Chat] Build suggestions failed (non-fatal):', e.message);
+    }
+
+    // ⭐ Lưu vào DB (fire-and-forget — không chặn response)
+    //   Chỉ lưu khi user là internal + có persistence service + có userId
+    if (persistence && ctx.userId && ctx.isInternal) {
+      (async () => {
+        try {
+          const session = await persistence.ensureSession({
+            sessionId: clientSessionId,
+            userId: ctx.userId,
+            userName: ctx.userName,
+            userRole: ctx.role,
+            branchId: ctx.userBranchId,
+            branchName: userBranchName,
+            firstMessage: message,
+          });
+
+          if (session) {
+            // Lưu tin user
+            await persistence.saveUserMessage(session, { text: message });
+
+            // Lưu tin assistant — dùng cleanReply (đã loại block SUGGESTIONS)
+            const usage = result?.response?.usageMetadata || {};
+            await persistence.saveAssistantMessage(session, {
+              text: cleanReply,
+              toolCalls: allToolCalls,
+              tokensUsed: {
+                prompt: usage.promptTokenCount || 0,
+                cached: usage.cachedContentTokenCount || 0,
+                output: usage.candidatesTokenCount || 0,
+              },
+              modelUsed: usedModel,
+              iterations,
+              messageId,
+            });
+          }
+        } catch (err) {
+          console.warn('[Chat] Persistence save failed (non-fatal):', err.message);
+        }
+      })();
+    }
+
     res.json({
-      reply: replyText,
-      messageId,                        // ⭐ FE dùng cho feedback
+      reply: cleanReply,                // ⭐ Đã clean block [SUGGESTIONS]
+      suggestions,                       // ⭐ Array buttons [{id, label, value}]
+      messageId,                         // ⭐ FE dùng cho feedback
       iterations,
       modelUsed: usedModel,
       scope: {
@@ -1992,8 +3370,127 @@ router.get('/health', (req, res) => {
       toolCacheSize: toolCache.size,
       rateLimitTracked: rateLimitMap.size,
     },
-    contextCache: getCacheStats(),     // ⭐ Stats về Gemini context cache
+    contextCache: getCacheStats(),
   });
+});
+
+// ============================================================
+// ⭐ NEW: Verify Gemini API key
+//   - GET /api/chat/verify-key
+//   - Gọi Google models.list để check key có hợp lệ không
+//   - Trả về: { valid, tier, modelsAvailable, error?, latencyMs }
+// ============================================================
+router.get('/verify-key', async (req, res) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return res.json({
+      valid: false,
+      error: 'GEMINI_API_KEY chưa được cấu hình trong .env',
+      suggestion: 'Thêm GEMINI_API_KEY=xxx vào file .env',
+    });
+  }
+
+  const startTime = Date.now();
+
+  try {
+    // Gọi Google API list models
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    const latencyMs = Date.now() - startTime;
+    const data = await response.json();
+
+    // Key invalid
+    if (!response.ok) {
+      return res.json({
+        valid: false,
+        statusCode: response.status,
+        error: data?.error?.message || `HTTP ${response.status}`,
+        details: data?.error,
+        latencyMs,
+        suggestion: response.status === 400
+          ? 'API key không đúng định dạng hoặc đã bị thu hồi. Kiểm tra lại tại https://aistudio.google.com/app/apikey'
+          : response.status === 403
+          ? 'API key không có quyền truy cập. Có thể chưa enable Generative Language API.'
+          : 'Có lỗi khi gọi Google API. Vui lòng thử lại.',
+      });
+    }
+
+    // Key OK
+    const models = data?.models || [];
+    const flashModels = models.filter(m => m.name?.includes('gemini-2.5'));
+    const fallbackModels = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'];
+    const availableFallbacks = fallbackModels.filter(fb =>
+      models.some(m => m.name?.endsWith(fb))
+    );
+
+    // Thử thêm 1 generateContent nhỏ để check quota
+    let testCall = null;
+    try {
+      const testStart = Date.now();
+      const testRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: 'OK' }] }],
+            generationConfig: { maxOutputTokens: 5 },
+          }),
+        }
+      );
+      const testData = await testRes.json();
+      const testLatency = Date.now() - testStart;
+
+      if (testRes.ok) {
+        testCall = {
+          ok: true,
+          model: 'gemini-2.5-flash',
+          latencyMs: testLatency,
+          tokensUsed: testData?.usageMetadata?.totalTokenCount || null,
+        };
+      } else {
+        testCall = {
+          ok: false,
+          statusCode: testRes.status,
+          error: testData?.error?.message,
+          isQuotaError: testRes.status === 429,
+          isOverloaded: testRes.status === 503,
+        };
+      }
+    } catch (err) {
+      testCall = { ok: false, error: err.message };
+    }
+
+    return res.json({
+      valid: true,
+      latencyMs,
+      keyPreview: apiKey.slice(0, 6) + '...' + apiKey.slice(-4),
+      totalModels: models.length,
+      gemini25Models: flashModels.length,
+      availableFallbacks,
+      missingFallbacks: fallbackModels.filter(fb => !availableFallbacks.includes(fb)),
+      testCall,
+      message: testCall?.ok
+        ? '✅ API key hợp lệ và còn quota'
+        : testCall?.isQuotaError
+        ? '⚠️ API key hợp lệ nhưng đã HẾT QUOTA'
+        : testCall?.isOverloaded
+        ? '⚠️ API key hợp lệ nhưng Google đang quá tải (503)'
+        : '⚠️ API key hợp lệ nhưng có vấn đề khi test gọi model',
+    });
+  } catch (err) {
+    return res.status(500).json({
+      valid: false,
+      error: err.message,
+      latencyMs: Date.now() - startTime,
+      suggestion: 'Có thể do mạng/firewall. Kiểm tra có thể access generativelanguage.googleapis.com không.',
+    });
+  }
 });
 
 module.exports = router;

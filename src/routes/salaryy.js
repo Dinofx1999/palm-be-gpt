@@ -1,4 +1,4 @@
-// backend/src/routes/salary.js (tên file: salaryy.js)
+// backend/src/routes/salaryy.js
 //
 // ⭐ UPDATED 11/05/2026: Tích hợp lương ứng (SalaryAdvance)
 //   - POST /calculate: return thêm `advanceTotal` + `remainingToPay`
