@@ -1,0 +1,98 @@
+[
+  {
+    "category": "booking",
+    "title": "Đoàn đông - dùng nhiều phòng cùng loại",
+    "pattern": "đoàn đông, nhiều người",
+    "priority": 9,
+    "userInput": "Tư vấn phòng cho đoàn 15 người lớn + 5 trẻ em, ở 3 đêm",
+    "assistantOutput": "🏨 Gợi ý đặt phòng từ 15/05/2026 đến 18/05/2026 (3 đêm) cho 15 NL + 5 TE:\n\n📦 ⭐ Đề xuất tốt nhất: 5 phòng Superior Quadruple Room\n\nSuperior Quadruple Room (sức chứa 4 NL + 0 TE, 25m²)\n   Còn 5 phòng trống · Số phòng dùng: 5\n   Phân bổ khách: 3 + 3 + 3 + 3 + 3 NL · 1 + 1 + 1 + 1 + 1 TE\n   Tổng/phòng: **1.350.000đ**\n   Tổng 5 phòng: **6.750.000đ**\n\n━━━━━━━━━━━━━━━━━━━━━━\n💰 **TỔNG: 6.750.000đ** (5 phòng, 3 đêm)\n\n👉 Bạn chọn phương án nào? Hay cần điều chỉnh gì?"
+  },
+  {
+    "category": "booking",
+    "title": "Khách lẻ - chọn phòng đơn rẻ nhất",
+    "pattern": "1-4 người, khách lẻ",
+    "priority": 9,
+    "userInput": "Tư vấn phòng 2 NL + 1 TE, 2 đêm",
+    "assistantOutput": "🏨 Gợi ý đặt phòng (2 đêm) cho 2 NL + 1 TE:\n\n📦 ⭐ Đề xuất tốt nhất: 1 phòng Standard City View Room\n\nStandard City View Room (sức chứa 2 NL + 1 TE, 22m²)\n   Còn 4 phòng trống · Số phòng dùng: 1\n   Tổng/phòng: **1.000.000đ**\n\n━━━━━━━━━━━━━━━━━━━━━━\n💰 **TỔNG: 1.000.000đ** (1 phòng, 2 đêm)\n\n👉 Bạn chọn phương án này hay xem thêm tuỳ chọn khác?"
+  },
+  {
+    "category": "pricing",
+    "title": "Phụ thu CI sớm/CO trễ",
+    "pattern": "check-in sớm, check-out muộn",
+    "priority": 8,
+    "userInput": "Khách đặt 2 NL từ 10h sáng đến 14h chiều hôm sau",
+    "assistantOutput": "🏨 Đặt phòng 2 NL (CI 10:00 → CO 14:00 hôm sau):\n\n📦 ⭐ Đề xuất tốt nhất: 1 phòng Standard City View Room\n\nStandard City View Room (sức chứa 2 NL + 1 TE, 22m²)\n   Còn 4 phòng trống · Số phòng dùng: 1\n   Giá cơ bản: 500.000đ\n   + Nhận phòng sớm (4 giờ): 200.000đ\n   + Trả phòng muộn (2 giờ): 100.000đ\n   Tổng/phòng: **800.000đ**\n\n━━━━━━━━━━━━━━━━━━━━━━\n💰 **TỔNG: 800.000đ** (1 phòng, 1 đêm)\n\n👉 Bạn chọn phương án này không?"
+  },
+  {
+    "category": "image",
+    "title": "Hiển thị ảnh phòng",
+    "pattern": "xem phòng, ảnh phòng",
+    "priority": 8,
+    "userInput": "Cho tôi xem phòng Deluxe",
+    "assistantOutput": "🏨 Phòng Deluxe của khách sạn:\n\n![Phòng Deluxe](https://example.com/deluxe-1.jpg)\n\n![Góc khác](https://example.com/deluxe-2.jpg)\n\n📐 Diện tích: 30m²\n👥 Sức chứa: 2 NL + 1 TE\n✨ Tiện nghi: TV, máy lạnh, minibar, ban công\n\nBạn cần thông tin gì thêm không?"
+  },
+  {
+    "category": "revenue",
+    "title": "Báo cáo doanh thu hôm nay",
+    "pattern": "doanh thu, báo cáo",
+    "priority": 7,
+    "userInput": "Doanh thu hôm nay bao nhiêu?",
+    "assistantOutput": "📊 Doanh thu hôm nay (13/05/2026):\n\n💰 Tổng: **3.500.000đ**\n📋 Số booking đã check-out: 3\n🏨 Phòng đã trả: 4 phòng\n\nThông tin chi tiết:\n   Booking #1234 (Anh Nguyễn Văn A): 1.200.000đ\n   Booking #1235 (Chị Lê Thị B): 800.000đ\n   Booking #1236 (đoàn 2 phòng): 1.500.000đ\n\nBạn cần xem khoảng thời gian khác không?"
+  },
+  {
+    "category": "customer",
+    "title": "Tìm thông tin khách",
+    "pattern": "tìm khách, thông tin khách",
+    "priority": 6,
+    "userInput": "Tìm thông tin khách Nguyễn Văn A",
+    "assistantOutput": "👤 Tìm thấy thông tin khách Nguyễn Văn A:\n\n📞 SĐT: 0909123456\n📧 Email: nguyenvana@gmail.com\n🆔 CCCD: 0010xxxxxxx\n\n📋 Lịch sử đặt phòng (3 lần):\n   1. Booking #1234 — 12/05/2026 — Phòng Deluxe — 1.500.000đ — ✅ Đã trả\n   2. Booking #1100 — 20/04/2026 — Phòng Standard — 600.000đ — ✅ Đã trả\n   3. Booking #1050 — 15/03/2026 — Phòng VIP — 2.000.000đ — ✅ Đã trả\n\n💰 Tổng chi tiêu: 4.100.000đ\n⭐ Khách thân thiết\n\nBạn cần xem chi tiết booking nào?"
+  },
+  {
+    "category": "general",
+    "title": "Không có phòng phù hợp",
+    "pattern": "không có phòng, hết phòng",
+    "priority": 7,
+    "userInput": "Tư vấn phòng cho 50 người",
+    "assistantOutput": "⚠️ Không có đủ phòng cho 50 người trong khoảng thời gian này.\n\nHiện tại khách sạn có tối đa 20 phòng, sức chứa tối đa khoảng 80 người (nếu tất cả phòng trống).\n\nMột số gợi ý:\n   • Chia thành nhiều booking nhỏ\n   • Chọn ngày khác có nhiều phòng trống hơn\n   • Liên hệ lễ tân để được tư vấn riêng cho đoàn lớn\n\nBạn muốn tôi kiểm tra ngày khác không?"
+  },
+  {
+    "category": "general",
+    "title": "Phòng đang được sử dụng",
+    "pattern": "tình trạng phòng hôm nay",
+    "priority": 6,
+    "userInput": "Tình trạng phòng hôm nay thế nào?",
+    "assistantOutput": "🏨 Tình trạng phòng hôm nay (13/05/2026):\n\n✅ Phòng trống: **8 phòng**\n🛌 Đang có khách: **10 phòng**\n🧹 Cần dọn: **2 phòng**\n🔧 Bảo trì: **0 phòng**\n\n📊 Tỷ lệ lấp đầy: 50%\n\nBạn cần xem chi tiết loại nào?"
+  },
+  {
+    "category": "booking",
+    "title": "Khách hỏi giá kèm phụ thu",
+    "pattern": "vượt sức chứa, thêm người",
+    "priority": 8,
+    "userInput": "Phòng Standard giá bao nhiêu cho 3 NL?",
+    "assistantOutput": "💰 Phòng Standard City View cho 3 NL (vượt 1 NL so với sức chứa 2 NL):\n\nGiá cơ bản: 500.000đ/đêm\n+ Phụ thu 1 NL: 100.000đ/đêm\n= **Tổng: 600.000đ/đêm**\n\nNếu ở 2 đêm thì tổng là **1.200.000đ**.\n\nBạn cần đặt phòng không?"
+  },
+  {
+    "category": "general",
+    "title": "Trả lời câu hỏi không liên quan",
+    "pattern": "off-topic, ngoài phạm vi",
+    "priority": 5,
+    "userInput": "Hôm nay thời tiết thế nào?",
+    "assistantOutput": "Xin lỗi, tôi là trợ lý AI của Palm PMS — tôi chỉ hỗ trợ về quản lý khách sạn (đặt phòng, báo giá, doanh thu, khách hàng...).\n\nBạn cần tôi giúp gì về hệ thống không?"
+  },
+  {
+    "category": "booking",
+    "title": "Đoàn có gia đình - hỏi chi tiết trước",
+    "pattern": "gia đình, nhóm, ở chung, đoàn có trẻ em",
+    "priority": 10,
+    "userInput": "Báo giá đoàn 20 NL + 12 TE, có 3 gia đình mang trẻ muốn ở chung",
+    "assistantOutput": "🏨 Để chia phòng tối ưu cho đoàn 20 NL + 12 TE, vui lòng cho biết cụ thể số người mỗi gia đình:\n\n📝 Ví dụ định dạng:\n   Gia đình 1: 2 NL + 2 TE\n   Gia đình 2: 2 NL + 1 TE\n   Gia đình 3: 2 NL + 1 TE\n\nSố khách còn lại (không thuộc gia đình nào) tôi sẽ tự sắp xếp vào các phòng share.\n\n👉 Bạn cho biết chi tiết các gia đình giúp tôi nhé!"
+  },
+  {
+    "category": "booking",
+    "title": "Đoàn có gia đình - hiển thị kết quả theo nhóm",
+    "pattern": "groups, family rooms, chia nhóm",
+    "priority": 10,
+    "userInput": "GĐ1: 2NL+2TE, GĐ2: 2NL+1TE, GĐ3: 2NL+1TE. Còn lại 14 NL + 8 TE",
+    "assistantOutput": "🏨 Gợi ý đặt phòng (3 đêm) cho đoàn 20 NL + 12 TE:\n\n📦 ⭐ Đề xuất chia theo 3 nhóm\n\n👨‍👩‍👧 Gia đình 1 (2 NL + 2 TE)\nFamily Suite (35m²)\n   Còn 2 phòng trống · Số phòng dùng: 1\n   Tổng/phòng: **2.400.000đ**\n\n👨‍👩‍👧 Gia đình 2 (2 NL + 1 TE)\nStandard Triple Room (28m²)\n   Còn 3 phòng trống · Số phòng dùng: 1\n   Tổng/phòng: **1.800.000đ**\n\n👨‍👩‍👧 Gia đình 3 (2 NL + 1 TE)\nStandard Triple Room (28m²)\n   Còn 2 phòng trống · Số phòng dùng: 1\n   Tổng/phòng: **1.800.000đ**\n\n👥 Đoàn còn lại (14 NL + 8 TE)\nSuperior Quadruple Room (25m²)\n   Còn 5 phòng trống · Số phòng dùng: 6\n   Tổng/phòng: 1.500.000đ\n\n   Chi tiết phân bổ:\n      • Phòng 1: 3 NL + 1 TE — 1.500.000đ\n      • Phòng 2: 3 NL + 1 TE — 1.500.000đ\n      • Phòng 3: 2 NL + 2 TE — 1.500.000đ\n      • Phòng 4: 2 NL + 2 TE — 1.500.000đ\n      • Phòng 5: 2 NL + 1 TE — 1.500.000đ\n      • Phòng 6: 2 NL + 1 TE — 1.500.000đ\n   Tổng 6 phòng: **9.000.000đ**\n\n━━━━━━━━━━━━━━━━━━━━━━\n💰 **TỔNG: 15.000.000đ** (9 phòng, 3 đêm)\n\n👉 Bạn xác nhận đặt theo phương án này không?"
+  }
+]

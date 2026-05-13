@@ -77,6 +77,16 @@ app.use('/api/penalty',           require('./routes/penalty'));
 app.use('/api/workshift',         require('./routes/workshift'));
 app.use('/api/attendance',        require('./routes/attendance'));
 app.use('/api/admin',             require('./routes/device-security'));
+app.use('/api/chat',              require('./routes/chat'));
+// ⭐ NEW 13/05/2026: AI Chat Feedback + Few-shot management
+//   - POST /api/chat-feedback             (user submit 👍/👎)
+//   - GET  /api/chat-feedback             (admin xem list)
+//   - GET  /api/chat-feedback/stats       (admin stats)
+//   - POST /api/chat-feedback/:id/convert (admin convert feedback → few-shot)
+//   - POST /api/chat-feedback/:id/dismiss (admin bỏ qua)
+//   - CRUD /api/chat-fewshots             (admin quản lý few-shot examples)
+//   - POST /api/chat-fewshots/refresh-cache (invalidate Gemini cache)
+app.use('/api',                   require('./routes/chatFeedback'));
 
 // ⭐ NEW 12/05/2026: Module Tuyển dụng (Careers)
 //   - /api/job-postings:     CRUD vị trí tuyển dụng (Admin/Manager)
