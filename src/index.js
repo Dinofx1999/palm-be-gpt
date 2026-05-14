@@ -78,34 +78,32 @@ app.use('/api/workshift',         require('./routes/workshift'));
 app.use('/api/attendance',        require('./routes/attendance'));
 app.use('/api/admin',             require('./routes/device-security'));
 app.use('/api/chat',              require('./routes/chat'));
+
 // ⭐ NEW 13/05/2026: AI Chat Feedback + Few-shot management
-//   - POST /api/chat-feedback             (user submit 👍/👎)
-//   - GET  /api/chat-feedback             (admin xem list)
-//   - GET  /api/chat-feedback/stats       (admin stats)
-//   - POST /api/chat-feedback/:id/convert (admin convert feedback → few-shot)
-//   - POST /api/chat-feedback/:id/dismiss (admin bỏ qua)
-//   - CRUD /api/chat-fewshots             (admin quản lý few-shot examples)
-//   - POST /api/chat-fewshots/refresh-cache (invalidate Gemini cache)
 app.use('/api',                   require('./routes/chatFeedback'));
 
 // ⭐ NEW 14/05/2026: AI Chat History — lưu/load lịch sử chat từ MongoDB
-//   - GET    /api/chat-history/sessions          List sessions của user hiện tại
-//   - GET    /api/chat-history/sessions/:id      Get 1 session + tất cả messages
-//   - PATCH  /api/chat-history/sessions/:id      Đổi title / pin / archive
-//   - DELETE /api/chat-history/sessions/:id      Xoá 1 session (+ tất cả messages)
-//   - DELETE /api/chat-history/sessions          Xoá tất cả của user
 app.use('/api/chat-history',      require('./routes/chatHistory'));
 
 // ⭐ NEW 12/05/2026: Module Tuyển dụng (Careers)
-//   - /api/job-postings:     CRUD vị trí tuyển dụng (Admin/Manager)
-//   - /api/job-applications: Quản lý hồ sơ ứng viên (Admin/Manager)
-//   - /api/public/careers:   Public endpoints — KHÔNG auth (form ứng tuyển)
 app.use('/api/job-postings',      require('./routes/jobPostingRoutes'));
 app.use('/api/job-applications',  require('./routes/jobApplicationRoutes'));
 app.use('/api/public/careers',    require('./routes/publicCareersRoutes'));
+
 // ⭐ NEW 13/05/2026: Module Quy trình Nhân viên
 app.use('/api/procedures',        require('./routes/procedureRoutes'));
 
+// ─────────────────────────────────────────────────────
+// ⭐ NEW 14/05/2026: Module Tài chính (Thu/Chi + Bàn giao ca + Đối soát)
+//   - /api/transactions:    Thu/Chi (CRUD, filter, summary)
+//   - /api/profit:          Báo cáo lợi nhuận (P&L)
+//   - /api/shifts:          Bàn giao ca (open/close/handover)
+//   - /api/reconciliations: Đối soát thu chi (daily/weekly/monthly)
+// ─────────────────────────────────────────────────────
+app.use('/api/transactions',     require('./routes/transactions'));
+app.use('/api/profit',           require('./routes/profit'));
+app.use('/api/shifts',           require('./routes/shifts'));
+app.use('/api/reconciliations',  require('./routes/reconciliation'));
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

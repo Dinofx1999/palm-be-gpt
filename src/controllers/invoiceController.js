@@ -2,6 +2,12 @@ const Invoice = require('../models/Invoice');
 const Booking = require('../models/Booking');
 const User    = require('../models/User');
 
+// ⭐ NEW 14/05/2026: Auto-sync transaction khi thanh toán/hoàn tiền
+const {
+  syncInvoicePayment,
+  removeInvoicePayment,
+} = require('../utils/invoiceTransactionHelper');
+
 let logAction = async () => {};
 try {
   logAction = require('../utils/auditLogger').logAction;
@@ -241,11 +247,6 @@ const enrichInvoice = async (invoice) => {
 const getAll = safe(async (req, res) => {
   const { customerId, paymentStatus, branchId, search, page = 1, limit = 20 } = req.query
 
-  // ⭐ FIX: Dùng aggregate pipeline để filter theo branchId
-  //   Lý do: invoice cũ trong DB CHƯA có field branchId (chỉ invoice mới mới có).
-  //   Solution: $lookup vào bookings để lấy branchId từ booking nếu invoice không có.
-  //   → Filter được cả invoice cũ lẫn mới mà KHÔNG cần migration.
-
   const matchStage = {}
   if (customerId)    matchStage.customerId    = new (require('mongoose').Types.ObjectId)(customerId)
   if (paymentStatus) matchStage.paymentStatus = paymentStatus
@@ -257,12 +258,6 @@ const getAll = safe(async (req, res) => {
     ]
   }
 
-  // ⭐ Pipeline:
-  //   1. Match các filter cơ bản (customerId, paymentStatus, search)
-  //   2. Lookup booking để có branch info
-  //   3. Add field effectiveBranchId = invoice.branchId ?? booking.branchId
-  //   4. Match theo effectiveBranchId nếu user truyền branchId
-  //   5. Sort + paginate
   const pipeline = [
     { $match: matchStage },
     {
@@ -276,7 +271,6 @@ const getAll = safe(async (req, res) => {
     },
     {
       $addFields: {
-        // Ưu tiên invoice.branchId, fallback sang booking.branchId
         effectiveBranchId: {
           $ifNull: ['$branchId', { $arrayElemAt: ['$_booking.branchId', 0] }],
         },
@@ -284,7 +278,6 @@ const getAll = safe(async (req, res) => {
     },
   ]
 
-  // ⭐ Filter theo branch (sau khi đã có effectiveBranchId)
   if (branchId) {
     pipeline.push({
       $match: {
@@ -293,19 +286,15 @@ const getAll = safe(async (req, res) => {
     })
   }
 
-  // Sort newest first
   pipeline.push({ $sort: { createdAt: -1 } })
 
-  // Count tổng (clone pipeline trước khi limit)
   const countPipeline = [...pipeline, { $count: 'total' }]
   const totalResult = await Invoice.aggregate(countPipeline)
   const total = totalResult[0]?.total ?? 0
 
-  // Pagination
   pipeline.push({ $skip: (+page - 1) * +limit })
   pipeline.push({ $limit: +limit })
 
-  // Cleanup field tạm trước khi return cho FE (giữ effectiveBranchId là branchId chính)
   pipeline.push({
     $addFields: { branchId: '$effectiveBranchId' },
   })
@@ -336,14 +325,12 @@ const getOrCreateForBooking = safe(async (req, res) => {
   const booking = await Booking.findById(bookingId)
   if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
-  // ⭐ Compute totals từ booking (xử lý cả single + group)
   const totals = computeBookingTotals(booking)
   const customerName = booking.customerName || booking.customerPhone || 'Khách'
 
   let invoice = await Invoice.findOne({ bookingId: booking._id })
 
   if (!invoice) {
-    // CREATE
     let attempts = 0
     let lastErr  = null
     while (attempts < 3 && !invoice) {
@@ -360,7 +347,6 @@ const getOrCreateForBooking = safe(async (req, res) => {
           paidAmount:      0,
           remainingAmount: totals.totalAmount,
           paymentStatus:   'unpaid',
-          // ⭐ NEW: branchId từ booking
           branchId:        booking.branchId ?? null,
           issuedBy:        req.user?.id ?? req.user?._id ?? null,
           items:           totals.items,
@@ -378,9 +364,6 @@ const getOrCreateForBooking = safe(async (req, res) => {
 
     if (!invoice) throw lastErr ?? new Error('Không tạo được invoice')
   } else {
-    // ⭐ UPDATE: ALWAYS recalc từ totals (trước đây chỉ check khác mới update)
-    //   Bug cũ: nếu booking đoàn add thêm phòng, totalAmount cũ giữ nguyên 1 phòng
-    //   Fix: luôn ghi đè từ totals tính lại
     const needRecalc =
       invoice.totalAmount     !== totals.totalAmount ||
       invoice.roomAmount      !== totals.roomAmount ||
@@ -406,7 +389,6 @@ const getOrCreateForBooking = safe(async (req, res) => {
         : (invoice.paidAmount ?? 0) > 0                 ? 'partial'
         :                                                 'unpaid'
 
-      // ⭐ Nếu invoice cũ chưa có branchId — backfill từ booking
       if (!invoice.branchId && booking.branchId) {
         invoice.branchId = booking.branchId
       }
@@ -454,6 +436,21 @@ const addPayment = safe(async (req, res) => {
                             paidAmount > 0 ? 'partial' : 'unpaid'
   invoice.paymentMethod   = method ?? invoice.paymentMethod
   await invoice.save()
+
+  // ⭐ NEW 14/05/2026: Auto-sync transaction vào module Thu/Chi
+  //   Mỗi payment thành 1 transaction riêng (idempotent theo payment._id)
+  //   - type='payment' → Transaction { type:'income', category:'Tiền phòng' }
+  //   - type='refund'  → Transaction { type:'expense', category:'Hoàn tiền khách' }
+  //   Errors KHÔNG chặn payment flow (non-fatal)
+  try {
+    const savedPayment = invoice.payments[invoice.payments.length - 1]
+    const syncResult = await syncInvoicePayment(invoice, savedPayment, {
+      userId: req.user?.id ?? req.user?._id ?? null,
+    })
+    console.log('[addPayment] Sync transaction:', syncResult)
+  } catch (syncErr) {
+    console.error('[addPayment] Sync transaction lỗi (non-fatal):', syncErr.message)
+  }
 
   let allocations = []
   if (invoice.bookingId && type === 'payment') {

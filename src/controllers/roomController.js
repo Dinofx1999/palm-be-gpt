@@ -3,9 +3,12 @@ const Booking = require('../models/Booking');
 
 // ── Tính trạng thái động theo booking.status ──────────
 // ⭐ FIX 14/05/2026:
-//   - Phòng có booking SẮP TỚI (now < checkIn) → 'available' (vẫn trống)
-//     Trước đây trả 'reserved' → user thấy "Đã đặt" ngay từ hôm trước
-//   - Thông tin booking sắp tới được gắn vào field `upcomingBooking` riêng
+//   - Booking SẮP TỚI HÔM NAY (cùng ngày, chưa tới giờ CI) → 'reserved' ("Đã đặt")
+//     Vd: now=16:13 14/05, checkIn=17:00 14/05 → "Đã đặt" (chỉ còn 47 phút nữa)
+//   - Booking NGÀY KHÁC sau hôm nay → 'available' + upcomingBooking (badge 📅)
+//     Vd: now=14/05, checkIn=15/05 → vẫn TRỐNG, có khách sắp đến mai
+//   - Booking ĐÃ CHECK-IN → 'occupied' (bất kể giờ)
+//   - Booking quá giờ checkOut nhưng chưa CO → 'checkout'
 const computeRealStatus = (room, activeBooking, subRoom = null) => {
   if (room.roomStatus === 'maintenance') return 'maintenance'
   if (room.roomStatus === 'inactive')    return 'cleaning'
@@ -29,9 +32,15 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
     const refCheckIn  = new Date(subRoom?.checkIn  ?? activeBooking.checkIn)
     const refCheckOut = new Date(subRoom?.checkOut ?? activeBooking.checkOut)
 
-    // ⭐ NEW: Nếu CHƯA tới giờ check-in → phòng vẫn TRỐNG
-    //   (booking là upcoming, chưa ảnh hưởng đến trạng thái phòng hiện tại)
-    if (now < refCheckIn) {
+    // ⭐ NEW: Kiểm tra booking có rơi vào HÔM NAY không
+    //   - Cùng ngày dương lịch với now → "đã đặt cho hôm nay" → realStatus='reserved'
+    //   - Ngày sau hôm nay → "đặt cho ngày khác" → realStatus='available' (sẽ gắn upcomingBooking)
+    const today    = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000)
+    const isToday  = refCheckIn >= today && refCheckIn < tomorrow
+
+    if (now < refCheckIn && !isToday) {
+      // Booking cho NGÀY KHÁC sau hôm nay → phòng vẫn TRỐNG
       return 'available'
     }
 
@@ -39,8 +48,9 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
     // (lỗi nghiệp vụ: lễ tân quên đổi sang checked_out) → coi như checkout
     if (now >= refCheckOut) return 'checkout'
 
-    // now ∈ [checkIn, checkOut] mà chưa checked_in → "reserved" hợp lệ
-    //   (vd khách đã đến trong khung giờ nhưng lễ tân chưa bấm CI)
+    // Các case còn lại đều là 'reserved':
+    //   - now < refCheckIn && isToday → đã đặt cho hôm nay, chưa tới giờ
+    //   - now >= refCheckIn && now < refCheckOut → đã tới giờ, chưa CI
     return 'reserved'
   }
 
@@ -128,9 +138,17 @@ const getAll = async (req, res, next) => {
         }
 
         const refCheckIn = new Date(subRoom?.checkIn ?? bk.checkIn)
-        // ⭐ Booking sắp tới: status reserved/confirmed VÀ chưa tới giờ check-in
+
+        // ⭐ FIX 14/05/2026: Booking sắp tới = ngày KHÁC sau hôm nay
+        //   - Cùng ngày hôm nay (dù chưa tới giờ CI) → currentMap → realStatus='reserved'
+        //   - Ngày khác sau hôm nay → upcomingMap → realStatus='available' + badge 📅
+        const today    = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+        const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000)
+        const isCheckInToday = refCheckIn >= today && refCheckIn < tomorrow
+
         const isUpcoming = (effectiveStatus === 'reserved' || effectiveStatus === 'confirmed')
                           && now < refCheckIn
+                          && !isCheckInToday   // ⭐ Booking hôm nay KHÔNG phải upcoming
 
         if (isUpcoming) {
           // Gắn vào upcomingMap — pick booking gần nhất (checkIn sớm nhất)
@@ -139,7 +157,7 @@ const getAll = async (req, res, next) => {
             upcomingMap[rid] = { booking: bk, subRoom }
           }
         } else {
-          // Booking hiện tại (checked_in hoặc đã tới giờ check-in)
+          // Booking hiện tại (checked_in, đã tới giờ CI, HOẶC đã đặt cho hôm nay)
           if (!currentMap[rid]) {
             currentMap[rid] = { booking: bk, subRoom }
           } else {
@@ -265,8 +283,15 @@ const getOne = async (req, res, next) => {
 
       const effectiveStatus = subRoom?.status ?? bk.status
       const refCheckIn = new Date(subRoom?.checkIn ?? bk.checkIn)
+
+      // ⭐ FIX 14/05/2026: Booking hôm nay (chưa tới giờ CI) KHÔNG phải upcoming
+      const today    = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+      const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000)
+      const isCheckInToday = refCheckIn >= today && refCheckIn < tomorrow
+
       const isUpcoming = (effectiveStatus === 'reserved' || effectiveStatus === 'confirmed')
                         && now < refCheckIn
+                        && !isCheckInToday   // ⭐ Booking hôm nay → current, không phải upcoming
 
       if (isUpcoming) {
         // Pick booking gần nhất

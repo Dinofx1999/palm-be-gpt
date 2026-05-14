@@ -23,6 +23,10 @@ const Branch      = require('../models/Branch');
 const Customer    = require('../models/Customer');
 const Invoice     = require('../models/Invoice');
 const PricePolicy = require('../models/PricePolicy');
+// ⭐ NEW 14/05/2026: 3 models bổ sung cho AI tra cứu
+const User          = require('../models/User');
+const Amenity       = require('../models/Amenity');
+const PaymentMethod = require('../models/PaymentMethod');
 
 // ⭐ Dùng cùng calculator như booking thật → giá khớp 100%
 const { calculatePrice } = require('../utils/priceCalculator');
@@ -492,38 +496,41 @@ const tools = [{
     // ════════════════════════════════════════
     {
       name: 'get_my_salary',
-      description: 'Xem lương cá nhân của user đang chat (hoặc của 1 user khác nếu có quyền). Dùng khi user hỏi "lương em tháng này", "lương của em bao nhiêu", "lương tháng X năm Y". Mặc định lấy của bản thân user đang chat. Admin/Manager có thể truyền targetUserId để xem của người khác. Internal only.',
+      description: 'Xem lương cá nhân của user đang chat HOẶC của nhân viên khác (chỉ Admin/Manager). Trigger: "lương em tháng này", "lương của em", "lương Nguyễn Phi Linh tháng này", "lương nhân viên X". Mặc định = bản thân. Admin/Manager truyền employeeName để tìm theo tên, hoặc targetUserId nếu có ID. Internal only.',
       parameters: {
         type: 'object',
         properties: {
           year:  { type: 'number', description: 'Năm (mặc định năm hiện tại)' },
           month: { type: 'number', description: 'Tháng 1-12 (mặc định tháng hiện tại)' },
-          targetUserId: { type: 'string', description: 'ID user cần xem (chỉ Admin/Manager). Bỏ qua nếu xem của bản thân.' },
+          targetUserId: { type: 'string', description: 'Mongo ObjectId của user cần xem (chỉ Admin/Manager). Bỏ qua nếu xem bản thân.' },
+          employeeName: { type: 'string', description: 'Tên nhân viên cần xem (chỉ Admin/Manager). Vd: "Nguyễn Phi Linh", "Linh", "Phi Linh". Tool sẽ tự search trong DB. Bỏ qua nếu xem bản thân.' },
         },
       },
     },
 
     {
       name: 'get_my_kpi',
-      description: 'Xem chi tiết KPI realtime: doanh thu hiện tại, target, % đạt được, tiers thưởng, số ngày còn lại để đạt mục tiêu, doanh thu/ngày cần làm. Dùng khi user hỏi "em đạt KPI bao nhiêu", "KPI tháng này", "% KPI của em", "em còn cách target bao xa". Internal only.',
+      description: 'Xem chi tiết KPI realtime của BẢN THÂN hoặc nhân viên khác (Admin/Manager): doanh thu hiện tại, target, % đạt, tiers thưởng, số ngày còn lại. Trigger: "KPI em đạt bao nhiêu", "% KPI tháng này", "KPI của Linh". Internal only. ⚠️ Đối với Admin (không có KPI cá nhân) → KHÔNG gọi tool này nếu user hỏi "KPI của tôi/em".',
       parameters: {
         type: 'object',
         properties: {
           year:  { type: 'number' },
           month: { type: 'number' },
-          targetUserId: { type: 'string', description: 'Admin/Manager có thể xem của user khác' },
+          targetUserId: { type: 'string', description: 'Admin/Manager xem KPI của user khác' },
+          employeeName: { type: 'string', description: 'Tên nhân viên (Admin/Manager). Vd: "Nguyễn Phi Linh"' },
         },
       },
     },
 
     {
       name: 'get_salary_history',
-      description: 'Xem lịch sử lương N tháng gần đây (mặc định 6 tháng). Dùng khi user hỏi "lương 3 tháng vừa rồi", "lịch sử lương", "lương các tháng trước", "lương từ đầu năm". Trả về data từng tháng + summary (TB tháng, tỉ lệ đạt KPI). Internal only.',
+      description: 'Lịch sử lương N tháng gần đây của bản thân hoặc nhân viên khác. Trigger: "lương 3 tháng vừa rồi", "lịch sử lương Linh", "lương các tháng trước". Internal only.',
       parameters: {
         type: 'object',
         properties: {
           months: { type: 'number', description: 'Số tháng quay lui (1-12, mặc định 6)' },
           targetUserId: { type: 'string', description: 'Admin/Manager xem của user khác' },
+          employeeName: { type: 'string', description: 'Tên nhân viên (Admin/Manager)' },
         },
       },
     },
@@ -537,6 +544,17 @@ const tools = [{
           year:  { type: 'number' },
           month: { type: 'number' },
           branchName: { type: 'string', description: 'Tên branch (Manager tự lọc theo branch của mình, không cần truyền)' },
+        },
+      },
+    },
+
+    {
+      name: 'get_branch_kpi_config',
+      description: 'Xem CẤU HÌNH KPI MỤC TIÊU của chi nhánh: target doanh thu tháng, % thưởng cơ bản cho từng role, các tier vượt mức, và doanh thu thực tế hiện tại của branch. Dùng khi user hỏi "KPI mục tiêu chi nhánh", "target chi nhánh tháng này", "doanh thu mục tiêu", "KPI tháng này của chi nhánh bao nhiêu", "chi nhánh cần đạt bao nhiêu". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          branchName: { type: 'string', description: 'Tên chi nhánh (Admin chỉ định, Manager tự lọc)' },
         },
       },
     },
@@ -565,6 +583,34 @@ const tools = [{
           year:  { type: 'number' },
           month: { type: 'number' },
           targetUserId: { type: 'string', description: 'Admin/Manager: gợi ý cho user khác' },
+        },
+      },
+    },
+
+    // ⭐ NEW 14/05/2026: Lương ứng + Phạt — granular
+    {
+      name: 'get_my_advances',
+      description: 'Chi tiết các lần ỨNG LƯƠNG trong tháng + tổng số tiền đã ứng. Của bản thân HOẶC nhân viên khác (Admin/Manager). Trigger: "em đã ứng bao nhiêu", "lương ứng tháng này", "Linh đã ứng bao nhiêu". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number', description: 'Năm (mặc định: hiện tại)' },
+          month: { type: 'number', description: 'Tháng (mặc định: hiện tại)' },
+          targetUserId: { type: 'string', description: 'Admin/Manager xem của user khác' },
+          employeeName: { type: 'string', description: 'Tên nhân viên (Admin/Manager)' },
+        },
+      },
+    },
+    {
+      name: 'get_my_penalties',
+      description: 'Chi tiết các khoản PHẠT trong tháng + tổng tiền phạt + breakdown theo type/severity. Của bản thân HOẶC nhân viên khác (Admin/Manager). Trigger: "em bị phạt bao nhiêu", "Linh bị phạt mấy lần", "lý do em bị trừ tiền". Internal only.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number', description: 'Năm (mặc định: hiện tại)' },
+          month: { type: 'number', description: 'Tháng (mặc định: hiện tại)' },
+          targetUserId: { type: 'string', description: 'Admin/Manager xem của user khác' },
+          employeeName: { type: 'string', description: 'Tên nhân viên (Admin/Manager)' },
         },
       },
     },
@@ -655,6 +701,140 @@ const tools = [{
           },
           branchName: { type: 'string', description: 'Tên/mã chi nhánh' },
           maxImages: { type: 'number', description: 'Số ảnh tối đa trả về (mặc định 6, tối đa 12)' },
+        },
+      },
+    },
+
+    // ════════════════════════════════════════════════════════════
+    // ⭐ NEW 14/05/2026: TOOLS BỔ SUNG — Customer, Amenity, PaymentMethod, User
+    // ════════════════════════════════════════════════════════════
+
+    // ── CUSTOMER (4 tools) ────────────────────────────────────────
+    {
+      name: 'find_customers',
+      description: 'Tìm khách hàng trong DB theo tên, SĐT, hoặc email. Dùng khi user hỏi "khách Nguyễn Văn A đã từng ở chưa", "tra số 090...", "khách hàng tên X". CHỈ internal. Hỗ trợ search partial.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Tên / SĐT / email cần tìm (search partial, case-insensitive)' },
+          limit: { type: 'number', description: 'Số kết quả tối đa (mặc định 10, tối đa 20)' },
+        },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'get_customer_detail',
+      description: 'Chi tiết 1 khách hàng + LỊCH SỬ booking (5 gần nhất). CHỈ internal. Tìm theo customerId hoặc phone. Trả về tổng số booking, tổng chi tiêu, ngày booking gần nhất.',
+      parameters: {
+        type: 'object',
+        properties: {
+          customerId: { type: 'string', description: 'Mongo _id của khách hàng' },
+          phone:      { type: 'string', description: 'SĐT khách hàng (exact match)' },
+        },
+      },
+    },
+    {
+      name: 'get_top_customers',
+      description: 'Top khách VIP — sắp xếp theo tổng chi tiêu hoặc số booking trong khoảng thời gian. Dùng khi user hỏi "khách thân thiết", "VIP", "top spender", "khách quay lại nhiều nhất". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sortBy: { type: 'string', description: 'Sắp xếp theo: "spending" (tổng chi tiêu, mặc định) hoặc "bookings" (số booking)' },
+          limit:  { type: 'number', description: 'Top N (mặc định 10, tối đa 30)' },
+          days:   { type: 'number', description: 'Khoảng thời gian xét (số ngày gần đây, mặc định 90)' },
+        },
+      },
+    },
+    {
+      name: 'get_customer_stats',
+      description: 'Thống kê tổng quát khách hàng: tổng số khách trong DB, khách mới tháng này, repeat rate (% khách quay lại). CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: 'Khoảng "khách mới" (mặc định 30 ngày)' },
+        },
+      },
+    },
+
+    // ── AMENITY (1 tool) ──────────────────────────────────────────
+    {
+      name: 'list_amenities',
+      description: 'Liệt kê tiện nghi (amenities) đang active trong hệ thống, group theo category. Dùng khi user hỏi "khách sạn có wifi không", "có máy lạnh", "tiện nghi phòng Deluxe có gì", "danh sách tiện nghi". Cả internal + external dùng được.',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', description: 'Lọc theo danh mục (vd "Phòng ngủ", "Phòng tắm", "Tiện ích", "Không gian", "Dịch vụ"). Bỏ qua = lấy tất cả.' },
+        },
+      },
+    },
+
+    // ── PAYMENT METHOD (1 tool) ──────────────────────────────────
+    {
+      name: 'list_payment_methods',
+      description: 'Danh sách phương thức thanh toán active (tiền mặt, chuyển khoản, thẻ, ví điện tử...). Dùng khi user hỏi "có nhận chuyển khoản không", "thanh toán bằng gì", "có quẹt thẻ không". Cả internal + external.',
+      parameters: { type: 'object', properties: {} },
+    },
+
+    // ── USER / STAFF (2 tools — Admin/Manager only) ──────────────
+    {
+      name: 'find_users',
+      description: 'Tìm nhân viên trong hệ thống theo tên, username, role, branch. CHỈ Admin/Manager. Dùng khi user hỏi "có những lễ tân nào ở chi nhánh X", "danh sách nhân viên role Receptionist", "tìm staff Nguyễn".',
+      parameters: {
+        type: 'object',
+        properties: {
+          query:      { type: 'string', description: 'Tên hoặc username cần tìm (partial)' },
+          role:       { type: 'string', description: 'Lọc theo role: Admin / Manager / Receptionist / Staff' },
+          branchName: { type: 'string', description: 'Lọc theo tên chi nhánh' },
+          isActive:   { type: 'boolean', description: 'Lọc trạng thái: true = đang hoạt động, false = đã khoá' },
+          limit:      { type: 'number', description: 'Tối đa kết quả (mặc định 20)' },
+        },
+      },
+    },
+    {
+      name: 'get_user_stats',
+      description: 'Thống kê tổng quát nhân viên: tổng số, breakdown theo role, theo branch, số đang active vs khoá. CHỈ Admin/Manager.',
+      parameters: { type: 'object', properties: {} },
+    },
+
+    // ⭐ NEW 14/05/2026: Tools cho module Thu/Chi + Ca trực + Đối soát
+    {
+      name: 'get_current_shift',
+      description: 'Xem ca trực đang mở của bản thân: tiền mặt đã thu, tiền chuyển khoản, tổng giao dịch, tiền dự kiến cuối ca. Trigger: "Em đang trực ca nào", "Ca em đang mở", "Em thu được bao nhiêu", "Tổng tiền ca em hôm nay", "Tiền mặt em đang giữ". Internal only.',
+      parameters: { type: 'object', properties: {} },
+    },
+    {
+      name: 'get_today_cash_flow',
+      description: 'Tổng quan dòng tiền hôm nay của chi nhánh: tổng thu, tổng chi, theo từng phương thức (tiền mặt/CK/thẻ). Trigger: "Hôm nay thu được bao nhiêu", "Doanh thu hôm nay", "Hôm nay chi bao nhiêu", "Tiền mặt hôm nay", "Tổng thu chi ngày X". Admin/Manager/Receptionist xem được.',
+      parameters: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: 'Ngày cần xem (YYYY-MM-DD, mặc định hôm nay)' },
+          branchName: { type: 'string', description: 'Tên chi nhánh (Admin tuỳ chọn)' },
+        },
+      },
+    },
+    {
+      name: 'find_cash_discrepancy',
+      description: 'Tìm các ca có chênh lệch tiền (cash hoặc bank) trong khoảng thời gian. Trigger: "Có ca nào thiếu tiền không", "Ca nào chênh lệch tháng này", "Ai làm thiếu tiền", "Có sai sót tiền không". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          fromDate: { type: 'string', description: 'YYYY-MM-DD (mặc định đầu tháng)' },
+          toDate: { type: 'string', description: 'YYYY-MM-DD (mặc định hôm nay)' },
+          minDifference: { type: 'number', description: 'Chỉ tìm ca chênh lệch lớn hơn (vnd, mặc định 0 = tìm tất cả)' },
+          branchName: { type: 'string', description: 'Admin tuỳ chọn' },
+        },
+      },
+    },
+    {
+      name: 'get_reconciliation_status',
+      description: 'Xem trạng thái đối soát tháng/kỳ: đã đối soát chưa, có chênh lệch không, số tiền chênh lệch. Trigger: "Tháng này đã đối soát chưa", "Đối soát tháng X thế nào", "Có chênh lệch không". CHỈ Admin/Manager.',
+      parameters: {
+        type: 'object',
+        properties: {
+          year:  { type: 'number' },
+          month: { type: 'number' },
+          branchName: { type: 'string' },
         },
       },
     },
@@ -1765,6 +1945,19 @@ const makeHandlers = (ctx) => ({
       .limit(Math.min(limit, 50))
       .lean();
 
+    // ⭐ FIX 14/05/2026: Format datetime VN timezone (UTC+7) trước khi trả
+    const fmtVN = (d) => {
+      if (!d) return null;
+      const dt = new Date(d);
+      if (isNaN(dt.getTime())) return null;
+      return dt.toLocaleString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+      });
+    };
+
     return {
       scope: branchId ? 'Theo chi nhánh' : 'Tất cả chi nhánh',
       count: bookings.length,
@@ -1778,6 +1971,9 @@ const makeHandlers = (ctx) => ({
         branch: b.branchId?.name,
         checkIn: b.checkIn,
         checkOut: b.checkOut,
+        // ⭐ NEW: dùng các field này để hiển thị cho user
+        checkInFormatted:  fmtVN(b.checkIn),
+        checkOutFormatted: fmtVN(b.checkOut),
         status: b.status,
         paymentStatus: b.paymentStatus,
         nights: b.nights,
@@ -1841,6 +2037,23 @@ const makeHandlers = (ctx) => ({
 
     if (!b) return { error: 'Không tìm thấy booking phù hợp' };
 
+    // ⭐ FIX 14/05/2026: Format datetime ở VN timezone (UTC+7) trước khi trả về tool.
+    //   Trước đây: trả Date object ISO raw → AI tự render bằng toLocaleString JS server,
+    //   nhưng node default UTC → kết quả lệch 7h so với giờ user mong đợi.
+    //   Giải pháp: format sẵn ở VN timezone, AI chỉ việc hiển thị y nguyên.
+    const fmtVN = (d) => {
+      if (!d) return null;
+      const dt = new Date(d);
+      if (isNaN(dt.getTime())) return null;
+      // Asia/Ho_Chi_Minh — luôn UTC+7, không daylight saving
+      return dt.toLocaleString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+      });
+    };
+
     return {
       // ⭐ MÃ ĐẶT PHÒNG để AI hiển thị cho user
       bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
@@ -1853,10 +2066,16 @@ const makeHandlers = (ctx) => ({
       isGroup: b.isGroup,
       groupName: b.groupName,
       roomCount: b.isGroup ? (b.rooms?.length || 0) : 1,
+      // ⭐ KEEP raw ISO để FE cần tính toán có thể dùng
       checkIn: b.checkIn,
       checkOut: b.checkOut,
       actualCheckIn: b.actualCheckIn,
       actualCheckOut: b.actualCheckOut,
+      // ⭐ NEW: Field *Formatted để AI hiển thị TRỰC TIẾP cho user (không tự convert)
+      checkInFormatted:       fmtVN(b.checkIn),
+      checkOutFormatted:      fmtVN(b.checkOut),
+      actualCheckInFormatted:  fmtVN(b.actualCheckIn),
+      actualCheckOutFormatted: fmtVN(b.actualCheckOut),
       status: b.status,
       paymentStatus: b.paymentStatus,
       nights: b.nights,
@@ -1872,6 +2091,8 @@ const makeHandlers = (ctx) => ({
         room: sr.roomNumber,
         status: sr.status,
         amount: fmt(sr.roomAmount || 0),
+        checkInFormatted:  fmtVN(sr.checkIn),
+        checkOutFormatted: fmtVN(sr.checkOut),
       })) : undefined,
     };
   },
@@ -2694,12 +2915,25 @@ const makeHandlers = (ctx) => ({
     return salaryAnalytics.getBranchKPIOverview({ ...args, ctx });
   },
 
+  async get_branch_kpi_config(args) {
+    return salaryAnalytics.getBranchKpiConfig({ ...args, ctx });
+  },
+
   async get_top_employees(args) {
     return salaryAnalytics.getTopEmployees({ ...args, ctx });
   },
 
   async get_kpi_improvement_suggestions(args) {
     return salaryAnalytics.getKPIImprovementSuggestions({ ...args, ctx });
+  },
+
+  // ⭐ NEW 14/05/2026: Lương ứng + phạt (chi tiết)
+  async get_my_advances(args) {
+    return salaryAnalytics.getMyAdvances({ ...args, ctx });
+  },
+
+  async get_my_penalties(args) {
+    return salaryAnalytics.getMyPenalties({ ...args, ctx });
   },
 
   // ── 8. Tìm khách hàng ──
@@ -3084,6 +3318,694 @@ const makeHandlers = (ctx) => ({
       // ⭐ Hint cho AI biết cách format ảnh
       _hint: 'Hiển thị ảnh trong markdown: ![Phòng X](url). Có thể đặt 2-3 ảnh liên tiếp, mỗi ảnh xuống dòng riêng.',
     };
+  },
+
+  // ════════════════════════════════════════════════════════════
+  // ⭐ NEW 14/05/2026: HANDLERS BỔ SUNG — Customer, Amenity, PaymentMethod, User
+  // ════════════════════════════════════════════════════════════
+
+  // ── CUSTOMER (4 handlers) ─────────────────────────────────────
+  async find_customers({ query, limit = 10 }) {
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Khách hàng không xem được dữ liệu này ạ.' };
+    }
+    if (!query || query.trim().length < 2) {
+      return { error: 'Cần ít nhất 2 ký tự để search' };
+    }
+    const lim = Math.min(+limit || 10, 20);
+    const customers = await Customer.find({
+      $or: [
+        { name:  { $regex: query, $options: 'i' } },
+        { phone: { $regex: query, $options: 'i' } },
+        { email: { $regex: query, $options: 'i' } },
+      ],
+    })
+      .select('_id name phone email idCard nationality notes createdAt')
+      .sort({ createdAt: -1 })
+      .limit(lim)
+      .lean();
+
+    return {
+      count: customers.length,
+      query,
+      customers: customers.map(c => ({
+        customerId: String(c._id),
+        name:        c.name,
+        phone:       c.phone,
+        email:       c.email || null,
+        idCard:      c.idCard || null,
+        nationality: c.nationality || null,
+        notes:       c.notes || null,
+        createdAt:   c.createdAt,
+      })),
+    };
+  },
+
+  async get_customer_detail({ customerId, phone }) {
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Khách hàng không xem được dữ liệu này ạ.' };
+    }
+    if (!customerId && !phone) {
+      return { error: 'Cần customerId hoặc phone' };
+    }
+
+    let customer;
+    if (customerId && mongoose.Types.ObjectId.isValid(customerId)) {
+      customer = await Customer.findById(customerId).lean();
+    }
+    if (!customer && phone) {
+      customer = await Customer.findOne({ phone: String(phone).trim() }).lean();
+    }
+    if (!customer) return { error: 'Không tìm thấy khách hàng' };
+
+    // ⭐ Lấy lịch sử booking — match qua customerPhone (Booking lưu phone snapshot)
+    const bookingFilter = { customerPhone: customer.phone };
+    if (ctx.role !== 'Admin' && ctx.userBranchId) {
+      bookingFilter.branchId = ctx.userBranchId;
+    }
+
+    const recentBookings = await Booking.find(bookingFilter)
+      .select('_id bookingCode roomNumber roomType checkIn checkOut status totalAmount nights branchId')
+      .populate('branchId', 'name')
+      .sort({ checkIn: -1 })
+      .limit(5)
+      .lean();
+
+    // Aggregate tổng thống kê
+    const allBookings = await Booking.find({
+      ...bookingFilter,
+      status: { $in: ['checked_in', 'checked_out', 'confirmed', 'reserved'] },
+    })
+      .select('totalAmount status nights')
+      .lean();
+
+    const totalBookings  = allBookings.length;
+    const totalSpending  = allBookings
+      .filter(b => b.status === 'checked_out')
+      .reduce((sum, b) => sum + (b.totalAmount || 0), 0);
+    const totalNights    = allBookings
+      .filter(b => b.status === 'checked_out')
+      .reduce((sum, b) => sum + (b.nights || 0), 0);
+    const completedCount = allBookings.filter(b => b.status === 'checked_out').length;
+    const cancelledCount = await Booking.countDocuments({ ...bookingFilter, status: 'cancelled' });
+
+    const fmtVN = (d) => {
+      if (!d) return null;
+      return new Date(d).toLocaleString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+        hour12: false,
+      });
+    };
+
+    return {
+      customerId:  String(customer._id),
+      name:        customer.name,
+      phone:       customer.phone,
+      email:       customer.email || null,
+      idCard:      customer.idCard || null,
+      nationality: customer.nationality || null,
+      notes:       customer.notes || null,
+      createdAt:   customer.createdAt,
+      stats: {
+        totalBookings,
+        completedBookings: completedCount,
+        cancelledBookings: cancelledCount,
+        totalSpending,
+        totalSpendingFormatted: fmt(totalSpending),
+        totalNights,
+        isRepeat: completedCount >= 2,        // Đánh dấu khách quay lại
+        isVIP:    totalSpending >= 5_000_000,  // VIP nếu chi tiêu > 5tr
+      },
+      recentBookings: recentBookings.map(b => ({
+        bookingCode: b.bookingCode || `BK_${String(b._id).slice(-6).toUpperCase()}`,
+        bookingId:   String(b._id),
+        room:        b.roomNumber,
+        roomType:    b.roomType,
+        branch:      b.branchId?.name,
+        checkIn:     b.checkIn,
+        checkOut:    b.checkOut,
+        checkInFormatted:  fmtVN(b.checkIn),
+        checkOutFormatted: fmtVN(b.checkOut),
+        status:      b.status,
+        nights:      b.nights,
+        totalAmount: b.totalAmount,
+        totalFormatted: fmt(b.totalAmount || 0),
+      })),
+    };
+  },
+
+  async get_top_customers({ sortBy = 'spending', limit = 10, days = 90 }) {
+    // ⭐ Chỉ Admin/Manager (analytics permission)
+    if (!ctx.isInternal || (ctx.role !== 'Admin' && ctx.role !== 'Manager')) {
+      return {
+        error: 'forbidden',
+        message: 'Tính năng top khách hàng chỉ dành cho Admin/Manager ạ.',
+      };
+    }
+
+    const lim = Math.min(+limit || 10, 30);
+    const since = new Date();
+    since.setDate(since.getDate() - (+days || 90));
+
+    const matchStage = {
+      status: 'checked_out',
+      checkOut: { $gte: since },
+    };
+    if (ctx.role !== 'Admin' && ctx.userBranchId) {
+      matchStage.branchId = new mongoose.Types.ObjectId(ctx.userBranchId);
+    }
+
+    const sortField = sortBy === 'bookings' ? 'bookingCount' : 'totalSpent';
+
+    const top = await Booking.aggregate([
+      { $match: matchStage },
+      {
+        $group: {
+          _id:           '$customerPhone',
+          customerName:  { $last: '$customerName' },
+          customerPhone: { $last: '$customerPhone' },
+          totalSpent:    { $sum: '$totalAmount' },
+          bookingCount:  { $sum: 1 },
+          totalNights:   { $sum: '$nights' },
+          lastBooking:   { $max: '$checkOut' },
+        },
+      },
+      { $match: { _id: { $ne: null } } },        // Loại booking không có phone
+      { $sort: { [sortField]: -1 } },
+      { $limit: lim },
+    ]);
+
+    return {
+      sortBy,
+      period: `${days} ngày gần đây`,
+      count:  top.length,
+      customers: top.map((c, i) => ({
+        rank:          i + 1,
+        name:          c.customerName || '(không tên)',
+        phone:         c.customerPhone,
+        totalSpent:    c.totalSpent,
+        totalSpentFormatted: fmt(c.totalSpent || 0),
+        bookingCount:  c.bookingCount,
+        totalNights:   c.totalNights,
+        lastBooking:   c.lastBooking,
+      })),
+    };
+  },
+
+  async get_customer_stats({ days = 30 }) {
+    if (!ctx.isInternal || (ctx.role !== 'Admin' && ctx.role !== 'Manager')) {
+      return {
+        error: 'forbidden',
+        message: 'Thống kê khách hàng chỉ dành cho Admin/Manager ạ.',
+      };
+    }
+
+    const since = new Date();
+    since.setDate(since.getDate() - (+days || 30));
+
+    const totalCustomers = await Customer.countDocuments({});
+    const newCustomers   = await Customer.countDocuments({ createdAt: { $gte: since } });
+
+    // Repeat rate: % khách có >= 2 booking
+    const bookingFilter = { status: 'checked_out' };
+    if (ctx.role !== 'Admin' && ctx.userBranchId) {
+      bookingFilter.branchId = new mongoose.Types.ObjectId(ctx.userBranchId);
+    }
+    const customerBookingCounts = await Booking.aggregate([
+      { $match: bookingFilter },
+      { $group: { _id: '$customerPhone', count: { $sum: 1 } } },
+      { $match: { _id: { $ne: null } } },
+    ]);
+    const totalWithBookings = customerBookingCounts.length;
+    const repeatCustomers   = customerBookingCounts.filter(c => c.count >= 2).length;
+    const repeatRate        = totalWithBookings > 0
+      ? Math.round((repeatCustomers / totalWithBookings) * 100)
+      : 0;
+
+    return {
+      totalCustomers,
+      newCustomers,
+      newCustomersPeriod:  `${days} ngày gần đây`,
+      repeatCustomers,
+      totalWithBookings,
+      repeatRate,
+      repeatRateFormatted: `${repeatRate}%`,
+    };
+  },
+
+  // ── AMENITY (1 handler) ───────────────────────────────────────
+  async list_amenities({ category }) {
+    const filter = { isActive: true };
+    if (category) filter.category = category;
+
+    const list = await Amenity.find(filter)
+      .select('name category icon description')
+      .sort({ category: 1, name: 1 })
+      .lean();
+
+    // Group theo category cho dễ hiển thị
+    const grouped = list.reduce((acc, a) => {
+      const cat = a.category || 'Khác';
+      if (!acc[cat]) acc[cat] = [];
+      acc[cat].push({
+        name:        a.name,
+        icon:        a.icon || '⭐',
+        description: a.description || null,
+      });
+      return acc;
+    }, {});
+
+    return {
+      total:      list.length,
+      categories: Object.keys(grouped),
+      grouped,
+      // Flat list cũng tiện
+      amenities: list.map(a => ({
+        name:        a.name,
+        category:    a.category,
+        icon:        a.icon || '⭐',
+        description: a.description || null,
+      })),
+    };
+  },
+
+  // ── PAYMENT METHOD (1 handler) ────────────────────────────────
+  async list_payment_methods() {
+    const list = await PaymentMethod.find({ isActive: true })
+      .select('name type description icon')
+      .sort({ name: 1 })
+      .lean();
+
+    return {
+      count: list.length,
+      methods: list.map(m => ({
+        name:        m.name,
+        type:        m.type,
+        icon:        m.icon || '💳',
+        description: m.description || null,
+      })),
+    };
+  },
+
+  // ── USER / STAFF (2 handlers) ─────────────────────────────────
+  async find_users({ query, role, branchName, isActive, limit = 20 }) {
+    // ⭐ Chỉ Admin/Manager xem được nhân viên khác
+    if (!ctx.isInternal || (ctx.role !== 'Admin' && ctx.role !== 'Manager')) {
+      return {
+        error: 'forbidden',
+        message: 'Tìm kiếm nhân viên chỉ dành cho Admin/Manager ạ.',
+      };
+    }
+
+    const filter = {};
+    if (query) {
+      filter.$or = [
+        { fullName: { $regex: query, $options: 'i' } },
+        { username: { $regex: query, $options: 'i' } },
+        { email:    { $regex: query, $options: 'i' } },
+      ];
+    }
+    if (role) filter.role = role;
+    if (isActive !== undefined) filter.isActive = isActive;
+
+    // Manager: chỉ thấy nhân viên cùng branch
+    if (ctx.role === 'Manager' && ctx.userBranchId) {
+      filter.branchId = ctx.userBranchId;
+    }
+    // Filter theo branchName
+    if (branchName) {
+      const br = await Branch.findOne({
+        $or: [
+          { name:      { $regex: branchName, $options: 'i' } },
+          { shortName: { $regex: branchName, $options: 'i' } },
+        ],
+      }).select('_id name').lean();
+      if (br) filter.branchId = br._id;
+    }
+
+    const lim = Math.min(+limit || 20, 50);
+    const users = await User.find(filter)
+      .select('_id username fullName email phone role branchId branchName isActive createdAt')
+      .populate('branchId', 'name')
+      .sort({ role: 1, fullName: 1 })
+      .limit(lim)
+      .lean();
+
+    return {
+      count: users.length,
+      users: users.map(u => ({
+        userId:    String(u._id),
+        username:  u.username,
+        fullName:  u.fullName,
+        email:     u.email,
+        phone:     u.phone || null,
+        role:      u.role,
+        branch:    u.branchId?.name || u.branchName || null,
+        isActive:  u.isActive,
+        createdAt: u.createdAt,
+      })),
+    };
+  },
+
+  async get_user_stats() {
+    if (!ctx.isInternal || (ctx.role !== 'Admin' && ctx.role !== 'Manager')) {
+      return {
+        error: 'forbidden',
+        message: 'Thống kê nhân viên chỉ dành cho Admin/Manager ạ.',
+      };
+    }
+
+    const filter = {};
+    if (ctx.role === 'Manager' && ctx.userBranchId) {
+      filter.branchId = ctx.userBranchId;
+    }
+
+    const all = await User.find(filter)
+      .select('role branchId branchName isActive')
+      .populate('branchId', 'name')
+      .lean();
+
+    // Breakdown theo role
+    const byRole = all.reduce((acc, u) => {
+      acc[u.role] = (acc[u.role] || 0) + 1;
+      return acc;
+    }, {});
+
+    // Breakdown theo branch
+    const byBranch = all.reduce((acc, u) => {
+      const branchName = u.branchId?.name || u.branchName || 'Chưa gán';
+      acc[branchName] = (acc[branchName] || 0) + 1;
+      return acc;
+    }, {});
+
+    const activeCount   = all.filter(u => u.isActive).length;
+    const inactiveCount = all.filter(u => !u.isActive).length;
+
+    return {
+      total:    all.length,
+      active:   activeCount,
+      inactive: inactiveCount,
+      byRole,
+      byBranch,
+      scope:    ctx.role === 'Manager' ? 'Trong chi nhánh của em' : 'Toàn hệ thống',
+    };
+  },
+
+  // ⭐ NEW 14/05/2026: Handlers cho 4 tools mới — Thu/Chi + Ca trực + Đối soát
+  // ───────────────────────────────────────────────────────────────────
+
+  // Tool: get_current_shift
+  async get_current_shift() {
+    if (!ctx.isInternal) {
+      return { error: 'internal_only', message: 'Tính năng này chỉ dành cho nhân viên ạ.' };
+    }
+    try {
+      const Shift = require('../models/Shift');
+      const shift = await Shift.findOne({ user: ctx.userId, status: 'open' })
+        .populate('user', 'fullName')
+        .populate('branchId', 'name')
+        .lean();
+
+      if (!shift) {
+        return {
+          hasOpenShift: false,
+          message: 'Em chưa mở ca nào ạ. Em có thể mở ca mới trong menu "Kế toán → Bàn giao ca".',
+        };
+      }
+
+      const summary = await Shift.computeShiftSummary(shift._id);
+      const expectedCash = (shift.openingCash || 0) + (summary.cashIn || 0) - (summary.cashOut || 0);
+      const expectedBank = (shift.openingBankBalance || 0) + (summary.transferIn || 0) + (summary.cardIn || 0) - (summary.transferOut || 0) - (summary.cardOut || 0);
+
+      const openedAt = new Date(shift.openedAt);
+      const now = new Date();
+      const hoursOpen = Math.floor((now - openedAt) / 3600000);
+      const minutesOpen = Math.floor(((now - openedAt) % 3600000) / 60000);
+
+      return {
+        hasOpenShift: true,
+        shiftCode: shift.shiftCode,
+        label: shift.label || '',
+        openedAt: shift.openedAt,
+        openedAtFormatted: openedAt.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
+        duration: `${hoursOpen}h ${minutesOpen}p`,
+        branchName: shift.branchId?.name,
+        openingCash: shift.openingCash,
+        openingCashFormatted: (shift.openingCash || 0).toLocaleString('vi-VN') + 'đ',
+        openingBank: shift.openingBankBalance,
+        openingBankFormatted: (shift.openingBankBalance || 0).toLocaleString('vi-VN') + 'đ',
+        summary: {
+          cashIn: summary.cashIn,
+          cashInFormatted: (summary.cashIn || 0).toLocaleString('vi-VN') + 'đ',
+          transferIn: summary.transferIn,
+          transferInFormatted: (summary.transferIn || 0).toLocaleString('vi-VN') + 'đ',
+          cardIn: summary.cardIn,
+          cardInFormatted: (summary.cardIn || 0).toLocaleString('vi-VN') + 'đ',
+          cashOut: summary.cashOut,
+          cashOutFormatted: (summary.cashOut || 0).toLocaleString('vi-VN') + 'đ',
+          totalIn: (summary.cashIn || 0) + (summary.transferIn || 0) + (summary.cardIn || 0),
+          totalInFormatted: ((summary.cashIn || 0) + (summary.transferIn || 0) + (summary.cardIn || 0)).toLocaleString('vi-VN') + 'đ',
+          transactionCount: summary.transactionCount,
+        },
+        expectedCash,
+        expectedCashFormatted: expectedCash.toLocaleString('vi-VN') + 'đ',
+        expectedBank,
+        expectedBankFormatted: expectedBank.toLocaleString('vi-VN') + 'đ',
+      };
+    } catch (err) {
+      console.error('[get_current_shift]', err);
+      return { error: err.message };
+    }
+  },
+
+  // Tool: get_today_cash_flow
+  async get_today_cash_flow({ date, branchName } = {}) {
+    if (!ctx.isInternal) {
+      return { error: 'internal_only', message: 'Tính năng này chỉ dành cho nhân viên ạ.' };
+    }
+    try {
+      const Transaction = require('../models/Transaction');
+      const mongoose = require('mongoose');
+
+      // Resolve date
+      const d = date ? new Date(date) : new Date();
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+
+      // Resolve branch
+      let bId = ctx.userBranchId;
+      if (ctx.role === 'Admin' && branchName) {
+        const Branch = require('../models/Branch');
+        const br = await Branch.findOne({
+          $or: [
+            { name: { $regex: branchName, $options: 'i' } },
+            { shortName: { $regex: branchName, $options: 'i' } },
+          ],
+        }).select('_id').lean();
+        if (br) bId = br._id;
+      }
+
+      const match = { occurredOn: { $gte: start, $lte: end } };
+      if (bId && mongoose.Types.ObjectId.isValid(bId)) {
+        match.branchId = new mongoose.Types.ObjectId(bId);
+      }
+
+      const agg = await Transaction.aggregate([
+        { $match: match },
+        { $group: {
+          _id: { type: '$type', paymentMethod: '$paymentMethod' },
+          total: { $sum: '$amount' },
+          count: { $sum: 1 },
+        }},
+      ]);
+
+      const result = {
+        date: d.toLocaleDateString('vi-VN'),
+        cashIn: 0, transferIn: 0, cardIn: 0, otherIn: 0,
+        cashOut: 0, transferOut: 0, cardOut: 0, otherOut: 0,
+        totalIn: 0, totalOut: 0, netCashFlow: 0,
+        transactionCount: 0,
+      };
+
+      for (const row of agg) {
+        const { type, paymentMethod } = row._id;
+        const pm = ['cash', 'transfer', 'card'].includes(paymentMethod) ? paymentMethod : 'other';
+        const key = type === 'income' ? `${pm}In` : `${pm}Out`;
+        result[key] = row.total;
+        if (type === 'income') result.totalIn += row.total;
+        else result.totalOut += row.total;
+        result.transactionCount += row.count;
+      }
+      result.netCashFlow = result.totalIn - result.totalOut;
+
+      return {
+        ...result,
+        cashInFormatted: result.cashIn.toLocaleString('vi-VN') + 'đ',
+        transferInFormatted: result.transferIn.toLocaleString('vi-VN') + 'đ',
+        cardInFormatted: result.cardIn.toLocaleString('vi-VN') + 'đ',
+        cashOutFormatted: result.cashOut.toLocaleString('vi-VN') + 'đ',
+        totalInFormatted: result.totalIn.toLocaleString('vi-VN') + 'đ',
+        totalOutFormatted: result.totalOut.toLocaleString('vi-VN') + 'đ',
+        netCashFlowFormatted: result.netCashFlow.toLocaleString('vi-VN') + 'đ',
+      };
+    } catch (err) {
+      console.error('[get_today_cash_flow]', err);
+      return { error: err.message };
+    }
+  },
+
+  // Tool: find_cash_discrepancy
+  async find_cash_discrepancy({ fromDate, toDate, minDifference = 0, branchName } = {}) {
+    if (!ctx.isInternal) {
+      return { error: 'internal_only', message: 'Tính năng này chỉ dành cho nhân viên ạ.' };
+    }
+    if (ctx.role !== 'Admin' && ctx.role !== 'Manager') {
+      return { error: 'forbidden', message: 'Chỉ Admin/Manager mới xem được ạ.' };
+    }
+    try {
+      const Shift = require('../models/Shift');
+      const mongoose = require('mongoose');
+
+      const filter = {
+        status: { $in: ['closed', 'handed_over', 'disputed'] },
+        $or: [
+          { cashDifference: { $ne: 0 } },
+          { bankDifference: { $ne: 0 } },
+        ],
+      };
+
+      if (ctx.role === 'Manager') {
+        filter.branchId = ctx.userBranchId;
+      } else if (ctx.role === 'Admin' && branchName) {
+        const Branch = require('../models/Branch');
+        const br = await Branch.findOne({
+          $or: [
+            { name: { $regex: branchName, $options: 'i' } },
+            { shortName: { $regex: branchName, $options: 'i' } },
+          ],
+        }).select('_id').lean();
+        if (br) filter.branchId = br._id;
+      }
+
+      const now = new Date();
+      const defaultFrom = new Date(now.getFullYear(), now.getMonth(), 1);
+      filter.openedAt = {
+        $gte: fromDate ? new Date(fromDate) : defaultFrom,
+        $lte: toDate ? new Date(toDate) : now,
+      };
+
+      const shifts = await Shift.find(filter)
+        .populate('user', 'fullName')
+        .populate('branchId', 'name')
+        .sort({ openedAt: -1 })
+        .limit(20)
+        .lean();
+
+      const filtered = minDifference > 0
+        ? shifts.filter(s => Math.abs(s.cashDifference || 0) >= minDifference || Math.abs(s.bankDifference || 0) >= minDifference)
+        : shifts;
+
+      const totalCashDiff = filtered.reduce((s, x) => s + (x.cashDifference || 0), 0);
+      const totalBankDiff = filtered.reduce((s, x) => s + (x.bankDifference || 0), 0);
+
+      return {
+        count: filtered.length,
+        totalCashDifference: totalCashDiff,
+        totalCashDifferenceFormatted: (totalCashDiff > 0 ? '+' : '') + totalCashDiff.toLocaleString('vi-VN') + 'đ',
+        totalBankDifference: totalBankDiff,
+        totalBankDifferenceFormatted: (totalBankDiff > 0 ? '+' : '') + totalBankDiff.toLocaleString('vi-VN') + 'đ',
+        shifts: filtered.map(s => ({
+          shiftCode: s.shiftCode,
+          label: s.label || '',
+          userName: s.user?.fullName,
+          branchName: s.branchId?.name,
+          openedAt: s.openedAt,
+          openedAtFormatted: new Date(s.openedAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),
+          cashDifference: s.cashDifference,
+          cashDifferenceFormatted: (s.cashDifference > 0 ? '+' : '') + (s.cashDifference || 0).toLocaleString('vi-VN') + 'đ',
+          bankDifference: s.bankDifference,
+          bankDifferenceFormatted: (s.bankDifference > 0 ? '+' : '') + (s.bankDifference || 0).toLocaleString('vi-VN') + 'đ',
+          status: s.status,
+        })),
+      };
+    } catch (err) {
+      console.error('[find_cash_discrepancy]', err);
+      return { error: err.message };
+    }
+  },
+
+  // Tool: get_reconciliation_status
+  async get_reconciliation_status({ year, month, branchName } = {}) {
+    if (!ctx.isInternal) {
+      return { error: 'internal_only', message: 'Tính năng này chỉ dành cho nhân viên ạ.' };
+    }
+    if (ctx.role !== 'Admin' && ctx.role !== 'Manager') {
+      return { error: 'forbidden', message: 'Chỉ Admin/Manager mới xem được ạ.' };
+    }
+    try {
+      const Reconciliation = require('../models/Reconciliation');
+      const now = new Date();
+      const y = parseInt(year, 10) || now.getFullYear();
+      const m = parseInt(month, 10) || (now.getMonth() + 1);
+
+      let bId = ctx.userBranchId;
+      if (ctx.role === 'Admin' && branchName) {
+        const Branch = require('../models/Branch');
+        const br = await Branch.findOne({
+          $or: [
+            { name: { $regex: branchName, $options: 'i' } },
+            { shortName: { $regex: branchName, $options: 'i' } },
+          ],
+        }).select('_id name').lean();
+        if (br) bId = br._id;
+      }
+
+      const start = new Date(y, m - 1, 1);
+      const end = new Date(y, m, 1);
+
+      const recs = await Reconciliation.find({
+        branchId: bId,
+        fromDate: { $gte: start, $lt: end },
+      })
+        .populate('branchId', 'name')
+        .populate('createdBy', 'fullName')
+        .populate('approvedBy', 'fullName')
+        .sort({ fromDate: 1 })
+        .lean();
+
+      const counts = recs.reduce((acc, r) => {
+        acc[r.status] = (acc[r.status] || 0) + 1;
+        return acc;
+      }, {});
+      const totalDiff = recs.reduce((s, r) => s + (r.totalDifference || 0), 0);
+
+      return {
+        year: y, month: m,
+        period: `Tháng ${m}/${y}`,
+        total: recs.length,
+        counts,
+        totalDifference: totalDiff,
+        totalDifferenceFormatted: (totalDiff > 0 ? '+' : '') + totalDiff.toLocaleString('vi-VN') + 'đ',
+        reconciliations: recs.map(r => ({
+          code: r.reconciliationCode,
+          label: r.label,
+          period: r.period,
+          status: r.status,
+          totalDifference: r.totalDifference,
+          totalDifferenceFormatted: (r.totalDifference > 0 ? '+' : '') + (r.totalDifference || 0).toLocaleString('vi-VN') + 'đ',
+          shiftCount: r.shiftCount,
+          createdBy: r.createdBy?.fullName,
+          approvedBy: r.approvedBy?.fullName,
+          fromDate: r.fromDate,
+          toDate: r.toDate,
+        })),
+      };
+    } catch (err) {
+      console.error('[get_reconciliation_status]', err);
+      return { error: err.message };
+    }
   },
 });
 
@@ -3539,6 +4461,28 @@ router.post('/message', async (req, res) => {
         role: ctx.role,
         branch: userBranchName || (ctx.role === 'Admin' ? 'Tất cả' : 'Chưa gán'),
       },
+      // ⭐ NEW 14/05/2026: Báo cho FE biết tool nào đã chạy thành công
+      //   để FE trigger reload các trang liên quan (sơ đồ phòng, dashboard...)
+      dataChanged: (() => {
+        const changedTools = allToolCalls.filter(t =>
+          !t.error && [
+            'create_booking',           // Đặt phòng mới
+            'check_in_booking',         // Check-in
+            'check_out_booking',        // Check-out
+            'cancel_booking',           // Hủy phòng
+            'update_booking',           // Sửa thông tin booking
+            'mark_room_cleaned',        // Đánh dấu đã dọn
+          ].includes(t.name)
+        );
+        if (changedTools.length === 0) return null;
+        return {
+          types: [...new Set(changedTools.map(t => t.name))],
+          // Đính kèm bookingCode mới nếu vừa create
+          createdBookingCode: changedTools
+            .find(t => t.name === 'create_booking')
+            ?.result?.bookingCode ?? null,
+        };
+      })(),
     });
 
   } catch (err) {
