@@ -1,7 +1,9 @@
 const RoomType = require('../models/RoomType');
 
-// ⭐ Helper: normalize maxAdults/maxChildren từ body (đảm bảo >= 0, integer)
-//   Cho phép FE cũ vẫn gửi `capacity` → tự convert thành maxAdults
+// ⭐ Helper: normalize maxAdults/maxChildren/beds/maxOccupancy từ body
+//   - Đảm bảo >= 0 integer
+//   - Cho phép FE cũ gửi `capacity` → tự convert thành maxAdults
+//   - Auto-default maxOccupancy nếu thiếu
 const normalizeBody = (body) => {
   const out = { ...body }
 
@@ -20,7 +22,36 @@ const normalizeBody = (body) => {
     out.maxChildren = Math.max(0, parseInt(out.maxChildren, 10) || 0)
   }
 
+  // ⭐ MỚI: beds
+  if (out.beds !== undefined) {
+    out.beds = Math.max(1, Math.min(10, parseInt(out.beds, 10) || 1))
+  }
+
+  // ⭐ MỚI: maxOccupancy
+  if (out.maxOccupancy !== undefined) {
+    out.maxOccupancy = Math.max(1, parseInt(out.maxOccupancy, 10) || 1)
+  }
+
   return out
+}
+
+// ⭐ Validate logic: maxOccupancy phải >= maxAdults + maxChildren
+//   Trả về { ok: boolean, message: string }
+const validateCapacity = (maxAdults, maxChildren, maxOccupancy) => {
+  const standardCap = (maxAdults || 0) + (maxChildren || 0)
+
+  if (standardCap < 1) {
+    return { ok: false, message: 'Loại phòng phải chứa được ít nhất 1 người (NL hoặc TE)' }
+  }
+
+  if (maxOccupancy !== undefined && maxOccupancy < standardCap) {
+    return {
+      ok: false,
+      message: `Số người tối đa (${maxOccupancy}) phải >= số chuẩn (${standardCap} = ${maxAdults} NL + ${maxChildren} TE)`,
+    }
+  }
+
+  return { ok: true }
 }
 
 const getAll = async (req, res, next) => {
@@ -52,13 +83,21 @@ const create = async (req, res, next) => {
 
     const payload = normalizeBody(req.body)
 
-    // ⭐ Validation: tổng phải >= 1 (loại phòng phải chứa được ít nhất 1 người)
-    const totalCap = (payload.maxAdults ?? 2) + (payload.maxChildren ?? 0)
-    if (totalCap < 1) {
-      return res.status(400).json({
-        success: false,
-        message: 'Loại phòng phải chứa được ít nhất 1 người (NL hoặc TE)',
-      })
+    // ⭐ Auto-default maxOccupancy = maxAdults + maxChildren + 1 (cho phép +1 extra)
+    //   Chỉ áp dụng khi FE không nhập explicit
+    if (payload.maxOccupancy === undefined) {
+      const standardCap = (payload.maxAdults ?? 2) + (payload.maxChildren ?? 0)
+      payload.maxOccupancy = standardCap + 1
+    }
+
+    // ⭐ Validate
+    const check = validateCapacity(
+      payload.maxAdults ?? 2,
+      payload.maxChildren ?? 0,
+      payload.maxOccupancy,
+    )
+    if (!check.ok) {
+      return res.status(400).json({ success: false, message: check.message })
     }
 
     const roomType = await RoomType.create(payload);
@@ -70,18 +109,22 @@ const update = async (req, res, next) => {
   try {
     const payload = normalizeBody(req.body)
 
-    // ⭐ Validation tổng (chỉ check khi có gửi 1 trong 2 field)
-    if (payload.maxAdults !== undefined || payload.maxChildren !== undefined) {
+    // ⭐ Validate (chỉ check khi có gửi 1 trong các field liên quan)
+    if (payload.maxAdults !== undefined
+        || payload.maxChildren !== undefined
+        || payload.maxOccupancy !== undefined) {
+
       // Lấy giá trị hiện tại để so sánh tổng cuối cùng
       const cur = await RoomType.findById(req.params.id)
       if (!cur) return res.status(404).json({ success: false, message: 'Không tìm thấy loại phòng' });
-      const finalMaxA = payload.maxAdults   ?? cur.maxAdults   ?? 2
-      const finalMaxC = payload.maxChildren ?? cur.maxChildren ?? 0
-      if ((finalMaxA + finalMaxC) < 1) {
-        return res.status(400).json({
-          success: false,
-          message: 'Loại phòng phải chứa được ít nhất 1 người (NL hoặc TE)',
-        })
+
+      const finalMaxA = payload.maxAdults    ?? cur.maxAdults    ?? 2
+      const finalMaxC = payload.maxChildren  ?? cur.maxChildren  ?? 0
+      const finalOcc  = payload.maxOccupancy ?? cur.maxOccupancy ?? (finalMaxA + finalMaxC + 1)
+
+      const check = validateCapacity(finalMaxA, finalMaxC, finalOcc)
+      if (!check.ok) {
+        return res.status(400).json({ success: false, message: check.message })
       }
     }
 

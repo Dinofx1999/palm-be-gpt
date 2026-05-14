@@ -31,13 +31,32 @@ function buildStandardSuggestions(allToolCalls, ctx) {
 
     const suggestions = [];
     recs.slice(0, 3).forEach((rec, idx) => {
-      const typeName = rec.roomTypeName || `Tùy chọn ${idx + 1}`;
+      // ⭐ Lấy typeName từ rooms[0] nếu không có ở level option
+      const typeName = rec.rooms?.[0]?.typeName || `phương án ${idx + 1}`;
       const total = rec.grandTotalFormatted || fmt(rec.grandTotal || 0);
-      const qty = rec.quantity || 1;
+      const totalRooms = rec.totalRooms || rec.rooms?.[0]?.quantity || 1;
+
+      // ⭐ Lấy số phòng cụ thể (Internal user)
+      const roomNumbers = rec.roomNumbers || rec.rooms?.[0]?.roomNumbers || [];
+      const hasRoomNumbers = roomNumbers.length > 0;
+
+      let label;
+      let value;
+      if (hasRoomNumbers) {
+        // Internal: hiển thị SỐ PHÒNG
+        const roomStr = roomNumbers.join(' + ');
+        label = `Đặt phòng ${roomStr} - ${total}`;
+        value = `Đặt giúp em phòng ${roomStr} (${totalRooms} phòng ${typeName}, tổng ${total})`;
+      } else {
+        // External: chỉ hiển thị tên loại + số lượng
+        label = `Đặt ${totalRooms} phòng ${typeName} - ${total}`;
+        value = `Đặt giúp em tùy chọn ${idx + 1}: ${totalRooms} phòng ${typeName}, tổng ${total}`;
+      }
+
       suggestions.push({
         id: `book_opt_${idx + 1}`,
-        label: `Đặt ${qty} phòng ${typeName} - ${total}`,
-        value: `Đặt giúp em tùy chọn ${idx + 1}: ${qty} phòng ${typeName}, tổng ${total}`,
+        label,
+        value,
       });
     });
 

@@ -11,7 +11,8 @@
 
 const express  = require('express');
 const mongoose = require('mongoose');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const jwt      = require('jsonwebtoken');                  // ⭐ Optional auth
+const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
 const router = express.Router();
 
 // ⚠️ Đổi path nếu models của bạn ở chỗ khác
@@ -769,7 +770,7 @@ const makeHandlers = (ctx) => ({
     if (branchId) roomFilter.branchId = branchId;
 
     const allRooms = await Room.find(roomFilter)
-      .populate('typeId', 'name maxAdults maxChildren area')
+      .populate('typeId', 'name maxAdults maxChildren maxOccupancy beds area')
       .populate('branchId', 'name')
       .lean();
 
@@ -911,6 +912,14 @@ const makeHandlers = (ctx) => ({
     const recommendations = [];
     const labelMap = ['⭐ Đề xuất tốt nhất', 'Tuỳ chọn 2', 'Tuỳ chọn 3'];
 
+    // ⭐ Helper: lấy sức chứa thực sự của 1 type
+    //   Ưu tiên maxOccupancy (số người tối đa, đã bao gồm extra slots)
+    //   Fallback maxAdults + maxChildren (data cũ chưa migrate)
+    const effectiveCap = (type) => {
+      if (type?.maxOccupancy && type.maxOccupancy > 0) return type.maxOccupancy;
+      return (type?.maxAdults || 0) + (type?.maxChildren || 0);
+    };
+
     // ===========================================
     // ⭐ NEW: GROUP PACKING — khi user truyền groups[]
     //   Mỗi group được ở 1 phòng riêng, hệ thống chọn loại phòng tối ưu
@@ -929,7 +938,7 @@ const makeHandlers = (ctx) => ({
         // Lọc các loại phòng đủ chứa và còn phòng trống
         const candidates = Object.values(roomsByType)
           .filter(g => {
-            const cap = (g.type.maxAdults || 0) + (g.type.maxChildren || 0);
+            const cap = effectiveCap(g.type);
             const tid = String(g.type._id);
             const used = usedRoomsByType[tid] || 0;
             return cap >= grpTotal && (g.rooms.length - used) >= 1;
@@ -948,13 +957,20 @@ const makeHandlers = (ctx) => ({
 
         const chosen = candidates[0];
         const tid = String(chosen.group.type._id);
-        usedRoomsByType[tid] = (usedRoomsByType[tid] || 0) + 1;
+        const usedIdx = usedRoomsByType[tid] || 0;
+        usedRoomsByType[tid] = usedIdx + 1;
+
+        // ⭐ Gán số phòng cụ thể (nếu Internal)
+        const assignedRoom = ctx.isInternal
+          ? chosen.group.rooms[usedIdx]?.number || null
+          : null;
 
         groupAllocations.push({
           groupInfo: grp,
           type: chosen.group.type,
           price: chosen.price,
           availableCount: chosen.group.rooms.length,
+          roomNumber: assignedRoom,        // ⭐ MỚI
         });
       }
 
@@ -972,7 +988,7 @@ const makeHandlers = (ctx) => ({
             const availForRemaining = g.rooms.length - usedCount;
             if (availForRemaining < 1) return null;
 
-            const cap = (g.type.maxAdults || 0) + (g.type.maxChildren || 0);
+            const cap = effectiveCap(g.type);
             const maxA = g.type.maxAdults || 0;
             if (cap <= 0) return null;
 
@@ -1023,6 +1039,13 @@ const makeHandlers = (ctx) => ({
             ? r.prices.map((p, i) => `P${i + 1}: ${p.totalAmountFormatted}`).join(', ')
             : null;
 
+          // ⭐ Lấy số phòng từ pool còn lại sau khi groupAllocations đã chiếm
+          const tid = String(r.group.type._id);
+          const startIdx = usedRoomsByType[tid] || 0;
+          const remainingRoomNumbers = ctx.isInternal
+            ? r.group.rooms.slice(startIdx, startIdx + r.roomsNeeded).map(rm => rm.number)
+            : [];
+
           remainingAllocations.push({
             type: r.group.type,
             quantity: r.roomsNeeded,
@@ -1031,6 +1054,7 @@ const makeHandlers = (ctx) => ({
             prices: r.prices,
             totalAmount: r.total,
             note: breakdown ? `Giá phòng khác nhau (${breakdown})` : null,
+            roomNumbers: remainingRoomNumbers,        // ⭐ MỚI
           });
         } else {
           remainingOk = false;
@@ -1040,19 +1064,26 @@ const makeHandlers = (ctx) => ({
       // Bước 3: build recommendation từ groups + remaining
       if (allGroupsOk && remainingOk) {
         const rooms = [];
+        const allRoomNumbers = [];        // ⭐ Tổng hợp số phòng cho cả option
 
         // Mỗi group → 1 room entry
         for (const alloc of groupAllocations) {
+          if (alloc.roomNumber) allRoomNumbers.push(alloc.roomNumber);
           rooms.push({
             typeName: alloc.type.name,
             maxAdults: alloc.type.maxAdults,
             maxChildren: alloc.type.maxChildren,
+            beds: alloc.type.beds || 1,
+            maxOccupancy: alloc.type.maxOccupancy || ((alloc.type.maxAdults||0) + (alloc.type.maxChildren||0)),
             area: alloc.type.area ? `${alloc.type.area}m²` : null,
             quantity: 1,
             availableCount: alloc.availableCount,
+            roomNumbers: alloc.roomNumber ? [alloc.roomNumber] : [],   // ⭐ MỚI
             assignAdults: alloc.groupInfo.adults,
             assignChildren: alloc.groupInfo.children,
-            groupLabel: `👨‍👩‍👧 ${alloc.groupInfo.name} (${alloc.groupInfo.adults} NL + ${alloc.groupInfo.children} TE)`,
+            groupLabel: alloc.roomNumber
+              ? `👨‍👩‍👧 ${alloc.groupInfo.name} — Phòng ${alloc.roomNumber} (${alloc.groupInfo.adults} NL + ${alloc.groupInfo.children} TE)`
+              : `👨‍👩‍👧 ${alloc.groupInfo.name} (${alloc.groupInfo.adults} NL + ${alloc.groupInfo.children} TE)`,
             ...alloc.price,
             totalForQuantity: alloc.price.totalAmount,
             totalForQuantityFormatted: fmt(alloc.price.totalAmount),
@@ -1061,9 +1092,14 @@ const makeHandlers = (ctx) => ({
 
         // Remaining → 1 entry với nhiều phòng cùng loại
         for (const rem of remainingAllocations) {
-          // ⭐ Build chi tiết từng phòng để AI hiển thị dễ hiểu
+          if (rem.roomNumbers) allRoomNumbers.push(...rem.roomNumbers);
+
+          // ⭐ Build chi tiết từng phòng — gắn số phòng thật nếu có
           const roomBreakdown = rem.distribution.map((d, i) => ({
-            label: `Phòng ${i + 1}`,
+            label: rem.roomNumbers?.[i]
+              ? `Phòng ${rem.roomNumbers[i]}`
+              : `Phòng ${i + 1}`,
+            roomNumber: rem.roomNumbers?.[i] || null,
             adults: d.adults,
             children: d.children,
             price: rem.prices[i]?.totalAmountFormatted || fmt(rem.prices[i]?.totalAmount || 0),
@@ -1073,9 +1109,12 @@ const makeHandlers = (ctx) => ({
             typeName: rem.type.name,
             maxAdults: rem.type.maxAdults,
             maxChildren: rem.type.maxChildren,
+            beds: rem.type.beds || 1,
+            maxOccupancy: rem.type.maxOccupancy || ((rem.type.maxAdults||0) + (rem.type.maxChildren||0)),
             area: rem.type.area ? `${rem.type.area}m²` : null,
             quantity: rem.quantity,
             availableCount: rem.availableCount,
+            roomNumbers: rem.roomNumbers || [],          // ⭐ MỚI
             roomBreakdown,                    // ⭐ Mảng chi tiết từng phòng
             groupLabel: `👥 Đoàn còn lại (${adults} NL + ${children} TE)`,
             ...rem.prices[0],
@@ -1092,6 +1131,7 @@ const makeHandlers = (ctx) => ({
           optionLabel: `⭐ Đề xuất chia theo ${validGroups.length} nhóm`,
           optionSummary: `${totalRooms} phòng cho ${validGroups.length} nhóm + đoàn còn lại`,
           rooms,
+          roomNumbers: allRoomNumbers,        // ⭐ MỚI
           totalRooms,
           grandTotal,
           grandTotalFormatted: fmt(grandTotal),
@@ -1109,7 +1149,7 @@ const makeHandlers = (ctx) => ({
 
     const candidatesSingleRoom = hasGroupRec ? [] : Object.values(roomsByType)
       .filter(g => {
-        const cap = (g.type.maxAdults || 0) + (g.type.maxChildren || 0);
+        const cap = effectiveCap(g.type);
         return cap >= totalGuests && g.rooms.length >= 1;
       })
       .map(g => {
@@ -1122,6 +1162,10 @@ const makeHandlers = (ctx) => ({
     // Lấy tối đa 3 option đơn rẻ nhất
     for (const cand of candidatesSingleRoom.slice(0, 3)) {
       const idx = recommendations.length;
+      // ⭐ Lấy số phòng cụ thể (chỉ Internal được thấy)
+      const roomNumbers = ctx.isInternal
+        ? cand.group.rooms.slice(0, 1).map(r => r.number)
+        : [];
       recommendations.push({
         optionLabel: labelMap[idx],                         // ⭐ Chỉ "⭐ Đề xuất tốt nhất" / "Tuỳ chọn 2"
         optionSummary: `1 phòng ${cand.group.type.name}`,   // ⭐ NEW: subtitle hiển thị dưới label
@@ -1129,15 +1173,19 @@ const makeHandlers = (ctx) => ({
           typeName: cand.group.type.name,
           maxAdults: cand.group.type.maxAdults,
           maxChildren: cand.group.type.maxChildren,
+          beds: cand.group.type.beds || 1,
+          maxOccupancy: cand.group.type.maxOccupancy || ((cand.group.type.maxAdults||0) + (cand.group.type.maxChildren||0)),
           area: cand.group.type.area ? `${cand.group.type.area}m²` : null,
           quantity: 1,
           availableCount: cand.group.rooms.length,
+          roomNumbers,                                       // ⭐ MỚI: ["201"] (chỉ Internal)
           assignAdults: adults,
           assignChildren: children,
           ...cand.price,
           totalForQuantity: cand.price.totalAmount,
           totalForQuantityFormatted: fmt(cand.price.totalAmount),
         }],
+        roomNumbers,                                          // ⭐ MỚI: ở level option
         totalRooms: 1,
         grandTotal: cand.price.totalAmount,
         grandTotalFormatted: fmt(cand.price.totalAmount),
@@ -1155,17 +1203,19 @@ const makeHandlers = (ctx) => ({
 
       // ⭐ Helper: pack N người vào X phòng cùng loại (greedy distribution)
       //   Trả về { roomsNeeded, distribution: [{adults, children}, ...] } nếu khả thi
-      const packIntoType = (typeMaxAdults, typeMaxChildren, availableRooms) => {
-        const cap = typeMaxAdults + typeMaxChildren;
+      //   ⭐ MỚI: dùng `typeMaxOccupancy` làm cap thật sự (số người tối đa cho phép)
+      //          `typeMaxAdults` chỉ dùng để check max NL/phòng (constraint cứng)
+      const packIntoType = (typeMaxAdults, typeMaxChildren, typeMaxOccupancy, availableRooms) => {
+        // ⭐ Cap = số người tối đa cho phép (đã bao gồm extra slots)
+        const cap = typeMaxOccupancy && typeMaxOccupancy > 0
+          ? typeMaxOccupancy
+          : (typeMaxAdults + typeMaxChildren);
         if (cap <= 0) return null;
 
         // Tính số phòng tối thiểu cần (theo tổng người)
         const roomsNeededByTotal = Math.ceil(totalGuests / cap);
-        // Cũng tính theo NL (vì TE ít hơn, đôi khi TE ít → NL quyết định)
-        const roomsNeededByAdults = typeMaxAdults > 0
-          ? Math.ceil(adults / typeMaxAdults)
-          : Infinity;
-        const roomsNeeded = Math.max(roomsNeededByTotal, roomsNeededByAdults);
+        // Cũng tính theo NL — chỉ cap theo maxOccupancy (không tách NL/TE riêng nữa, vì khách lớn nằm chung cũng ổn)
+        const roomsNeeded = roomsNeededByTotal;
 
         if (roomsNeeded > availableRooms) return null;
         if (roomsNeeded < 2) return null;  // Đã có option A xử lý
@@ -1176,15 +1226,14 @@ const makeHandlers = (ctx) => ({
         let remainingChildren = children;
         for (let i = 0; i < roomsNeeded; i++) {
           const roomsLeft = roomsNeeded - i;
-          // Số NL cho phòng này
+          // Số NL cho phòng này (ưu tiên dồn NL trước)
           const aThisRoom = Math.min(
-            typeMaxAdults,
+            cap,                                   // không vượt maxOccupancy
             Math.ceil(remainingAdults / roomsLeft)
           );
           // Số TE cho phòng này: cho đầy slot còn lại của phòng
           const slotsLeft = cap - aThisRoom;
           const cThisRoom = Math.min(
-            typeMaxChildren > 0 ? typeMaxChildren : slotsLeft,
             slotsLeft,
             Math.ceil(remainingChildren / roomsLeft)
           );
@@ -1206,6 +1255,7 @@ const makeHandlers = (ctx) => ({
           const packed = packIntoType(
             g.type.maxAdults || 0,
             g.type.maxChildren || 0,
+            effectiveCap(g.type),                    // ⭐ MỚI: dùng maxOccupancy
             g.rooms.length
           );
           if (!packed) return null;
@@ -1243,9 +1293,17 @@ const makeHandlers = (ctx) => ({
         const idx = recommendations.length;
         const q = cand.packed.roomsNeeded;
 
-        // ⭐ Build chi tiết từng phòng
+        // ⭐ Lấy danh sách số phòng cụ thể được gán (chỉ Internal)
+        const roomNumbers = ctx.isInternal
+          ? cand.group.rooms.slice(0, q).map(r => r.number)
+          : [];
+
+        // ⭐ Build chi tiết từng phòng — gắn roomNumber nếu có
         const roomBreakdown = cand.packed.distribution.map((d, i) => ({
-          label: `Phòng ${i + 1}`,
+          label: roomNumbers[i]
+            ? `Phòng ${roomNumbers[i]}`               // ⭐ Hiển thị số phòng thật
+            : `Phòng ${i + 1}`,
+          roomNumber: roomNumbers[i] || null,         // ⭐ Field riêng
           adults: d.adults,
           children: d.children,
           price: cand.roomPrices[i]?.totalAmountFormatted || fmt(cand.roomPrices[i]?.totalAmount || 0),
@@ -1264,15 +1322,19 @@ const makeHandlers = (ctx) => ({
             typeName: cand.group.type.name,
             maxAdults: cand.group.type.maxAdults,
             maxChildren: cand.group.type.maxChildren,
+          beds: cand.group.type.beds || 1,
+          maxOccupancy: cand.group.type.maxOccupancy || ((cand.group.type.maxAdults||0) + (cand.group.type.maxChildren||0)),
             area: cand.group.type.area ? `${cand.group.type.area}m²` : null,
             quantity: q,
             availableCount: cand.group.rooms.length,
+            roomNumbers,                                            // ⭐ MỚI
             roomBreakdown,
             ...cand.firstPrice,
             totalForQuantity: cand.totalPrice,
             totalForQuantityFormatted: fmt(cand.totalPrice),
             note,
           }],
+          roomNumbers,                                              // ⭐ MỚI: ở level option
           totalRooms: q,
           grandTotal: cand.totalPrice,
           grandTotalFormatted: fmt(cand.totalPrice),
@@ -1287,7 +1349,7 @@ const makeHandlers = (ctx) => ({
         // Greedy: sắp xếp các loại theo "giá trên đầu người" tăng dần, rồi pack
         const sortedTypes = Object.values(roomsByType)
           .map(g => {
-            const cap = (g.type.maxAdults || 0) + (g.type.maxChildren || 0);
+            const cap = effectiveCap(g.type);
             if (cap <= 0 || g.rooms.length === 0) return null;
             // Tính giá khi pack đầy 1 phòng (để so sánh hiệu quả)
             const p = priceForType(
@@ -1407,6 +1469,8 @@ const makeHandlers = (ctx) => ({
     const inventory = Object.values(roomsByType).map(g => ({
       typeName: g.type.name,
       capacity: `${g.type.maxAdults} NL + ${g.type.maxChildren} TE`,
+      beds: g.type.beds || 1,
+      maxOccupancy: effectiveCap(g.type),
       available: g.rooms.length,
     }));
 
@@ -1442,7 +1506,7 @@ const makeHandlers = (ctx) => ({
     }
 
     const room = await Room.findOne(roomFilter)
-      .populate('typeId', 'name maxAdults maxChildren area')
+      .populate('typeId', 'name maxAdults maxChildren maxOccupancy beds area')
       .populate('branchId', 'name')
       .lean();
 
@@ -1590,6 +1654,9 @@ const makeHandlers = (ctx) => ({
       roomNumber: room.number,
       roomType: room.typeId?.name || '—',
       capacity: `${room.typeId?.maxAdults || 2} NL + ${room.typeId?.maxChildren || 0} TE`,
+      beds: room.typeId?.beds || 1,                              // ⭐ MỚI
+      maxOccupancy: room.typeId?.maxOccupancy                   // ⭐ MỚI
+        || ((room.typeId?.maxAdults || 0) + (room.typeId?.maxChildren || 0)),
       area: room.typeId?.area ? `${room.typeId.area}m²` : null,
       branch: room.branchId?.name || null,
       status,
@@ -3026,7 +3093,45 @@ const makeHandlers = (ctx) => ({
 // ============================================================
 router.post('/message', async (req, res) => {
   try {
-    const { message, history = [], userRole, userBranchId, userName: bodyUserName, sessionId: clientSessionId } = req.body;
+    // ⭐ OPTIONAL AUTH — parse JWT nếu có, không bắt buộc
+    //   Chat endpoint cần hỗ trợ cả internal (nhân viên) lẫn external (khách)
+    //   Internal có JWT → set req.user → lưu DB được
+    //   External không có JWT → vẫn dùng được nhưng KHÔNG lưu DB
+    if (!req.user) {
+      const authHeader = req.headers.authorization || '';
+      const token = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7)
+        : null;
+      if (token && process.env.JWT_SECRET) {
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          // ⭐ Hỗ trợ nhiều format payload thường gặp
+          req.user = {
+            id: decoded.id || decoded._id || decoded.userId || decoded.sub,
+            _id: decoded._id || decoded.id || decoded.userId,
+            role: decoded.role,
+            branchId: decoded.branchId,
+            fullName: decoded.fullName || decoded.name,
+            displayName: decoded.displayName,
+            username: decoded.username,
+            email: decoded.email,
+          };
+          console.log('[Chat] Parsed JWT - user:', req.user.id, req.user.role);
+        } catch (e) {
+          console.warn('[Chat] JWT verify failed (non-fatal):', e.message);
+        }
+      }
+    }
+
+    const {
+      message,
+      history = [],
+      userRole,
+      userBranchId,
+      userName: bodyUserName,
+      sessionId: clientSessionId,
+      userId: bodyUserId,         // ⭐ FE gửi userId trong body làm fallback cho JWT
+    } = req.body;
 
     if (!message || typeof message !== 'string') {
       return res.status(400).json({ reply: 'Vui lòng nhập tin nhắn hợp lệ.' });
@@ -3043,7 +3148,11 @@ router.post('/message', async (req, res) => {
       userBranchId: req.user?.branchId
         ? String(req.user.branchId._id || req.user.branchId)
         : (userBranchId || null),
-      userId: req.user?.id || req.user?._id || null,    // ⭐ Cho audit log
+      // ⭐ Ưu tiên JWT (đáng tin), fallback body (cho app nội bộ khi JWT chưa hoàn thiện)
+      //   Validate là ObjectId hợp lệ để tránh inject string lung tung vào DB
+      userId: req.user?.id
+        || req.user?._id
+        || (bodyUserId && /^[0-9a-fA-F]{24}$/.test(String(bodyUserId)) ? String(bodyUserId) : null),
       // ⭐ Tên user — ưu tiên từ JWT (đáng tin hơn body), fallback body
       userName: req.user?.fullName
         || req.user?.displayName
@@ -3074,16 +3183,56 @@ router.post('/message', async (req, res) => {
 
     console.log('[Chat] ctx:', ctx, '| branchName:', userBranchName, '| msg:', message.slice(0, 60));
 
-    const geminiHistory = history
-      .filter(h => h.text && (h.role === 'user' || h.role === 'assistant'))
-      .slice(-20)                          // ⭐ Giữ 20 messages cuối (đủ context cho flow đặt phòng đa lượt)
+    // ⭐ Build Gemini history — filter & validate sạch
+    //   - Bỏ message rỗng / undefined text
+    //   - Bỏ message quá dài (>10k chars) để tránh API reject
+    //   - Đảm bảo turn xen kẽ: user → model → user → model
+    //   - History phải BẮT ĐẦU bằng user, KẾT THÚC bằng model
+    const cleanHistory = history
+      .filter(h => {
+        if (!h || !h.role) return false;
+        if (h.role !== 'user' && h.role !== 'assistant') return false;
+        const text = String(h.text || '').trim();
+        if (!text || text.length === 0) return false;
+        if (text.length > 10000) return false;     // Bỏ message quá dài
+        return true;
+      })
+      .slice(-20)
       .map(h => ({
         role: h.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: h.text }],
+        parts: [{ text: String(h.text).trim().slice(0, 10000) }],
       }));
-    while (geminiHistory.length && geminiHistory[0].role === 'model') {
-      geminiHistory.shift();
+
+    // ⭐ Bỏ message đầu nếu là 'model' (Gemini yêu cầu history bắt đầu bằng user)
+    while (cleanHistory.length && cleanHistory[0].role === 'model') {
+      cleanHistory.shift();
     }
+
+    // ⭐ Merge các turn liên tiếp cùng role (Gemini yêu cầu xen kẽ user/model)
+    //   Vd: user → user → model → assistant_2 → user
+    //   Sau merge: user(text1+text2) → model(text1+text2) → user
+    const geminiHistory = [];
+    for (const msg of cleanHistory) {
+      const last = geminiHistory[geminiHistory.length - 1];
+      if (last && last.role === msg.role) {
+        // Cùng role → merge text
+        last.parts[0].text = last.parts[0].text + '\n\n' + msg.parts[0].text;
+      } else {
+        geminiHistory.push(msg);
+      }
+    }
+
+    // ⭐ Bỏ tin user CUỐI cùng nếu trùng với `message` đang gửi
+    //   (tránh trùng lặp khi FE vô tình include msg user vừa gõ)
+    if (geminiHistory.length > 0) {
+      const lastMsg = geminiHistory[geminiHistory.length - 1];
+      if (lastMsg.role === 'user' && lastMsg.parts[0].text === message.trim()) {
+        console.warn('[Chat] History có duplicate user msg cuối — đã bỏ');
+        geminiHistory.pop();
+      }
+    }
+
+    console.log(`[Chat] History: ${geminiHistory.length} messages, last role=${geminiHistory[geminiHistory.length-1]?.role || 'none'}`);
 
     const handlers = makeHandlers(ctx);
 
@@ -3122,6 +3271,15 @@ router.post('/message', async (req, res) => {
         systemInstruction: systemPrompt,
         tools,
         generationConfig: { temperature: 0.4, maxOutputTokens: 2000 },
+        // ⭐ Tắt safety filters — chat khách sạn không cần block,
+        //   tránh tình huống Gemini trả rỗng do FALSE POSITIVE
+        //   (vd "trả phòng ngày mốt" bị nhận nhầm là content nguy hiểm)
+        safetySettings: [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        ],
       });
     }
 
@@ -3158,9 +3316,25 @@ router.post('/message', async (req, res) => {
               err.message?.includes('quota') ||
               err.status === 429;
 
-            console.warn(`[Chat] ${modelName} attempt ${retry + 1} failed:`, err.message?.slice(0, 100));
+            // ⭐ Bad request 400 — thường do history có vấn đề (vd image cũ, parts rỗng)
+            const isBadRequest =
+              err.message?.includes('400') ||
+              err.message?.includes('INVALID_ARGUMENT') ||
+              err.status === 400;
+
+            // ⭐ FULL error log để biết bug chính xác
+            console.error(`[Chat] ${modelName} attempt ${retry + 1} ERROR:`);
+            console.error(`  Message: ${err.message}`);
+            console.error(`  Status: ${err.status || 'N/A'}`);
+            console.error(`  StatusText: ${err.statusText || 'N/A'}`);
+            if (err.errorDetails) console.error(`  Details:`, err.errorDetails);
 
             if (isQuotaError) break;
+            if (isBadRequest) {
+              // Bad request: thử fallback model có thể không cùng vấn đề
+              console.warn(`[Chat] Bad request 400 — try fallback model`);
+              break;
+            }
             if (!isRetryable) throw err;
             if (retry === 0) await new Promise(r => setTimeout(r, 2000));
           }
@@ -3251,9 +3425,26 @@ router.post('/message', async (req, res) => {
 
     let replyText = result.response.text?.() || '';
     if (!replyText.trim()) {
-      // ⭐ Log để debug khi response rỗng
+      // ⭐ Log CHI TIẾT để debug khi response rỗng
+      //   Có thể do: safety filter, recitation, no function calls, etc.
       console.warn('[Chat] Empty response from Gemini. User msg:', message.slice(0, 100));
       console.warn('[Chat] Last function calls:', result.response.functionCalls?.() || 'none');
+
+      // ⭐ NEW: Log promptFeedback + finishReason để biết lý do block
+      try {
+        const candidates = result.response.candidates || [];
+        if (candidates.length > 0) {
+          console.warn('[Chat] Finish reason:', candidates[0].finishReason);
+          console.warn('[Chat] Safety ratings:', JSON.stringify(candidates[0].safetyRatings || []));
+        }
+        const pf = result.response.promptFeedback;
+        if (pf) {
+          console.warn('[Chat] Prompt feedback:', JSON.stringify(pf));
+        }
+      } catch (e) {
+        console.warn('[Chat] Cannot extract debug info:', e.message);
+      }
+
       replyText = 'Dạ em chưa hiểu rõ câu hỏi của anh/chị ạ. Anh/chị có thể diễn đạt lại được không ạ?';
     }
 
@@ -3274,50 +3465,74 @@ router.post('/message', async (req, res) => {
       console.warn('[Chat] Build suggestions failed (non-fatal):', e.message);
     }
 
-    // ⭐ Lưu vào DB (fire-and-forget — không chặn response)
-    //   Chỉ lưu khi user là internal + có persistence service + có userId
-    if (persistence && ctx.userId && ctx.isInternal) {
-      (async () => {
-        try {
-          const session = await persistence.ensureSession({
-            sessionId: clientSessionId,
-            userId: ctx.userId,
-            userName: ctx.userName,
-            userRole: ctx.role,
-            branchId: ctx.userBranchId,
-            branchName: userBranchName,
-            firstMessage: message,
-          });
+    // ⭐ Lưu vào DB
+    //   ensureSession: AWAIT (cần dbSessionId trả về FE để link)
+    //   saveUserMessage + saveAssistantMessage: fire-and-forget (không chặn response)
+    const willPersist = !!(persistence && ctx.userId && ctx.isInternal);
+    console.log(`[Chat] DB persist:`, {
+      willPersist,
+      hasPersistenceService: !!persistence,
+      hasUserId: !!ctx.userId,
+      isInternal: ctx.isInternal,
+      userId: ctx.userId,
+      role: ctx.role,
+      clientSessionId,
+    });
 
-          if (session) {
-            // Lưu tin user
-            await persistence.saveUserMessage(session, { text: message });
+    let dbSessionId = null;        // ⭐ Trả về FE để map với session local
 
-            // Lưu tin assistant — dùng cleanReply (đã loại block SUGGESTIONS)
-            const usage = result?.response?.usageMetadata || {};
-            await persistence.saveAssistantMessage(session, {
-              text: cleanReply,
-              toolCalls: allToolCalls,
-              tokensUsed: {
-                prompt: usage.promptTokenCount || 0,
-                cached: usage.cachedContentTokenCount || 0,
-                output: usage.candidatesTokenCount || 0,
-              },
-              modelUsed: usedModel,
-              iterations,
-              messageId,
-            });
-          }
-        } catch (err) {
-          console.warn('[Chat] Persistence save failed (non-fatal):', err.message);
+    if (willPersist) {
+      try {
+        console.log(`[Chat] DB ensureSession: userId=${ctx.userId}, sessionId=${clientSessionId}`);
+        const session = await persistence.ensureSession({
+          sessionId: clientSessionId,
+          userId: ctx.userId,
+          userName: ctx.userName,
+          userRole: ctx.role,
+          branchId: ctx.userBranchId,
+          branchName: userBranchName,
+          firstMessage: message,
+        });
+        dbSessionId = session?._id?.toString() || null;
+        console.log(`[Chat] DB session:`, dbSessionId);
+
+        if (session) {
+          // Save messages BACKGROUND — không chặn response cho user
+          (async () => {
+            try {
+              const userMsg = await persistence.saveUserMessage(session, { text: message });
+              console.log(`[Chat] DB saved user msg:`, userMsg?._id?.toString());
+
+              const usage = result?.response?.usageMetadata || {};
+              const aiMsg = await persistence.saveAssistantMessage(session, {
+                text: cleanReply,
+                toolCalls: allToolCalls,
+                tokensUsed: {
+                  prompt: usage.promptTokenCount || 0,
+                  cached: usage.cachedContentTokenCount || 0,
+                  output: usage.candidatesTokenCount || 0,
+                },
+                modelUsed: usedModel,
+                iterations,
+                messageId,
+              });
+              console.log(`[Chat] DB saved AI msg:`, aiMsg?._id?.toString());
+            } catch (err) {
+              console.error('[Chat] ❌ Save messages FAILED:', err.message);
+            }
+          })();
         }
-      })();
+      } catch (err) {
+        console.error('[Chat] ❌ ensureSession FAILED:', err.message);
+        console.error(err.stack);
+      }
     }
 
     res.json({
       reply: cleanReply,                // ⭐ Đã clean block [SUGGESTIONS]
       suggestions,                       // ⭐ Array buttons [{id, label, value}]
       messageId,                         // ⭐ FE dùng cho feedback
+      dbSessionId,                       // ⭐ MongoDB _id của session — FE link với session local
       iterations,
       modelUsed: usedModel,
       scope: {

@@ -88,6 +88,14 @@ app.use('/api/chat',              require('./routes/chat'));
 //   - POST /api/chat-fewshots/refresh-cache (invalidate Gemini cache)
 app.use('/api',                   require('./routes/chatFeedback'));
 
+// ⭐ NEW 14/05/2026: AI Chat History — lưu/load lịch sử chat từ MongoDB
+//   - GET    /api/chat-history/sessions          List sessions của user hiện tại
+//   - GET    /api/chat-history/sessions/:id      Get 1 session + tất cả messages
+//   - PATCH  /api/chat-history/sessions/:id      Đổi title / pin / archive
+//   - DELETE /api/chat-history/sessions/:id      Xoá 1 session (+ tất cả messages)
+//   - DELETE /api/chat-history/sessions          Xoá tất cả của user
+app.use('/api/chat-history',      require('./routes/chatHistory'));
+
 // ⭐ NEW 12/05/2026: Module Tuyển dụng (Careers)
 //   - /api/job-postings:     CRUD vị trí tuyển dụng (Admin/Manager)
 //   - /api/job-applications: Quản lý hồ sơ ứng viên (Admin/Manager)

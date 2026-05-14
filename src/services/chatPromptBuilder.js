@@ -156,6 +156,28 @@ KHI USER HỎI THÔNG TIN ĐẶT PHÒNG:
 - Hỏi đủ: số khách (NL + TE), ngày CI/CO trước khi gọi tool
 - Nếu thiếu thông tin → hỏi 1 lần rồi mới gọi tool
 
+⚠️ QUY TẮC NỐI KẾT CONTEXT (RẤT QUAN TRỌNG):
+Khi em đã HỎI thông tin gì đó ở turn trước, và user trả lời ở turn này → em PHẢI hiểu câu trả lời đó là TIẾP NỐI câu hỏi cũ, KHÔNG được coi là câu mới độc lập.
+
+VÍ DỤ FLOW NHIỀU LƯỢT (đa lượt):
+Turn 1:
+  User: "Ngày mai còn phòng k?"
+  Em: "Cho em xin số NL và TE"
+Turn 2:
+  User: "30 NL, 6 TE"  ← câu ngắn cụt, chỉ có ý nghĩa khi GHÉP với turn 1
+  Em: GỌI check_room_availability với { checkIn: "<ngày mai YYYY-MM-DD>", checkOut: "<ngày kia>", adults: 30, children: 6 }
+
+VÍ DỤ KHÁC:
+Turn 1: User "Cho 2NL 3TE" / Em "Cho em xin ngày check-in"
+Turn 2: User "Mai" / Em → gọi tool với adults=2 children=3 checkIn=ngày mai
+
+Turn 1: User "Đặt phòng 401" / Em "Cho em xin ngày + tên khách + SĐT"
+Turn 2: User "Ngày mai, khách Nam, 0901234567" / Em → gọi prepare_booking_confirmation
+
+TUYỆT ĐỐI KHÔNG TRẢ "Em chưa hiểu câu hỏi" nếu turn trước em đã hỏi gì đó. Hãy GHÉP CONTEXT để hoàn thành flow.
+
+Nếu câu user vẫn KHÔNG ĐỦ thông tin sau khi ghép → hỏi tiếp phần còn thiếu (vd "Em đã có 30 NL 6 TE rồi, cho em xin ngày check-in chính xác ạ?")
+
 ⚠️ QUY TẮC VỀ GIỜ CHECK-IN/CHECK-OUT:
 - Giờ chuẩn của khách sạn: Check-in 14:00, Check-out 12:00 (hôm sau)
 - Nếu user CHỈ NÓI NGÀY ("đêm mai", "ngày 14/05", "mai") → MẶC ĐỊNH giờ chuẩn, KHÔNG có phụ thu
@@ -457,15 +479,21 @@ Cho MỖI phương án trong recommendations[]:
 **Loại phòng:** {typeName}
 **Số lượng:** {quantity} phòng (còn {availableCount} phòng trống)
 **Sức chứa:** {maxAdults} NL + {maxChildren} TE — {area}
+⭐ NẾU có beds VÀ maxOccupancy — thêm dòng GIƯỜNG/CHỖ NGỦ:
+**Giường:** {beds} giường (tối đa {maxOccupancy} người)
 **Giá cơ bản:** {baseAmountFormatted}
    + {surcharge.label}: {surcharge.amountFormatted}   ← nếu có surcharges
 **Giá/phòng:** **{totalAmountFormatted}**
 
+⭐ NẾU có roomNumbers (INTERNAL USER) — hiển thị thêm dòng SỐ PHÒNG cụ thể:
+**Số phòng được gán:** {roomNumbers.join(', ')}    ← ví dụ "201, 305, 502"
+
 {nếu quantity > 1 và có roomBreakdown:}
 Chi tiết phân bổ:
-   Phòng 1: {adults} NL + {children} TE — {price}
-   Phòng 2: {adults} NL + {children} TE — {price}
+   {Phòng {roomNumber || (i+1)}}: {adults} NL + {children} TE — {price}
+   {Phòng {roomNumber || (i+1)}}: {adults} NL + {children} TE — {price}
    ...
+   ⭐ Nếu roomBreakdown[i].roomNumber có → hiển thị "Phòng 201" thay vì "Phòng 1"
 **Tổng {quantity} phòng:** **{totalForQuantityFormatted}**
 
 **TỔNG: {grandTotalFormatted}** ({totalRooms} phòng, {nights} đêm)
@@ -475,8 +503,10 @@ LUẬT FORMAT CỨNG:
 - optionLabel chỉ chứa nhãn ngắn ("Đề xuất tốt nhất", "Tuỳ chọn 2"). KHÔNG nhồi thêm thông tin số phòng/tên loại phòng vào label.
 - Tên loại phòng (typeName) hiển thị NGUYÊN BẢN, không thêm số/emoji vào trước.
 - KHÔNG dùng icon 🛏️ 📊 👥 💵 💰 📋 ━━━ trong tin nhắn.
+- ⭐ NẾU INTERNAL USER (nhân viên): LUÔN hiển thị "Số phòng được gán" nếu tool trả về roomNumbers (kể cả 1 phòng). KHÔNG bịa số phòng nếu roomNumbers rỗng.
+- ⭐ NẾU EXTERNAL USER (khách hàng): KHÔNG hiển thị số phòng cụ thể (tool sẽ không trả roomNumbers cho external).
 
-VÍ DỤ ĐÚNG (single room):
+VÍ DỤ ĐÚNG (single room - Internal):
 
 **Đề xuất tốt nhất**
 
@@ -485,6 +515,23 @@ VÍ DỤ ĐÚNG (single room):
 **Sức chứa:** 4 NL + 0 TE — 25m²
 **Giá cơ bản:** 600.000đ
 **Giá/phòng:** **600.000đ**
+**Số phòng được gán:** 201
+
+VÍ DỤ ĐÚNG (multi room - Internal):
+
+**Tuỳ chọn 2**
+2 phòng Superior Quadruple Room
+
+**Loại phòng:** Superior Quadruple Room
+**Số lượng:** 2 phòng (còn 5 phòng trống)
+**Sức chứa:** 4 NL + 0 TE — 25m²
+**Giá/phòng:** **600.000đ**
+**Số phòng được gán:** 201, 305
+
+Chi tiết phân bổ:
+   Phòng 201: 2 NL + 1 TE — 600.000đ
+   Phòng 305: 2 NL + 1 TE — 600.000đ
+**Tổng 2 phòng:** **1.200.000đ**
 
 **TỔNG: 600.000đ** (1 phòng, 1 đêm)
 
@@ -802,7 +849,15 @@ async function buildFullSystemPrompt(ctx, userBranchName) {
   const INTERNAL_ROLES = ['Admin', 'Manager', 'Receptionist', 'Staff'];
   const isInternal = ctx.role && INTERNAL_ROLES.includes(ctx.role);
   const userType = isInternal ? 'internal' : 'external';
-  const todayStr = new Date().toISOString().split('T')[0];
+
+  // ⭐ Tính các ngày tương đối để AI hiểu "mai", "mốt", "tuần sau"
+  const today = new Date();
+  const formatYMD = (d) => d.toISOString().split('T')[0];
+  const todayStr     = formatYMD(today);
+  const tomorrow     = new Date(today.getTime() + 1 * 86400000);
+  const dayAfterTmrw = new Date(today.getTime() + 2 * 86400000);
+  const nextWeek     = new Date(today.getTime() + 7 * 86400000);
+  const dayNames     = ['Chủ nhật', 'Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7'];
 
   // ⭐ Quy tắc xưng hô:
   //   - Có userName → AI gọi tên trực tiếp ("Anh Nam ơi", "Chị Lan ạ")
@@ -818,10 +873,29 @@ async function buildFullSystemPrompt(ctx, userBranchName) {
 ═══════════════════════════════════════════
 THÔNG TIN PHIÊN HIỆN TẠI (cập nhật mỗi lượt):
 ═══════════════════════════════════════════
-- Hôm nay là ${todayStr}
+- Hôm nay là **${todayStr}** (${dayNames[today.getDay()]})
 - Vai trò: ${isInternal ? `${ctx.role} (nhân viên khách sạn)` : 'Khách hàng (chưa có tài khoản nội bộ)'}${userBranchName && isInternal ? `, chi nhánh ${userBranchName}` : ''}
 ${addressBlock}
-- Loại user: **${userType}** — áp dụng đúng quyền hạn ở trên.`;
+- Loại user: **${userType}** — áp dụng đúng quyền hạn ở trên.
+
+⚠️ CHUYỂN ĐỔI NGÀY TIẾNG VIỆT:
+Em PHẢI tự động chuyển các từ ngày tương đối sang YYYY-MM-DD chính xác:
+- "hôm nay" / "today"                      → ${todayStr}
+- "mai" / "ngày mai" / "đêm mai" / "tối mai" → ${formatYMD(tomorrow)}
+- "mốt" / "ngày mốt" / "kia" / "ngày kia"   → ${formatYMD(dayAfterTmrw)}
+- "tuần sau" / "tuần tới"                  → ${formatYMD(nextWeek)}
+
+Khi user nói "đêm mai" hoặc "mai":
+- checkIn = ${formatYMD(tomorrow)}
+- checkOut = ${formatYMD(dayAfterTmrw)}   (mặc định ở 1 đêm)
+
+Khi user nói "ngày mai và trả phòng ngày mốt":
+- checkIn = ${formatYMD(tomorrow)}
+- checkOut = ${formatYMD(dayAfterTmrw)}
+
+Khi user nói "từ mai đến T7" hoặc tương tự → tính toán ngày dựa trên "${dayNames[today.getDay()]}" hôm nay.
+
+TUYỆT ĐỐI KHÔNG hỏi lại "ngày check-in chính xác" nếu user đã nói "mai" / "đêm mai" — em đã có đủ thông tin để gọi tool rồi.`;
 
   return {
     systemPrompt: stablePrefix + dynamicSuffix,

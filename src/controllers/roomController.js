@@ -2,6 +2,10 @@ const Room    = require('../models/Room');
 const Booking = require('../models/Booking');
 
 // ── Tính trạng thái động theo booking.status ──────────
+// ⭐ FIX 14/05/2026:
+//   - Phòng có booking SẮP TỚI (now < checkIn) → 'available' (vẫn trống)
+//     Trước đây trả 'reserved' → user thấy "Đã đặt" ngay từ hôm trước
+//   - Thông tin booking sắp tới được gắn vào field `upcomingBooking` riêng
 const computeRealStatus = (room, activeBooking, subRoom = null) => {
   if (room.roomStatus === 'maintenance') return 'maintenance'
   if (room.roomStatus === 'inactive')    return 'cleaning'
@@ -12,9 +16,7 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
   const effectiveStatus = subRoom?.status ?? activeBooking.status
 
   if (effectiveStatus === 'checked_in') {
-    const refCheckOut = subRoom?.checkOut ?? activeBooking.checkOut
-    const now = new Date()
-    if (refCheckOut && now >= new Date(refCheckOut)) return 'occupied'
+    // Khách đã check-in → đang ở (bất kể giờ checkOut đã qua hay chưa)
     return 'occupied'
   }
 
@@ -24,7 +26,21 @@ const computeRealStatus = (room, activeBooking, subRoom = null) => {
 
   if (effectiveStatus === 'reserved' || effectiveStatus === 'confirmed') {
     const now = new Date()
-    if (now >= new Date(activeBooking.checkOut)) return 'checkout'
+    const refCheckIn  = new Date(subRoom?.checkIn  ?? activeBooking.checkIn)
+    const refCheckOut = new Date(subRoom?.checkOut ?? activeBooking.checkOut)
+
+    // ⭐ NEW: Nếu CHƯA tới giờ check-in → phòng vẫn TRỐNG
+    //   (booking là upcoming, chưa ảnh hưởng đến trạng thái phòng hiện tại)
+    if (now < refCheckIn) {
+      return 'available'
+    }
+
+    // Đã quá giờ checkOut nhưng vẫn ở status reserved/confirmed
+    // (lỗi nghiệp vụ: lễ tân quên đổi sang checked_out) → coi như checkout
+    if (now >= refCheckOut) return 'checkout'
+
+    // now ∈ [checkIn, checkOut] mà chưa checked_in → "reserved" hợp lệ
+    //   (vd khách đã đến trong khung giờ nhưng lễ tân chưa bấm CI)
     return 'reserved'
   }
 
@@ -78,7 +94,12 @@ const getAll = async (req, res, next) => {
       ],
     })
 
-    const bookingMap = {}
+    // ⭐ NEW: Tách booking thành 2 nhóm:
+    //   - currentMap: booking đang ảnh hưởng đến phòng (đang ở, đã reserve và checkIn <= now)
+    //   - upcomingMap: booking sắp tới (now < checkIn) — không đổi realStatus nhưng FE cần biết
+    const currentMap  = {}    // roomId → { booking, subRoom }
+    const upcomingMap = {}    // roomId → { booking, subRoom } (booking gần nhất sắp tới)
+
     for (const bk of activeBookings) {
       const relatedRooms = []
 
@@ -106,16 +127,31 @@ const getAll = async (req, res, next) => {
           continue
         }
 
-        if (!bookingMap[rid]) {
-          bookingMap[rid] = { booking: bk, subRoom }
+        const refCheckIn = new Date(subRoom?.checkIn ?? bk.checkIn)
+        // ⭐ Booking sắp tới: status reserved/confirmed VÀ chưa tới giờ check-in
+        const isUpcoming = (effectiveStatus === 'reserved' || effectiveStatus === 'confirmed')
+                          && now < refCheckIn
+
+        if (isUpcoming) {
+          // Gắn vào upcomingMap — pick booking gần nhất (checkIn sớm nhất)
+          if (!upcomingMap[rid]
+              || refCheckIn < new Date(upcomingMap[rid].subRoom?.checkIn ?? upcomingMap[rid].booking.checkIn)) {
+            upcomingMap[rid] = { booking: bk, subRoom }
+          }
         } else {
-          const cur = bookingMap[rid]
-          const curStatus = cur.subRoom?.status ?? cur.booking.status
-          const newStatus = effectiveStatus
-          if (curStatus !== 'checked_in' && newStatus === 'checked_in') {
-            bookingMap[rid] = { booking: bk, subRoom }
-          } else if (curStatus === newStatus && new Date(bk.checkIn) < new Date(cur.booking.checkIn)) {
-            bookingMap[rid] = { booking: bk, subRoom }
+          // Booking hiện tại (checked_in hoặc đã tới giờ check-in)
+          if (!currentMap[rid]) {
+            currentMap[rid] = { booking: bk, subRoom }
+          } else {
+            const cur = currentMap[rid]
+            const curStatus = cur.subRoom?.status ?? cur.booking.status
+            const newStatus = effectiveStatus
+            // Ưu tiên checked_in
+            if (curStatus !== 'checked_in' && newStatus === 'checked_in') {
+              currentMap[rid] = { booking: bk, subRoom }
+            } else if (curStatus === newStatus && new Date(bk.checkIn) < new Date(cur.booking.checkIn)) {
+              currentMap[rid] = { booking: bk, subRoom }
+            }
           }
         }
       }
@@ -123,7 +159,8 @@ const getAll = async (req, res, next) => {
 
     let result = rooms.map(r => {
       const obj      = r.toObject()
-      const entry    = bookingMap[r._id.toString()] ?? { booking: null, subRoom: null }
+      const ridStr   = r._id.toString()
+      const entry    = currentMap[ridStr] ?? { booking: null, subRoom: null }
       const booking  = entry.booking
       const subRoom  = entry.subRoom
 
@@ -141,17 +178,38 @@ const getAll = async (req, res, next) => {
         groupName:    booking.groupName ?? '',
         isGroupMember: !!subRoom,
         totalRoomsInBooking: Array.isArray(booking.rooms) ? booking.rooms.length : 1,
-        // ⭐ NEW 11/05/2026: Tên chính sách giá để FE hiển thị trong card grid
-        //   Ưu tiên sub-room.policyName (đoàn — mỗi phòng có policy riêng)
-        //   Fallback booking.policyName (đơn)
         policyName:   subRoom?.policyName ?? booking.policyName ?? '',
         priceType:    subRoom?.priceType  ?? booking.priceType  ?? '',
-        // ⭐ NEW 12/05/2026: Nguồn khách (Trực tiếp / Booking.com / Agoda / ...)
-        //   source là field cấp booking — đoàn dùng chung 1 nguồn cho cả đoàn,
-        //   không phải mỗi phòng có nguồn riêng → không có fallback từ subRoom.
         source:       booking.source ?? '',
       } : null
       obj.currentBookingId = booking?._id ?? null
+
+      // ⭐ NEW 14/05/2026: Booking sắp tới (phòng vẫn trống)
+      //   FE dùng để hiển thị badge 📅 góc phải + tooltip
+      const upcomingEntry = upcomingMap[ridStr]
+      if (upcomingEntry) {
+        const ub = upcomingEntry.booking
+        const usr = upcomingEntry.subRoom
+        const upCheckIn = usr?.checkIn ?? ub.checkIn
+        obj.upcomingBooking = {
+          id:           ub._id,
+          customerName: ub.customerName,
+          customerPhone: ub.customerPhone ?? '',
+          checkIn:      upCheckIn,
+          checkOut:     usr?.checkOut ?? ub.checkOut,
+          status:       usr?.status ?? ub.status,
+          isGroup:      ub.isGroup ?? false,
+          groupName:    ub.groupName ?? '',
+          policyName:   usr?.policyName ?? ub.policyName ?? '',
+          priceType:    usr?.priceType  ?? ub.priceType  ?? '',
+          source:       ub.source ?? '',
+          // Tiện cho FE: số giờ nữa đến check-in
+          hoursUntil:   Math.max(0, Math.round((new Date(upCheckIn) - now) / 3600000)),
+        }
+      } else {
+        obj.upcomingBooking = null
+      }
+
       return obj
     })
 
@@ -172,7 +230,8 @@ const getOne = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Không tìm thấy phòng' })
 
     const now = new Date()
-    const activeBooking = await Booking.findOne({
+    // ⭐ Lấy TẤT CẢ booking liên quan (cả hiện tại + upcoming)
+    const allBookings = await Booking.find({
       $or: [
         { roomId: room._id },
         { 'rooms.roomId': room._id },
@@ -190,24 +249,79 @@ const getOne = async (req, res, next) => {
       ],
     }).sort({ status: -1, checkIn: 1 })
 
-    let subRoom = null
-    if (activeBooking) {
-      if (activeBooking.roomId.toString() !== room._id.toString()) {
-        subRoom = (activeBooking.rooms ?? []).find(r =>
+    // ⭐ Tách thành booking hiện tại + booking sắp tới
+    let currentBooking = null
+    let currentSubRoom = null
+    let upcomingBooking = null
+    let upcomingSubRoom = null
+
+    for (const bk of allBookings) {
+      let subRoom = null
+      if (bk.roomId.toString() !== room._id.toString()) {
+        subRoom = (bk.rooms ?? []).find(r =>
           r.roomId && r.roomId.toString() === room._id.toString()
         ) ?? null
+      }
+
+      const effectiveStatus = subRoom?.status ?? bk.status
+      const refCheckIn = new Date(subRoom?.checkIn ?? bk.checkIn)
+      const isUpcoming = (effectiveStatus === 'reserved' || effectiveStatus === 'confirmed')
+                        && now < refCheckIn
+
+      if (isUpcoming) {
+        // Pick booking gần nhất
+        if (!upcomingBooking || refCheckIn < new Date(upcomingSubRoom?.checkIn ?? upcomingBooking.checkIn)) {
+          upcomingBooking = bk
+          upcomingSubRoom = subRoom
+        }
+      } else {
+        // Booking hiện tại — ưu tiên checked_in
+        if (!currentBooking
+            || (effectiveStatus === 'checked_in'
+                && (currentSubRoom?.status ?? currentBooking.status) !== 'checked_in')) {
+          currentBooking = bk
+          currentSubRoom = subRoom
+        }
       }
     }
 
     const obj         = room.toObject()
-    obj.realStatus    = computeRealStatus(room, activeBooking, subRoom)
-    obj.activeBooking = activeBooking ?? null
+    obj.realStatus    = computeRealStatus(room, currentBooking, currentSubRoom)
+    obj.activeBooking = currentBooking ?? null
+
+    // ⭐ NEW: upcomingBooking
+    if (upcomingBooking) {
+      const ub = upcomingBooking
+      const usr = upcomingSubRoom
+      const upCheckIn = usr?.checkIn ?? ub.checkIn
+      obj.upcomingBooking = {
+        id:           ub._id,
+        customerName: ub.customerName,
+        customerPhone: ub.customerPhone ?? '',
+        checkIn:      upCheckIn,
+        checkOut:     usr?.checkOut ?? ub.checkOut,
+        status:       usr?.status ?? ub.status,
+        isGroup:      ub.isGroup ?? false,
+        groupName:    ub.groupName ?? '',
+        policyName:   usr?.policyName ?? ub.policyName ?? '',
+        priceType:    usr?.priceType  ?? ub.priceType  ?? '',
+        source:       ub.source ?? '',
+        hoursUntil:   Math.max(0, Math.round((new Date(upCheckIn) - now) / 3600000)),
+      }
+    } else {
+      obj.upcomingBooking = null
+    }
 
     res.json({ success: true, data: { room: obj } })
   } catch (err) { next(err) }
 }
 
 // ── GET AVAILABLE ─────────────────────────────────────
+// ⚠️ KHÔNG đổi logic này:
+//   - Khi user pick checkIn/checkOut → check overlap booking → đúng
+//   - Khi không pick → chỉ trả phòng KHÔNG có active booking nào
+//   Đây là endpoint dành riêng cho "đặt phòng cho ngày X" — booking
+//   tương lai vẫn phải loại ra để tránh double-book.
 const getAvailable = async (req, res, next) => {
   try {
     const { branchId, checkIn, checkOut } = req.query

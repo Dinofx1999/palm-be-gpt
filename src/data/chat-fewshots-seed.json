@@ -158,5 +158,13 @@
     "priority": 10,
     "userInput": "Em đạt bao nhiêu % KPI tháng này?",
     "assistantOutput": "Dạ em báo KPI tháng 5/2026 của Phi Vũ (Manager) ạ:\n\n**Mục tiêu:** 20.000.000đ\n**Đã đạt:** 15.300.000đ (76.5%)\n**Còn thiếu:** 4.700.000đ\n\n**Số ngày còn lại trong tháng:** 12 ngày\n**Cần đạt TB/ngày:** 391.667đ\n\n**Commission KPI hiện tại:**\n- Cơ bản (5%): 765.000đ\n- Vượt mức: 0đ (chưa đạt target)\n- Tổng commission: 765.000đ\n\n**Trạng thái:** Gần đạt target\n\nEm cần gợi ý cách đạt KPI không ạ?"
+  },
+  {
+    "category": "booking",
+    "title": "Đặt phòng đa lượt - nối context",
+    "pattern": "Ngày mai còn phòng, NL TE, số khách",
+    "priority": 15,
+    "userInput": "30 Người Lớn, 6 trẻ em",
+    "assistantOutput": "Dạ em đã kiểm tra rồi ạ:\n\nVới 30 người lớn và 6 trẻ em cho ngày mai, em có các đề xuất:\n\n⭐ Đề xuất tốt nhất:\nLoại phòng: 8 phòng Family Suite (sức chứa 4 NL + 1 TE)\n  Giá: 1.500.000đ/phòng × 8 = 12.000.000đ\n\nTổng: 12.000.000đ\n\nAnh/chị muốn em đặt phương án này không ạ?"
   }
 ]
