@@ -178,63 +178,72 @@ ReconciliationSchema.index(
 );
 
 // ─── Pre-save: auto-generate code + label ──────────────────────────
+// ⭐ FIX 15/05: Dùng callback-style với next() — chắc chắn tương thích
+//   mọi version Mongoose, tránh confusion với async function
 ReconciliationSchema.pre('save', function (next) {
-  if (this.isNew && !this.reconciliationCode) {
-    const d = this.fromDate || new Date();
-    const dateStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-    const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
-    this.reconciliationCode = `REC_${dateStr}_${rand}`;
-  }
-  if (!this.label) {
-    const fromStr = this.fromDate?.toLocaleDateString('vi-VN');
-    const toStr = this.toDate?.toLocaleDateString('vi-VN');
-    if (this.period === 'daily') {
-      this.label = `Đối soát ngày ${fromStr}`;
-    } else if (this.period === 'weekly') {
-      this.label = `Đối soát tuần ${fromStr} - ${toStr}`;
-    } else if (this.period === 'monthly') {
-      const m = this.fromDate?.getMonth() + 1;
-      const y = this.fromDate?.getFullYear();
-      this.label = `Đối soát tháng ${m}/${y}`;
-    } else {
-      this.label = `Đối soát ${fromStr} - ${toStr}`;
+  try {
+    if (this.isNew && !this.reconciliationCode) {
+      const d = this.fromDate || new Date();
+      const dateStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+      const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
+      this.reconciliationCode = `REC_${dateStr}_${rand}`;
     }
+    if (!this.label) {
+      const fromStr = this.fromDate?.toLocaleDateString('vi-VN');
+      const toStr = this.toDate?.toLocaleDateString('vi-VN');
+      if (this.period === 'daily') {
+        this.label = `Đối soát ngày ${fromStr}`;
+      } else if (this.period === 'weekly') {
+        this.label = `Đối soát tuần ${fromStr} - ${toStr}`;
+      } else if (this.period === 'monthly') {
+        const m = this.fromDate?.getMonth() + 1;
+        const y = this.fromDate?.getFullYear();
+        this.label = `Đối soát tháng ${m}/${y}`;
+      } else {
+        this.label = `Đối soát ${fromStr} - ${toStr}`;
+      }
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
-  next();
 });
 
 // ─── Pre-save: auto-tính totals từ chi tiết ────────────────────────
 ReconciliationSchema.pre('save', function (next) {
-  const methods = ['cash', 'transfer', 'card', 'other'];
+  try {
+    const methods = ['cash', 'transfer', 'card', 'other'];
 
-  let totalSystemIn = 0;
-  let totalSystemOut = 0;
-  let totalActualIn = 0;
-  let totalActualOut = 0;
-  let totalDifference = 0;
+    let totalSystemIn = 0;
+    let totalSystemOut = 0;
+    let totalActualIn = 0;
+    let totalActualOut = 0;
+    let totalDifference = 0;
 
-  for (const m of methods) {
-    const detail = this[m] || {};
-    // Tính net từng loại
-    detail.systemNet = (detail.systemIn || 0) - (detail.systemOut || 0);
-    detail.actualNet = (detail.actualIn || 0) - (detail.actualOut || 0);
-    detail.difference = detail.actualNet - detail.systemNet;
+    for (const m of methods) {
+      const detail = this[m] || {};
+      detail.systemNet = (detail.systemIn || 0) - (detail.systemOut || 0);
+      detail.actualNet = (detail.actualIn || 0) - (detail.actualOut || 0);
+      detail.difference = detail.actualNet - detail.systemNet;
 
-    totalSystemIn  += detail.systemIn || 0;
-    totalSystemOut += detail.systemOut || 0;
-    totalActualIn  += detail.actualIn || 0;
-    totalActualOut += detail.actualOut || 0;
-    totalDifference += detail.difference;
+      totalSystemIn  += detail.systemIn || 0;
+      totalSystemOut += detail.systemOut || 0;
+      totalActualIn  += detail.actualIn || 0;
+      totalActualOut += detail.actualOut || 0;
+      totalDifference += detail.difference;
+    }
+
+    this.totalSystemIn = totalSystemIn;
+    this.totalSystemOut = totalSystemOut;
+    this.totalActualIn = totalActualIn;
+    this.totalActualOut = totalActualOut;
+    this.totalDifference = totalDifference;
+    this.shiftCount = (this.shiftIds || []).length;
+
+    next();
+  } catch (err) {
+    next(err);
   }
-
-  this.totalSystemIn = totalSystemIn;
-  this.totalSystemOut = totalSystemOut;
-  this.totalActualIn = totalActualIn;
-  this.totalActualOut = totalActualOut;
-  this.totalDifference = totalDifference;
-  this.shiftCount = (this.shiftIds || []).length;
-
-  next();
 });
 
 // ─── Static helpers ─────────────────────────────────────────────────
