@@ -417,16 +417,21 @@ function calculatePrice(input) {
       if (effectiveNights === 1) {
         // 1 đêm duy nhất: dùng giờ thực tế cả 2 đầu
         segStart = ci
-        // ⭐ FIX: Nếu co > coStandard (overstay) → đêm này dừng ở coStandard,
-        //   phần overstay tách ra surcharge "Trả phòng muộn" — tránh double counting
+        // ⭐ FIX 16/05/2026 v19.2: Nếu co > coStandard (overstay) → đêm này dừng ở coStandard,
+        //   phần overstay tách ra surcharge "Trả phòng muộn" — tránh double counting.
+        //   THÊM guard isCheckInAfterCoStd: nếu CI đã sau coStandard cùng ngày
+        //   (vd check-in muộn 18:14 > coStandard 12:00) → KHÔNG phải overstay,
+        //   mà là đêm 1 thực sự bắt đầu chiều/tối → segEnd = co bình thường.
         const [coStdH1, coStdM1] = coStandard.split(':').map(Number)
         const coStdMin1 = coStdH1 * 60 + coStdM1
         const coMin1    = co.getHours() * 60 + co.getMinutes()
+        const ciMin1    = ci.getHours() * 60 + ci.getMinutes()
+        const isCheckInAfterCoStd = ciMin1 >= coStdMin1   // ⭐ NEW guard
         // Chỉ apply nếu co và coStandard ở cùng ngày (đêm 1 duy nhất kéo dài qua nhiều ngày = không apply)
         const sameDayCo = co.getFullYear() === ci.getFullYear()
                        && co.getMonth() === ci.getMonth()
                        && co.getDate()  === ci.getDate() + (sameDay ? 0 : 1)
-        if (sameDayCo && coMin1 > coStdMin1 && (finalType === 'day' || finalType === 'night')) {
+        if (sameDayCo && coMin1 > coStdMin1 && !isCheckInAfterCoStd && (finalType === 'day' || finalType === 'night')) {
           const tmpEnd = new Date(co)
           tmpEnd.setHours(coStdH1, coStdM1, 0, 0)
           segEnd = tmpEnd
@@ -464,14 +469,21 @@ function calculatePrice(input) {
           tmp.setHours(h, m, 0, 0)
           segStart = tmp
         }
-        // ⭐ FIX: Nếu co thực > coStandard (overstay) → label đêm cuối DỪNG ở coStandard
-        //   thay vì kéo đến co. Lý do: phần [coStandard → co] sẽ được tính
-        //   riêng thành "Trả phòng muộn (X giờ)" → tránh double counting.
-        //   Nếu co <= coStandard (đúng giờ hoặc trả sớm) → giữ nguyên co.
+        // ⭐ FIX 16/05/2026 v19.2: Nếu co thực > coStandard (overstay) → label đêm cuối
+        //   DỪNG ở coStandard thay vì kéo đến co. Phần [coStandard → co] tách
+        //   thành surcharge "Trả phòng muộn" — tránh double counting.
+        //   Guard isLastNightStartAfterCoStd: nếu segStart đã sau coStandard
+        //   (vd đêm cuối bắt đầu 14:00 hoặc 18:00) → không phải overstay,
+        //   đêm này chạy bình thường → segEnd = co.
         const [coStdH, coStdM] = coStandard.split(':').map(Number)
         const coStdMin = coStdH * 60 + coStdM
         const coMin    = co.getHours() * 60 + co.getMinutes()
-        if (coMin > coStdMin && (finalType === 'day' || finalType === 'night')) {
+        const segStartMin = segStart.getHours() * 60 + segStart.getMinutes()
+        const sameDayLast = co.getFullYear() === segStart.getFullYear()
+                         && co.getMonth() === segStart.getMonth()
+                         && co.getDate()  === segStart.getDate()
+        const isLastNightStartAfterCoStd = sameDayLast && segStartMin >= coStdMin
+        if (coMin > coStdMin && !isLastNightStartAfterCoStd && (finalType === 'day' || finalType === 'night')) {
           // Đêm cuối tới giờ trả chuẩn — phần overstay sẽ vào surcharge "Trả phòng muộn"
           const tmpEnd = new Date(co)
           tmpEnd.setHours(coStdH, coStdM, 0, 0)

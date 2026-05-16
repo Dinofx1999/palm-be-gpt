@@ -120,9 +120,28 @@ const TransactionSchema = new Schema(
       default: '',
       maxlength: 500,
     },
+
+    // ⭐ NEW 15/05/2026: Audit khi payment liên kết bị sửa/huỷ
+    isEdited: { type: Boolean, default: false },
+    lastEditedAt: { type: Date, default: null },
+
+    // ⭐ Soft cancel khi user huỷ payment liên kết
+    isCancelled: { type: Boolean, default: false },
+    cancelledAt: { type: Date, default: null },
+    cancelledReason: { type: String, default: '', maxlength: 500 },
+
+    // ⭐ NEW 15/05/2026: Đối soát chuyển khoản với sao kê NH
+    //   Manager tick checkbox khi đã xác nhận gd này có trong sao kê NH
+    isReconciled: { type: Boolean, default: false, index: true },
+    reconciledAt: { type: Date, default: null },
+    reconciledBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    reconciledByName: { type: String, default: '' },
   },
   { timestamps: true }
 );
+
+// ⭐ Index cho query đối soát
+TransactionSchema.index({ branchId: 1, paymentMethod: 1, occurredOn: -1, isReconciled: 1 });
 
 // Index combo cho query thường dùng: list theo branch + tháng + type
 TransactionSchema.index({ branchId: 1, occurredOn: -1, type: 1 });

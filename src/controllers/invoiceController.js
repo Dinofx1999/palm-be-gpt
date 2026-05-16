@@ -1,6 +1,8 @@
 const Invoice = require('../models/Invoice');
 const Booking = require('../models/Booking');
 const User    = require('../models/User');
+const Transaction = require('../models/Transaction');
+const Shift = require('../models/Shift');
 
 // ⭐ NEW 14/05/2026: Auto-sync transaction khi thanh toán/hoàn tiền
 const {
@@ -222,6 +224,60 @@ const enrichInvoice = async (invoice) => {
     createdByUser: p.createdBy ? userMap[p.createdBy.toString()] ?? null : null,
   }))
 
+  // ⭐ NEW 16/05/2026: Enrich lockInfo cho từng payment
+  //   FE dùng để ẩn nút Sửa/Huỷ khi payment thuộc ca đã settle
+  try {
+    const paymentIds = (obj.payments ?? [])
+      .filter(p => !p.isDeleted)
+      .map(p => p._id);
+    if (paymentIds.length > 0) {
+      // Bulk lookup transactions linked to these payments
+      const txs = await Transaction.find({
+        relatedType: 'invoice_payment',
+        relatedId: { $in: paymentIds },
+        isCancelled: { $ne: true },
+      }).select('relatedId shiftId').lean();
+      const txMap = new Map(txs.map(t => [String(t.relatedId), t.shiftId]));
+
+      const shiftIds = [...new Set(txs.map(t => String(t.shiftId)).filter(Boolean))];
+      let shiftMap = new Map();
+      if (shiftIds.length > 0) {
+        const shifts = await Shift.find({ _id: { $in: shiftIds } })
+          .select('shiftCode status').lean();
+        shiftMap = new Map(shifts.map(s => [String(s._id), s]));
+      }
+
+      const LOCKED = ['handed_over', 'reconciled', 'resolved', 'disputed'];
+      const LABELS = {
+        handed_over: 'đã bàn giao',
+        reconciled:  'đã duyệt',
+        resolved:    'đã giải quyết tranh chấp',
+        disputed:    'đang tranh chấp',
+      };
+
+      obj.payments = obj.payments.map(p => {
+        if (p.isDeleted) return { ...p, lockInfo: { isLocked: false } };
+        const shiftId = txMap.get(String(p._id));
+        if (!shiftId) return { ...p, lockInfo: { isLocked: false } };
+        const sh = shiftMap.get(String(shiftId));
+        if (!sh) return { ...p, lockInfo: { isLocked: false } };
+        return {
+          ...p,
+          lockInfo: LOCKED.includes(sh.status)
+            ? {
+                isLocked: true,
+                shiftCode: sh.shiftCode,
+                shiftStatus: sh.status,
+                statusLabel: LABELS[sh.status] || sh.status,
+              }
+            : { isLocked: false, shiftCode: sh.shiftCode, shiftStatus: sh.status },
+        };
+      });
+    }
+  } catch (lockErr) {
+    console.error('[enrichInvoice] Enrich lockInfo failed (non-fatal):', lockErr.message);
+  }
+
   if (obj.bookingId) {
     try {
       const booking = await Booking.findById(obj.bookingId).select('roomNumber roomType rooms')
@@ -383,11 +439,8 @@ const getOrCreateForBooking = safe(async (req, res) => {
       invoice.totalAmount     = totals.totalAmount
       invoice.roomNumber      = totals.roomNumber
       invoice.items           = totals.items
-      invoice.remainingAmount = Math.max(0, totals.totalAmount - (invoice.paidAmount ?? 0))
-      invoice.paymentStatus   =
-        (invoice.paidAmount ?? 0) >= totals.totalAmount ? 'paid'
-        : (invoice.paidAmount ?? 0) > 0                 ? 'partial'
-        :                                                 'unpaid'
+      // ⭐ FIX 15/05/2026: Dùng helper để filter isDeleted khi tính paidAmount
+      recomputeInvoiceTotals(invoice)
 
       if (!invoice.branchId && booking.branchId) {
         invoice.branchId = booking.branchId
@@ -429,12 +482,10 @@ const addPayment = safe(async (req, res) => {
     targetRoomId: targetRoomId ?? null,
   })
 
-  const paidAmount = invoice.payments.reduce((s, p) => s + (p.amount ?? 0), 0)
-  invoice.paidAmount      = paidAmount
-  invoice.remainingAmount = Math.max(0, (invoice.totalAmount ?? 0) - paidAmount)
-  invoice.paymentStatus   = paidAmount >= (invoice.totalAmount ?? 0) ? 'paid' :
-                            paidAmount > 0 ? 'partial' : 'unpaid'
-  invoice.paymentMethod   = method ?? invoice.paymentMethod
+  // ⭐ FIX 15/05/2026: Dùng helper recomputeInvoiceTotals — filter isDeleted
+  //   (Trước đây cộng cả payment đã huỷ → tổng sai)
+  recomputeInvoiceTotals(invoice)
+  invoice.paymentMethod = method ?? invoice.paymentMethod
   await invoice.save()
 
   // ⭐ NEW 14/05/2026: Auto-sync transaction vào module Thu/Chi
@@ -549,4 +600,410 @@ const update = safe(async (req, res) => {
   res.json({ success: true, message: 'Cập nhật thành công', data: { invoice } })
 }, 'update')
 
-module.exports = { getAll, getOne, getOrCreateForBooking, addPayment, update }
+// ─────────────────────────────────────────────────────────────────
+// ⭐ NEW 15/05/2026: Edit + Delete payment + History
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Helper: tính lại paidAmount/remaining/status từ payments[]
+ *   Bỏ qua các payment đã isDeleted
+ */
+function recomputeInvoiceTotals(invoice) {
+  const validPayments = (invoice.payments ?? []).filter(p => !p.isDeleted)
+  const paidAmount = validPayments.reduce((s, p) => s + (p.amount ?? 0), 0)
+  invoice.paidAmount = paidAmount
+  invoice.remainingAmount = Math.max(0, (invoice.totalAmount ?? 0) - paidAmount)
+  invoice.paymentStatus =
+    paidAmount >= (invoice.totalAmount ?? 0) ? 'paid'
+    : paidAmount > 0 ? 'partial'
+    : 'unpaid'
+}
+
+/**
+ * Helper: check permission — cho phép nếu cùng branch
+ *   - Admin: mọi branch
+ *   - Khác: phải cùng branch của invoice
+ */
+const canModifyPayment = (user, invoice) => {
+  if (user.role === 'Admin') return true
+  const userBranchId = String(user.branchId?._id ?? user.branchId ?? '')
+  const invoiceBranchId = String(invoice.branchId ?? '')
+  return userBranchId && invoiceBranchId && userBranchId === invoiceBranchId
+}
+
+/**
+ * ⭐ NEW 16/05/2026: Check payment có thuộc ca đã settle không?
+ *   Ca đã settle = status ∈ ['handed_over', 'reconciled', 'resolved', 'disputed']
+ *   Nghĩa là tiền đã được bàn giao thực tế / đã đối soát với QL / NH → không cho sửa.
+ *
+ * Logic kinh doanh: đã bàn giao = đã settle. Nếu khách cần thay đổi → tạo gd hoàn trả mới.
+ *
+ * @returns {Object|null} null nếu OK, ngược lại { blocked: true, shiftCode, status, reason }
+ */
+const STATUS_LABEL = {
+  handed_over: 'đã bàn giao',
+  reconciled:  'đã duyệt',
+  resolved:    'đã giải quyết tranh chấp',
+  disputed:    'đang tranh chấp',
+}
+
+async function checkPaymentLockedByShift(paymentId) {
+  try {
+    // Tìm Transaction liên kết với payment này
+    const tx = await Transaction.findOne({
+      relatedType: 'invoice_payment',
+      relatedId: paymentId,
+      isCancelled: { $ne: true },
+    }).select('shiftId').lean()
+
+    if (!tx?.shiftId) return null   // Không có ca → cho sửa
+
+    const shift = await Shift.findById(tx.shiftId).select('shiftCode status').lean()
+    if (!shift) return null
+
+    const lockedStatuses = ['handed_over', 'reconciled', 'resolved', 'disputed']
+    if (lockedStatuses.includes(shift.status)) {
+      return {
+        blocked: true,
+        shiftCode: shift.shiftCode,
+        status: shift.status,
+        statusLabel: STATUS_LABEL[shift.status] || shift.status,
+      }
+    }
+    return null
+  } catch (err) {
+    console.error('[checkPaymentLockedByShift]', err.message)
+    return null   // fail-open để không block do lỗi tra cứu
+  }
+}
+
+/**
+ * PUT /api/invoices/:id/payments/:paymentId
+ * Body: { amount?, method?, note?, reason }
+ *   - reason: BẮT BUỘC (min 5 ký tự)
+ *   - Chỉ field nào gửi mới được update
+ */
+const editPayment = safe(async (req, res) => {
+  const { id, paymentId } = req.params
+  const { amount, method, note, reason = '' } = req.body
+
+  if (!reason || reason.trim().length < 5) {
+    return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do sửa (≥5 ký tự)' })
+  }
+
+  const invoice = await Invoice.findById(id)
+  if (!invoice) return res.status(404).json({ success: false, message: 'Không tìm thấy hoá đơn' })
+
+  if (!canModifyPayment(req.user, invoice)) {
+    return res.status(403).json({ success: false, message: 'Không có quyền sửa thanh toán của chi nhánh khác' })
+  }
+
+  const payment = invoice.payments.id(paymentId)
+  if (!payment) return res.status(404).json({ success: false, message: 'Không tìm thấy phiếu thanh toán' })
+
+  if (payment.isDeleted) {
+    return res.status(400).json({ success: false, message: 'Phiếu này đã bị huỷ, không thể sửa' })
+  }
+
+  // ⭐ NEW 16/05/2026: Block khi payment thuộc ca đã settle (bàn giao/duyệt/tranh chấp)
+  //   Lý do: đã bàn giao = tiền đã thực sự chuyển/báo có → không thể "sửa số".
+  //   Nếu khách cần thay đổi → tạo giao dịch hoàn trả mới ở ca hiện tại.
+  const lockInfo = await checkPaymentLockedByShift(paymentId)
+  if (lockInfo) {
+    return res.status(409).json({
+      success: false,
+      code: 'PAYMENT_LOCKED_BY_SHIFT',
+      message: `Phiếu thanh toán này thuộc ca ${lockInfo.shiftCode} đã ${lockInfo.statusLabel} — không thể sửa. Nếu cần điều chỉnh, vui lòng tạo giao dịch hoàn trả mới ở ca hiện tại.`,
+      data: { shiftCode: lockInfo.shiftCode, shiftStatus: lockInfo.status },
+    })
+  }
+
+  // ⭐ Validate giá trị mới
+  const changes = {}
+  let hasChange = false
+
+  if (amount !== undefined) {
+    const newAmount = Number(amount)
+    if (!Number.isFinite(newAmount) || newAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Số tiền không hợp lệ' })
+    }
+    // Tôn trọng dấu: nếu payment cũ âm (refund) → giữ âm
+    const signedNewAmount = payment.amount < 0 ? -Math.abs(newAmount) : Math.abs(newAmount)
+    if (signedNewAmount !== payment.amount) {
+      changes.amount = { from: payment.amount, to: signedNewAmount }
+      payment.amount = signedNewAmount
+      hasChange = true
+    }
+  }
+
+  if (method !== undefined && method !== payment.method) {
+    changes.method = { from: payment.method, to: String(method) }
+    payment.method = String(method)
+    hasChange = true
+  }
+
+  if (note !== undefined && String(note) !== (payment.note ?? '')) {
+    changes.note = { from: payment.note ?? '', to: String(note) }
+    payment.note = String(note)
+    hasChange = true
+  }
+
+  if (!hasChange) {
+    return res.status(400).json({ success: false, message: 'Không có thay đổi nào' })
+  }
+
+  // ⭐ Audit
+  const userId = req.user?.id ?? req.user?._id
+  let userName = req.user?.fullName ?? req.user?.username ?? ''
+  if (!userName && userId) {
+    try {
+      const u = await User.findById(userId).select('fullName username').lean()
+      userName = u?.fullName ?? u?.username ?? ''
+    } catch (_) {}
+  }
+
+  payment.isEdited = true
+  if (!Array.isArray(payment.editHistory)) payment.editHistory = []
+  payment.editHistory.push({
+    editedAt: new Date(),
+    editedBy: userId,
+    editedByName: userName,
+    reason: String(reason).slice(0, 500),
+    changes,
+  })
+
+  recomputeInvoiceTotals(invoice)
+  await invoice.save()
+
+  // ⭐ Sync Transaction: đánh dấu isEdited (transaction giữ nguyên amount cũ — Edit ko tạo gd mới)
+  //   Nếu muốn re-sync hoàn toàn → gọi syncInvoicePayment ở đây
+  try {
+    const syncResult = await syncInvoicePayment(invoice, payment, {
+      userId,
+      isEdit: true,   // ⭐ flag cho helper: update Transaction thay vì create mới
+    })
+    console.log('[editPayment] re-sync transaction:', syncResult)
+  } catch (syncErr) {
+    console.error('[editPayment] re-sync transaction failed (non-fatal):', syncErr.message)
+  }
+
+  // Update booking sub-rooms (nếu group) — đơn giản: recompute từ payments
+  if (invoice.bookingId) {
+    try {
+      await Booking.findByIdAndUpdate(invoice.bookingId, { paymentStatus: invoice.paymentStatus })
+    } catch (_) {}
+  }
+
+  // ⭐ FIX 16/05/2026: Audit log đầy đủ — gắn bookingId vào metadata
+  //   để Booking Detail audit tab có thể query thấy log này.
+  //   Thêm customer/room info để description rõ ràng hơn.
+  try {
+    // Lookup booking để có customer name + room
+    const booking = invoice.bookingId
+      ? await Booking.findById(invoice.bookingId).select('customerName roomNumber').lean()
+      : null
+    const customerLabel = booking?.customerName
+      ? `${booking.customerName}${booking.roomNumber ? ` (${booking.roomNumber})` : ''}`
+      : (invoice.customerName || 'khách')
+
+    // Mô tả thay đổi cụ thể
+    const changeParts = []
+    if (changes.amount) {
+      changeParts.push(
+        `số tiền: ${Math.abs(changes.amount.from).toLocaleString('vi-VN')}đ → ${Math.abs(changes.amount.to).toLocaleString('vi-VN')}đ`
+      )
+    }
+    if (changes.method) {
+      const methodLabel = (m) => ({ cash: 'Tiền mặt', transfer: 'Chuyển khoản', card: 'Thẻ' })[m] || m
+      changeParts.push(`HTTT: ${methodLabel(changes.method.from)} → ${methodLabel(changes.method.to)}`)
+    }
+    if (changes.note) changeParts.push('ghi chú')
+
+    await logAction({
+      entityType: 'Invoice', entityId: invoice._id,
+      action: 'edit_payment',
+      description: `Sửa phiếu thanh toán của ${customerLabel} — ${changeParts.join(', ')} (lý do: ${reason})`,
+      user: req.user, branchId: invoice.branchId,
+      metadata: {
+        paymentId, changes, reason,
+        bookingId: invoice.bookingId,           // ⭐ cho /by-booking query
+        invoiceCode: invoice.invoiceCode,
+        customerName: booking?.customerName,
+        roomNumber:   booking?.roomNumber,
+      },
+    })
+  } catch (auditErr) {
+    console.error('[editPayment] audit log failed (non-fatal):', auditErr.message)
+  }
+
+  const enriched = await enrichInvoice(invoice).catch(() => invoice.toObject())
+  res.json({
+    success: true,
+    message: 'Đã sửa phiếu thanh toán',
+    data: { invoice: enriched },
+  })
+}, 'editPayment')
+
+/**
+ * DELETE /api/invoices/:id/payments/:paymentId
+ * Body: { reason }
+ *   - Soft delete: payment.isDeleted = true
+ *   - Trừ paidAmount khỏi invoice
+ *   - Đánh dấu Transaction tương ứng isCancelled
+ */
+const deletePayment = safe(async (req, res) => {
+  const { id, paymentId } = req.params
+  const { reason = '' } = req.body
+
+  if (!reason || reason.trim().length < 5) {
+    return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do huỷ (≥5 ký tự)' })
+  }
+
+  const invoice = await Invoice.findById(id)
+  if (!invoice) return res.status(404).json({ success: false, message: 'Không tìm thấy hoá đơn' })
+
+  if (!canModifyPayment(req.user, invoice)) {
+    return res.status(403).json({ success: false, message: 'Không có quyền huỷ thanh toán của chi nhánh khác' })
+  }
+
+  const payment = invoice.payments.id(paymentId)
+  if (!payment) return res.status(404).json({ success: false, message: 'Không tìm thấy phiếu thanh toán' })
+
+  if (payment.isDeleted) {
+    return res.status(400).json({ success: false, message: 'Phiếu này đã bị huỷ trước đó' })
+  }
+
+  // ⭐ NEW 16/05/2026: Block khi payment thuộc ca đã settle
+  const lockInfo = await checkPaymentLockedByShift(paymentId)
+  if (lockInfo) {
+    return res.status(409).json({
+      success: false,
+      code: 'PAYMENT_LOCKED_BY_SHIFT',
+      message: `Phiếu thanh toán này thuộc ca ${lockInfo.shiftCode} đã ${lockInfo.statusLabel} — không thể huỷ. Nếu cần điều chỉnh, vui lòng tạo giao dịch hoàn trả mới ở ca hiện tại.`,
+      data: { shiftCode: lockInfo.shiftCode, shiftStatus: lockInfo.status },
+    })
+  }
+
+  const userId = req.user?.id ?? req.user?._id
+  let userName = req.user?.fullName ?? req.user?.username ?? ''
+  if (!userName && userId) {
+    try {
+      const u = await User.findById(userId).select('fullName username').lean()
+      userName = u?.fullName ?? u?.username ?? ''
+    } catch (_) {}
+  }
+
+  // Soft delete
+  payment.isDeleted = true
+  payment.deletedAt = new Date()
+  payment.deletedBy = userId
+  payment.deletedByName = userName
+  payment.deletedReason = String(reason).slice(0, 500)
+
+  recomputeInvoiceTotals(invoice)
+  await invoice.save()
+
+  // Allocate ngược: trừ paidAmount khỏi sub-rooms (nếu booking group)
+  if (invoice.bookingId) {
+    try {
+      const booking = await Booking.findById(invoice.bookingId)
+      if (booking && Array.isArray(booking.rooms) && booking.rooms.length > 0) {
+        let toReverse = Math.abs(payment.amount)
+        // Trừ từ phòng có paidAmount > 0
+        for (const sr of booking.rooms) {
+          if (toReverse <= 0) break
+          const paid = sr.paidAmount ?? 0
+          if (paid <= 0) continue
+          const sub = Math.min(paid, toReverse)
+          sr.paidAmount = paid - sub
+          toReverse -= sub
+        }
+        booking.paymentStatus = invoice.paymentStatus
+        await booking.save()
+      } else if (booking) {
+        booking.paymentStatus = invoice.paymentStatus
+        await booking.save()
+      }
+    } catch (e) {
+      console.error('[deletePayment] reverse allocate failed (non-fatal):', e.message)
+    }
+  }
+
+  // ⭐ Sync Transaction: đánh dấu Cancelled
+  try {
+    await removeInvoicePayment(invoice, payment, {
+      userId,
+      reason: payment.deletedReason,
+    })
+  } catch (syncErr) {
+    console.error('[deletePayment] cancel transaction failed (non-fatal):', syncErr.message)
+  }
+
+  // ⭐ FIX 16/05/2026: Audit log đầy đủ — gắn bookingId vào metadata
+  try {
+    const booking = invoice.bookingId
+      ? await Booking.findById(invoice.bookingId).select('customerName roomNumber').lean()
+      : null
+    const customerLabel = booking?.customerName
+      ? `${booking.customerName}${booking.roomNumber ? ` (${booking.roomNumber})` : ''}`
+      : (invoice.customerName || 'khách')
+
+    const methodLabel = (m) => ({ cash: 'Tiền mặt', transfer: 'Chuyển khoản', card: 'Thẻ' })[m] || m
+
+    await logAction({
+      entityType: 'Invoice', entityId: invoice._id,
+      action: 'cancel_payment',
+      description: `Huỷ phiếu thanh toán ${Math.abs(payment.amount).toLocaleString('vi-VN')}đ (${methodLabel(payment.method)}) của ${customerLabel} — lý do: ${reason}`,
+      user: req.user, branchId: invoice.branchId,
+      metadata: {
+        paymentId,
+        amount: payment.amount,
+        method: payment.method,
+        reason,
+        bookingId: invoice.bookingId,          // ⭐ cho /by-booking query
+        invoiceCode: invoice.invoiceCode,
+        customerName: booking?.customerName,
+        roomNumber:   booking?.roomNumber,
+      },
+    })
+  } catch (auditErr) {
+    console.error('[deletePayment] audit log failed (non-fatal):', auditErr.message)
+  }
+
+  const enriched = await enrichInvoice(invoice).catch(() => invoice.toObject())
+  res.json({
+    success: true,
+    message: 'Đã huỷ phiếu thanh toán',
+    data: { invoice: enriched },
+  })
+}, 'deletePayment')
+
+/**
+ * GET /api/invoices/:id/payments/:paymentId/history
+ * Trả về editHistory + deletedBy info của 1 payment
+ */
+const getPaymentHistory = safe(async (req, res) => {
+  const { id, paymentId } = req.params
+
+  const invoice = await Invoice.findById(id)
+  if (!invoice) return res.status(404).json({ success: false, message: 'Không tìm thấy hoá đơn' })
+
+  const payment = invoice.payments.id(paymentId)
+  if (!payment) return res.status(404).json({ success: false, message: 'Không tìm thấy phiếu thanh toán' })
+
+  res.json({
+    success: true,
+    data: {
+      paymentId: payment._id,
+      isEdited: !!payment.isEdited,
+      editHistory: payment.editHistory ?? [],
+      isDeleted: !!payment.isDeleted,
+      deletedAt: payment.deletedAt,
+      deletedBy: payment.deletedBy,
+      deletedByName: payment.deletedByName,
+      deletedReason: payment.deletedReason,
+    },
+  })
+}, 'getPaymentHistory')
+
+module.exports = { getAll, getOne, getOrCreateForBooking, addPayment, update, editPayment, deletePayment, getPaymentHistory }

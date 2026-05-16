@@ -1,14 +1,43 @@
+// backend/src/models/Invoice.js
+//
+// ⭐ UPDATED 15/05/2026: Thêm audit fields cho payment sub-document
+//   - isEdited / editHistory[]: track sửa đổi (Số tiền + Method + Note)
+//   - isDeleted / deletedAt / deletedBy / deletedReason: soft delete
+//
 const mongoose = require('mongoose');
 
+// ⭐ NEW: Schema cho 1 lần sửa đổi payment
+const paymentEditEntrySchema = new mongoose.Schema({
+  editedAt:     { type: Date, default: Date.now },
+  editedBy:     { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  editedByName: { type: String, default: '' },          // snapshot tên (audit-safe)
+  reason:       { type: String, required: true },
+  changes: {
+    amount: { from: Number, to: Number },
+    method: { from: String, to: String },
+    note:   { from: String, to: String },
+  },
+}, { _id: false });
+
 const paymentSchema = new mongoose.Schema({
-  amount:    { type: Number, required: true },   // dương = thu, âm = hoàn tiền
-  method:    { type: String, default: 'cash' },  // 'cash', 'bank', 'card', 'momo'...
+  amount:    { type: Number, required: true },
+  method:    { type: String, default: 'cash' },
   note:      { type: String, default: '' },
   type:      { type: String, enum: ['payment', 'refund'], default: 'payment' },
   paidAt:    { type: Date, default: Date.now },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-  // ⭐ NEW: Room ưu tiên thanh toán (cho booking đoàn — phòng được trả tiền trước)
   targetRoomId: { type: mongoose.Schema.Types.ObjectId, ref: 'Room', default: null },
+
+  // ⭐ NEW 15/05: Audit fields
+  isEdited:     { type: Boolean, default: false },
+  editHistory:  { type: [paymentEditEntrySchema], default: [] },
+
+  // ⭐ NEW 15/05: Soft delete
+  isDeleted:      { type: Boolean, default: false },
+  deletedAt:      { type: Date, default: null },
+  deletedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  deletedByName:  { type: String, default: '' },
+  deletedReason:  { type: String, default: '' },
 }, { _id: true });
 
 const itemSchema = new mongoose.Schema({
@@ -19,9 +48,7 @@ const itemSchema = new mongoose.Schema({
 }, { _id: false });
 
 const invoiceSchema = new mongoose.Schema({
-  // ⭐ NEW: Mã HĐ tự sinh dạng HD000001 (auto-gen ở pre-save hook)
   invoiceCode:     { type: String, unique: true, sparse: true, index: true },
-
   bookingId:       { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', required: true },
   customerId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', default: null },
   customerName:    { type: String, required: true },
@@ -38,20 +65,14 @@ const invoiceSchema = new mongoose.Schema({
   items:           [itemSchema],
   payments:        [paymentSchema],
   issuedBy:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-
-  // ⭐ NEW: Branch của hoá đơn (lấy từ booking khi tạo) — cho filter theo chi nhánh
   branchId:        { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
-
-  // Ngày lập HĐ
   issuedAt:        { type: Date, default: Date.now },
-  // Thời gian sửa đổi gần nhất
   lastModifiedAt:  { type: Date, default: Date.now },
 }, { timestamps: true });
 
 invoiceSchema.index({ bookingId: 1 });
 invoiceSchema.index({ customerId: 1 });
 invoiceSchema.index({ paymentStatus: 1 });
-// ⭐ NEW: Composite index cho filter theo branch + sort
 invoiceSchema.index({ branchId: 1, createdAt: -1 });
 
 invoiceSchema.pre('save', async function () {

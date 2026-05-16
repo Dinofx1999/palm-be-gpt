@@ -35,7 +35,8 @@ const Transaction = require('../models/Transaction');
  * @returns {Promise<{ created?, updated?, deleted?, skipped? }>}
  */
 async function syncInvoicePayment(invoice, payment, opts = {}) {
-  const { userId, action = 'create' } = opts;
+  // ⭐ UPDATED 15/05: thêm flag isEdit để đánh dấu Transaction.isEdited
+  const { userId, action = 'create', isEdit = false } = opts;
 
   if (!invoice?._id) return { skipped: 'no_invoice' };
   if (!payment?._id) return { skipped: 'no_payment' };
@@ -99,13 +100,16 @@ async function syncInvoicePayment(invoice, payment, opts = {}) {
   // Nếu method là ObjectId → lookup PaymentMethod để lấy type thực
   if (!paymentMethod && mongoose.Types.ObjectId.isValid(payment.method)) {
     try {
-      const PaymentMethod = mongoose.model('PaymentMethod');
+      // ⭐ Dùng require() thay vì mongoose.model() — đảm bảo schema được load
+      //   khi gọi từ standalone script (vd: backfill CLI)
+      const PaymentMethod = require('../models/PaymentMethod');
       const pmDoc = await PaymentMethod.findById(payment.method).select('type').lean();
       if (pmDoc?.type) {
         paymentMethod = pmMap[String(pmDoc.type).toLowerCase()] || 'other';
         console.log(`[syncInvoicePayment] Resolved ObjectId ${payment.method} → type "${pmDoc.type}" → "${paymentMethod}"`);
       }
     } catch (err) {
+      // Non-fatal: nếu model chưa load hoặc lookup lỗi → fallback 'cash'
       console.warn('[syncInvoicePayment] PaymentMethod lookup failed:', err.message);
     }
   }
@@ -144,18 +148,41 @@ async function syncInvoicePayment(invoice, payment, opts = {}) {
   });
 
   if (existing) {
+    const oldAmount = existing.amount;
+    const oldMethod = existing.paymentMethod;
+
     existing.type = txType;
     existing.amount = amount;
     existing.description = description;
     existing.category = category;
     existing.paymentMethod = paymentMethod;
     existing.occurredOn = new Date(occurredOn);
-    // ⭐ Update shiftId nếu chưa có (đừng đè nếu đã gán đúng ca rồi)
     if (!existing.shiftId && shiftId) {
       existing.shiftId = shiftId;
     }
+    // ⭐ NEW 15/05: Mark isEdited when payment sửa
+    if (isEdit) {
+      existing.isEdited = true;
+      existing.lastEditedAt = new Date();
+    }
     if (userId) existing.updatedBy = userId;
     await existing.save();
+
+    // ⭐ FIX 15/05/2026: Re-compute shift summary nếu amount/method đổi
+    //   (chỉ khi tx đã thuộc 1 ca và có thay đổi liên quan tổng tiền)
+    if (existing.shiftId && (oldAmount !== amount || oldMethod !== paymentMethod)) {
+      try {
+        const Shift = require('../models/Shift');
+        const newSummary = await Shift.computeShiftSummary(existing.shiftId);
+        await Shift.collection.updateOne(
+          { _id: existing.shiftId },
+          { $set: { summary: newSummary, updatedAt: new Date() } }
+        );
+      } catch (e) {
+        console.error('[syncInvoicePayment edit] re-compute shift summary failed (non-fatal):', e.message);
+      }
+    }
+
     return { updated: existing.toObject() };
   }
 
@@ -180,15 +207,61 @@ async function syncInvoicePayment(invoice, payment, opts = {}) {
 }
 
 /**
- * Xoá transaction liên quan 1 payment (khi user xoá payment riêng lẻ)
+ * ⭐ UPDATED 15/05/2026: Soft cancel transaction khi user huỷ payment
+ *   Thay vì xoá hẳn → đánh dấu isCancelled = true để vẫn audit được
+ *
+ *   Signature mới: removeInvoicePayment(invoice, payment, opts)
+ *   Để tương thích ngược: nếu gọi với 1 arg (paymentId) → fallback dùng cách cũ
  */
-async function removeInvoicePayment(paymentId) {
-  if (!paymentId) return { deleted: false };
-  const r = await Transaction.deleteOne({
+async function removeInvoicePayment(invoiceOrId, paymentMaybe, opts = {}) {
+  // Backward compat: nếu chỉ truyền 1 arg là paymentId (string/ObjectId)
+  if (!paymentMaybe && (typeof invoiceOrId === 'string' || invoiceOrId?._bsontype === 'ObjectID')) {
+    const paymentId = invoiceOrId;
+    if (!paymentId) return { deleted: false };
+    const r = await Transaction.deleteOne({
+      relatedType: 'invoice_payment',
+      relatedId: paymentId,
+    });
+    return { deleted: r.deletedCount > 0 };
+  }
+
+  // Signature mới: soft cancel
+  const payment = paymentMaybe;
+  const paymentId = payment?._id;
+  if (!paymentId) return { skipped: 'no_payment' };
+
+  const { userId, reason = '' } = opts;
+
+  const existing = await Transaction.findOne({
     relatedType: 'invoice_payment',
     relatedId: paymentId,
   });
-  return { deleted: r.deletedCount > 0 };
+  if (!existing) return { skipped: 'no_transaction' };
+
+  existing.isCancelled = true;
+  existing.cancelledAt = new Date();
+  existing.cancelledReason = String(reason).slice(0, 500);
+  if (userId) existing.updatedBy = userId;
+  await existing.save();
+
+  // ⭐ FIX 15/05/2026: Re-compute summary cho ca chứa gd này
+  //   Lý do: shift.summary là cached field — sau khi đánh dấu isCancelled,
+  //   nếu ca vẫn đang mở/đóng, summary cũ vẫn cộng gd này → hiển thị sai
+  if (existing.shiftId) {
+    try {
+      const Shift = require('../models/Shift');
+      const newSummary = await Shift.computeShiftSummary(existing.shiftId);
+      // ⭐ Dùng updateOne raw để bypass mongoose hooks (tránh re-trigger lỗi nào)
+      await Shift.collection.updateOne(
+        { _id: existing.shiftId },
+        { $set: { summary: newSummary, updatedAt: new Date() } }
+      );
+    } catch (e) {
+      console.error('[removeInvoicePayment] re-compute shift summary failed (non-fatal):', e.message);
+    }
+  }
+
+  return { cancelled: existing.toObject() };
 }
 
 /**

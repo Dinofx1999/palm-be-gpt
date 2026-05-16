@@ -177,6 +177,20 @@ const ShiftSchema = new Schema(
       default: '',
       maxlength: 100,
     },
+    // ⭐ NEW 15/05/2026: Bàn giao Banking (CK + Thẻ)
+    //   bankStatementBalance = handoverBankingToNext + handoverBankingToManager
+    //   - handoverBankingToNext: giữ trong tài khoản banking cho ca sau dùng
+    //   - handoverBankingToManager: rút NH chuyển sang tài khoản QL (gửi quỹ)
+    handoverBankingToNext: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    handoverBankingToManager: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     bankStatementBalance: {
       type: Number,
       default: 0,
@@ -230,7 +244,7 @@ const ShiftSchema = new Schema(
     // ─── Status ────────────────────────────────────────────────────
     status: {
       type: String,
-      enum: ['open', 'closed', 'handed_over', 'reconciled', 'disputed'],
+      enum: ['open', 'closed', 'handed_over', 'reconciled', 'disputed', 'resolved'],
       default: 'open',
       index: true,
     },
@@ -245,6 +259,57 @@ const ShiftSchema = new Schema(
       ref: 'User',
     },
     reconciledAt: { type: Date },
+
+    // ⭐ NEW 16/05/2026: Đối soát khi duyệt ca
+    //   QL nhập số đếm thực tế, tick từng gd CK, ghi lý do nếu chênh lệch
+    reconcileCheck: {
+      // Cash
+      actualCashCounted: { type: Number, default: null },   // Số tiền QL đếm thực tế (BG quản lý)
+      cashDifference:    { type: Number, default: 0 },      // = actualCashCounted - handoverToManager
+      cashReason:        { type: String, default: '', maxlength: 500 },
+
+      // Banking — số tiền các gd CK đã được tick
+      bankReconciledAmount: { type: Number, default: 0 },
+      bankExpectedAmount:   { type: Number, default: 0 },   // tổng CK đáng lẽ phải đối soát
+      bankDifference:       { type: Number, default: 0 },
+      bankReason:           { type: String, default: '', maxlength: 500 },
+
+      // Tổng quan
+      checkedAt: { type: Date, default: null },
+      checkedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+      checkedByName: { type: String, default: '' },
+    },
+
+    // ⭐ NEW 16/05/2026: Giải quyết tranh chấp
+    //   Khi Manager đánh dấu disputed → chứa thread comment + resolution cuối cùng
+    disputeResolution: {
+      // Lý do ban đầu (khi mark disputed) — copy từ closingNote
+      initialReason: { type: String, default: '', maxlength: 1000 },
+      markedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+      markedByName: { type: String, default: '' },
+      markedAt: { type: Date, default: null },
+
+      // Thread thảo luận
+      comments: [{
+        userId: { type: Schema.Types.ObjectId, ref: 'User' },
+        userName: { type: String, default: '' },
+        userRole: { type: String, default: '' },
+        text: { type: String, maxlength: 2000 },
+        createdAt: { type: Date, default: Date.now },
+      }],
+
+      // Resolution cuối cùng
+      resolution: {
+        type: String,
+        enum: ['compensated', 'salary_deducted', 'system_error', 'ignored', null],
+        default: null,
+      },
+      resolutionAmount: { type: Number, default: 0 },
+      resolutionNote: { type: String, default: '', maxlength: 1000 },
+      resolvedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+      resolvedByName: { type: String, default: '' },
+      resolvedAt: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );
@@ -310,8 +375,10 @@ ShiftSchema.statics.findOpenShiftForUser = async function (userId, branchId) {
 ShiftSchema.statics.computeShiftSummary = async function (shiftId) {
   const Transaction = mongoose.model('Transaction');
 
+  // ⭐ FIX 15/05/2026: Exclude isCancelled = true để bàn giao ca không cộng gd đã huỷ
   const txs = await Transaction.find({
     shiftId: new mongoose.Types.ObjectId(shiftId),
+    isCancelled: { $ne: true },
   }).select('type amount paymentMethod').lean();
 
   // Map alias → enum chuẩn

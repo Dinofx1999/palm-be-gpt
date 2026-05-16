@@ -5,7 +5,7 @@ const Invoice      = require('../models/Invoice');
 const Branch       = require('../models/Branch');
 const PricePolicy  = require('../models/PricePolicy');
 const AuditLog     = require('../models/AuditLog');
-const { calculatePrice } = require('../utils/priceCalculator');
+const { calculatePrice, pickSlot, toMinutes, roundHoursWithTolerance } = require('../utils/priceCalculator');
 const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 
@@ -1159,6 +1159,28 @@ const moveRoom = async (req, res, next) => {
     const oldPolicyId    = isGroup ? subRoom.policyId     : booking.policyId
     const oldRoom        = await Room.findById(oldRoomId).populate('typeId')
 
+    // ════════════════════════════════════════════════════════════════════════
+    // ⭐ FIX 16/05/2026 v19.1 — Day-of-transfer rule
+    //   Quy tắc:
+    //     1. Đêm TRƯỚC splitAt (khách qua midnight): phòng cũ gánh full theo policy cũ
+    //     2. "Day-of-transfer": ngày chứa splitAt (chưa qua midnight kế) → phòng cũ KHÔNG tính
+    //        thêm đêm, chỉ có phí chuyển. Phòng mới gánh từ splitAt → cuối booking.
+    //     3. Phụ thu chuyển phòng: 1 dòng riêng dưới phòng cũ
+    //     4. Phòng MỚI = calculatePrice(splitAt, sourceCheckOut, newPolicy) — chuẩn 1 booking
+    //        Logic này áp dụng cho lúc moveRoom save vào DB (đến-khi-trả-phòng).
+    //        Tab "Đến hiện tại" được calculateBill mode='now' re-compute live.
+    //
+    //   Ví dụ: Booking 15/05 17:32 → 17/05 12:00, đổi 604(700K)→504(650K) lúc 16/05 17:33:
+    //     [604] Giá ngày (15/05 17:32 - 16/05 12:00)       700K  (đêm 1)
+    //     [604] Phụ thu chuyển phòng 604 → 504              30K
+    //     [504] Giá ngày (16/05 17:33 - 17/05 12:00)       650K  (đêm 2 của 504)
+    //                                                    1.380K
+    //
+    //   Ví dụ same-day: Booking 15/05 17:32 → 16/05 22:00, đổi 16/05 17:33:
+    //     [604] Giá ngày (15/05 17:32 - 16/05 12:00)       700K
+    //     [604] Phụ thu chuyển phòng                        30K
+    //     [504] Giá nghỉ giờ (16/05 17:33 - 16/05 22:00) slot ~5h  ???K
+    // ════════════════════════════════════════════════════════════════════════
     const recalcMoveBreakdown = async ({
       sourceCheckIn, sourceCheckOut, sourceActualCheckIn,
       sourcePolicySnapshot, sourcePolicyId,
@@ -1168,32 +1190,30 @@ const moveRoom = async (req, res, next) => {
       const newPolicy = await PricePolicy.findById(newPolicyId)
       if (!newPolicy) throw new Error('Không tìm thấy chính sách giá mới')
 
-      const branch      = await Branch.findById(booking.branchId)
-      const splitAt     = transferAt ? new Date(transferAt) : new Date()
+      const branch  = await Branch.findById(booking.branchId)
+      const splitAt = transferAt ? new Date(transferAt) : new Date()
       const newMaxAdults   = newRoom.typeId?.maxAdults   ?? newRoom.typeId?.capacity ?? 2
       const newMaxChildren = newRoom.typeId?.maxChildren ?? 0
 
+      const seg1Start = sourceActualCheckIn ?? sourceCheckIn
+
+      // Resolve old policy
       let oldPolicy = null
       const snap = sourcePolicySnapshot
         ? (sourcePolicySnapshot.toObject ? sourcePolicySnapshot.toObject() : sourcePolicySnapshot)
         : null
-
-      if (snap && (snap.dayEnabled || snap.hourEnabled || snap.nightEnabled || (snap.dayPrice && snap.dayPrice > 0) || (snap.nightPrice && snap.nightPrice > 0))) {
+      if (snap && (snap.dayEnabled || snap.hourEnabled || snap.dayPrice > 0 || snap.nightPrice > 0)) {
         oldPolicy = snap
       } else if (sourcePolicyId) {
         oldPolicy = await PricePolicy.findById(sourcePolicyId)
       }
-
       const oldMaxAdults   = snap?.maxAdults   ?? oldRoom?.typeId?.maxAdults   ?? snap?.capacity ?? oldRoom?.typeId?.capacity ?? 2
       const oldMaxChildren = snap?.maxChildren ?? oldRoom?.typeId?.maxChildren ?? 0
 
-      let resultAmount = 0
-      let resultBreakdown = []
-      let usedSplit = splitAt
-
+      // ── Case A: splitAt <= sourceCheckIn → chỉ phòng mới
       if (splitAt <= sourceCheckIn) {
         const result = calculatePrice({
-          checkIn:   sourceActualCheckIn ?? sourceCheckIn,
+          checkIn:   seg1Start,
           checkOut:  sourceCheckOut,
           priceType: sourcePriceType,
           policy:    newPolicy, branch,
@@ -1201,95 +1221,153 @@ const moveRoom = async (req, res, next) => {
           children:  sourceChildren,
           maxAdults: newMaxAdults, maxChildren: newMaxChildren,
         })
-        resultAmount    = result.roomAmount
-        resultBreakdown = (result.breakdown ?? []).map(b => ({
+        const items = (result.breakdown ?? []).map(b => ({
           ...b,
           label: `[${newRoom.number}] ${b.label}`,
           meta:  { ...(b.meta || {}), segment: 2, roomNumber: newRoom.number, policyId: newPolicy._id },
         }))
-      } else if (splitAt >= sourceCheckOut) {
-        resultAmount = currentRoomAmount
-      } else {
-        const seg1CheckIn = sourceActualCheckIn ?? sourceCheckIn
-        let seg1Amount = 0
-        let seg1Items  = []
+        const fee = Math.max(0, Number(transferFee) || 0)
+        if (fee > 0) {
+          items.unshift({
+            label:  `[${oldRoomNumber}] Phụ thu chuyển phòng ${oldRoomNumber} → ${newRoom.number}`,
+            amount: fee, type: 'surcharge',
+            meta:   { segment: 1, roomNumber: oldRoomNumber, transferFeeRow: true },
+          })
+        }
+        return {
+          roomAmount:     result.roomAmount + fee,
+          priceBreakdown: items,
+          usedSplit:      splitAt,
+          newPolicy, newMaxAdults, newMaxChildren,
+        }
+      }
 
-        if (oldPolicy) {
-          const seg1Result = calculatePrice({
-            checkIn:   seg1CheckIn,
-            checkOut:  splitAt,
-            priceType: sourcePriceType,
-            policy:    oldPolicy, branch,
-            adults:    sourceAdults,
-            children:  sourceChildren,
-            maxAdults: oldMaxAdults, maxChildren: oldMaxChildren,
-          })
-          const filteredBreakdown = (seg1Result.breakdown ?? []).filter(b => {
-            const label = String(b.label || '')
-            return !label.includes('Trả phòng muộn') && !label.includes('late_checkout')
-          })
-          seg1Amount = filteredBreakdown.reduce((s, b) => s + (b.amount ?? 0), 0)
-          seg1Items  = filteredBreakdown.map(b => ({
+      // ── Case B: splitAt >= sourceCheckOut → đã qua booking, không split
+      if (splitAt >= sourceCheckOut) {
+        return {
+          roomAmount:     currentRoomAmount,
+          priceBreakdown: [],
+          usedSplit:      splitAt,
+          newPolicy, newMaxAdults, newMaxChildren,
+        }
+      }
+
+      // ── Case C (main): splitAt nằm trong booking → day-of-transfer rule
+      const pad2 = (n) => String(n).padStart(2, '0')
+      const fmtDM   = (d) => `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}`
+      const fmtTime = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+
+      const items = []
+
+      // ─── PHẦN 1: SEG1 (phòng cũ) — chỉ tính đêm TRƯỚC splitAt (khách qua midnight) ───
+      //   Dùng calculatePrice với checkIn=seg1Start, checkOut=splitAt
+      //   Nhưng cần "trim" splitAt về midnight gần nhất TRƯỚC nó (không tính ngày calendar của splitAt)
+      //
+      //   Logic: Tìm coStandard của ngày HÔM TRƯỚC splitAt (= cuối đêm cuối cùng có khách
+      //   ngủ qua midnight trong phòng cũ).
+      //   - splitAt = 16/05 17:33, coStandard=12:00 → cutoff = 16/05 12:00 (đêm 15→16)
+      //   - splitAt = 16/05 02:44, coStandard=12:00 → cutoff = 16/05 12:00 (vẫn đêm 15→16)
+      //   - splitAt = 16/05 11:30 (trước co 12:00) → cutoff = 16/05 11:30 (chính splitAt, đêm 15→16 đến giờ này)
+      //
+      //   Simpler: dùng splitAtCutoff = min(splitAt, ngày hôm sau seg1Start lúc coStandard)
+      //   Đây là điểm cuối "đêm cuối cùng có khách ngủ qua midnight"
+      const ciStandard = branch?.checkInTime  || '14:00'
+      const coStandard = branch?.checkOutTime || '12:00'
+      const [ciH, ciM] = ciStandard.split(':').map(Number)
+      const [coH, coM] = coStandard.split(':').map(Number)
+
+      // Tính số đêm khách ngủ qua midnight TRƯỚC splitAt
+      // splitAtMidnight = 00:00 ngày của splitAt
+      const splitAtMidnight = new Date(splitAt)
+      splitAtMidnight.setHours(0, 0, 0, 0)
+      // Số đêm qua midnight = số lần midnight rơi vào (seg1Start, splitAt]
+      const seg1StartMidnight = new Date(seg1Start)
+      seg1StartMidnight.setHours(0, 0, 0, 0)
+      const nightsCrossedByOld = Math.max(0, Math.round((splitAtMidnight - seg1StartMidnight) / 86400000))
+
+      // Seg1 cutoff = nếu có đêm qua midnight, dừng ở coStandard của ngày splitAt
+      //              nếu chưa qua midnight (splitAt cùng ngày seg1Start), dừng ở splitAt
+      let seg1End
+      if (nightsCrossedByOld === 0) {
+        // Chưa qua midnight → seg1 = seg1Start → splitAt (= giá giờ hoặc trong tolerance)
+        seg1End = new Date(splitAt)
+      } else {
+        // Đã qua N midnight → tính N đêm full, dừng ở coStandard ngày splitAt
+        seg1End = new Date(splitAtMidnight)
+        seg1End.setHours(coH, coM, 0, 0)
+        if (seg1End > splitAt) seg1End = new Date(splitAt)   // nếu splitAt < coStandard cùng ngày
+      }
+
+      // Tính seg1 dùng calculatePrice
+      if (oldPolicy) {
+        const seg1Result = calculatePrice({
+          checkIn:   seg1Start,
+          checkOut:  seg1End,
+          priceType: sourcePriceType,
+          policy:    oldPolicy, branch,
+          adults:    sourceAdults,
+          children:  sourceChildren,
+          maxAdults: oldMaxAdults, maxChildren: oldMaxChildren,
+        })
+        // Filter bỏ "Trả phòng muộn" / "Nhận phòng sớm" (vì splitAt thường ngoài giờ chuẩn)
+        const filtered = (seg1Result.breakdown ?? []).filter(b => {
+          const lbl = String(b.label || '')
+          return !lbl.includes('Trả phòng muộn') && !lbl.includes('late_checkout')
+                 && !lbl.includes('Nhận phòng sớm') && !lbl.includes('early_checkin')
+        })
+        for (const b of filtered) {
+          items.push({
             ...b,
             label: `[${oldRoomNumber}] ${b.label}`,
             meta:  { ...(b.meta || {}), segment: 1, roomNumber: oldRoomNumber, policyId: sourcePolicyId },
-          }))
-        } else {
-          const oldNights = Math.max(1, currentNights || 1)
-          if (sourcePriceType === 'hour') {
-            const totalHours = Math.max(1, (sourceCheckOut - seg1CheckIn) / 3600000)
-            const usedHours  = Math.max(0, (splitAt - seg1CheckIn) / 3600000)
-            seg1Amount = Math.round(currentRoomAmount * (usedHours / totalHours))
-            seg1Items  = [{
-              label:  `[${oldRoomNumber}] Giá giờ (${usedHours.toFixed(1)}h)`,
-              amount: seg1Amount, type: 'base',
-              meta:   { segment: 1, roomNumber: oldRoomNumber, fallback: true },
-            }]
-          } else {
-            const startMs    = new Date(seg1CheckIn).setHours(0,0,0,0)
-            const splitMs    = new Date(splitAt).setHours(0,0,0,0)
-            const usedNights = Math.max(0, Math.min(oldNights, Math.ceil((splitMs - startMs) / 86400000)))
-            const pricePerNight = Math.round(currentRoomAmount / oldNights)
-            seg1Amount = pricePerNight * usedNights
-            seg1Items  = [{
-              label:  `[${oldRoomNumber}] Giá phòng × ${usedNights} đêm × ${pricePerNight.toLocaleString('vi-VN')}đ`,
-              amount: seg1Amount, type: 'base',
-              meta:   { segment: 1, roomNumber: oldRoomNumber, fallback: true },
-            }]
-          }
+          })
         }
+      }
 
-        const seg2Result = calculatePrice({
-          checkIn:   splitAt,
-          checkOut:  sourceCheckOut,
-          priceType: sourcePriceType,
-          policy:    newPolicy, branch,
-          adults:    sourceAdults,
-          children:  sourceChildren,
-          maxAdults: newMaxAdults, maxChildren: newMaxChildren,
+      // ─── PHẦN 2: Phụ thu chuyển phòng ───
+      const fee = Math.max(0, Number(transferFee) || 0)
+      if (fee > 0) {
+        items.push({
+          label:  `[${oldRoomNumber}] Phụ thu chuyển phòng ${oldRoomNumber} → ${newRoom.number}`,
+          amount: fee,
+          type:   'surcharge',
+          meta:   { segment: 1, roomNumber: oldRoomNumber, transferFeeRow: true },
         })
-        const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
-          const label = String(b.label || '')
-          return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
-        })
-        const seg2Amount = filteredSeg2.reduce((s, b) => s + (b.amount ?? 0), 0)
-        const seg2Items  = filteredSeg2.map(b => ({
+      }
+
+      // ─── PHẦN 3: SEG2 (phòng mới) — calculatePrice(splitAt → sourceCheckOut) ───
+      // Đây là logic chuẩn của 1 booking đơn lẻ — calculatePrice handle hết:
+      //   - Tolerance grace period
+      //   - Giá giờ vs giá ngày
+      //   - Day-equiv conversion, early CI, late CO
+      const seg2Result = calculatePrice({
+        checkIn:   splitAt,
+        checkOut:  sourceCheckOut,
+        priceType: sourcePriceType,
+        policy:    newPolicy, branch,
+        adults:    sourceAdults,
+        children:  sourceChildren,
+        maxAdults: newMaxAdults, maxChildren: newMaxChildren,
+      })
+      // Filter bỏ "Nhận phòng sớm" (vì splitAt là điểm chuyển, không phải sớm thật)
+      const seg2Filtered = (seg2Result.breakdown ?? []).filter(b => {
+        const lbl = String(b.label || '')
+        return !lbl.includes('Nhận phòng sớm') && !lbl.includes('early_checkin')
+      })
+      for (const b of seg2Filtered) {
+        items.push({
           ...b,
           label: `[${newRoom.number}] ${b.label}`,
           meta:  { ...(b.meta || {}), segment: 2, roomNumber: newRoom.number, policyId: newPolicy._id },
-        }))
-
-        resultAmount    = seg1Amount + seg2Amount
-        resultBreakdown = [...seg1Items, ...seg2Items]
+        })
       }
 
+      const resultAmount = items.reduce((s, it) => s + (it.amount || 0), 0)
       return {
         roomAmount:     resultAmount,
-        priceBreakdown: resultBreakdown,
-        usedSplit,
-        newPolicy,
-        newMaxAdults,
-        newMaxChildren,
+        priceBreakdown: items,
+        usedSplit:      splitAt,
+        newPolicy, newMaxAdults, newMaxChildren,
       }
     }
 
@@ -1359,7 +1437,11 @@ const moveRoom = async (req, res, next) => {
         booking.roomType   = newRoom.typeName
       }
 
-      booking.transferFee = (booking.transferFee || 0) + fee
+      // ⭐ FIX 16/05/2026 v19.1: Nếu policyChanged → fee đã gộp vào dòng phụ thu trong
+      //   subroom.priceBreakdown. KHÔNG cộng vào booking.transferFee để tránh double.
+      if (!policyChanged) {
+        booking.transferFee = (booking.transferFee || 0) + fee
+      }
       const totalRoomAmount = booking.rooms.reduce((s, r) => s + (r.roomAmount ?? 0), 0)
       booking.roomAmount = totalRoomAmount
 
@@ -1476,7 +1558,10 @@ const moveRoom = async (req, res, next) => {
       policyChanged          = true
     }
 
-    booking.transferFee = (booking.transferFee || 0) + fee
+    // ⭐ FIX 16/05/2026 v19.1: Tránh double-count fee khi policyChanged
+    if (!policyChanged) {
+      booking.transferFee = (booking.transferFee || 0) + fee
+    }
     booking.roomAmount     = newRoomAmount
     booking.priceBreakdown = newPriceBreakdown
     const subtotal = newRoomAmount + (booking.servicesAmount ?? 0)
@@ -3305,15 +3390,112 @@ const calculateBill = async (req, res, next) => {
         const oldSegments = (booking.priceBreakdown ?? []).filter(b => b.meta?.segment === 1)
         const oldSegmentsAmount = oldSegments.reduce((s, b) => s + (b.amount ?? 0), 0)
 
-        const seg2Result = calculatePrice({
-          checkIn:   lastTransferAt,
-          checkOut:  effectiveCheckOut,
-          priceType: booking.priceType,
-          policy, branch,
-          adults:    booking.adults,
-          children:  booking.children,
-          maxAdults, maxChildren,
-        })
+        // ⭐ FIX 16/05/2026 v19.3: Seg2 mode='now' logic
+        //   1. Trong tolerance (15p) → grace period 0đ (calculatePrice tự handle)
+        //   2. Sau tolerance, sameDay (chưa qua midnight kế) → tính giá GIỜ với
+        //      hourSlots của policy mới (dù hourEnabled=false vẫn dùng).
+        //      Fallback: nếu policy không có hourSlots → policy của roomType.
+        //   3. Qua midnight → tính theo NGÀY chuẩn
+        const tolerance = branch?.toleranceMinutes ?? 15
+        const seg2DiffMin = (effectiveCheckOut - lastTransferAt) / 60000
+        const seg2SameDay = lastTransferAt.getFullYear() === effectiveCheckOut.getFullYear()
+                         && lastTransferAt.getMonth() === effectiveCheckOut.getMonth()
+                         && lastTransferAt.getDate() === effectiveCheckOut.getDate()
+
+        let seg2Result
+
+        if (seg2DiffMin <= tolerance) {
+          // ── Trong tolerance: grace period
+          seg2Result = {
+            roomAmount: 0,
+            breakdown: [{
+              label: `Mới ${Math.max(0, Math.floor(seg2DiffMin))} Phút (Linh hoạt ${tolerance} Phút — Miễn Phí)`,
+              amount: 0,
+              type:   'base',
+              meta:   { freeGracePeriod: true, tolerance, diffMinutes: seg2DiffMin },
+            }],
+          }
+        } else if (seg2SameDay && booking.priceType === 'day') {
+          // ── Sau tolerance, cùng ngày → tính giá GIỜ với fallback hourSlots
+          // Resolve hourSlots: ưu tiên policy mới, fallback policy roomType
+          let hourSlotsToUse = Array.isArray(policy?.hourSlots) && policy.hourSlots.length > 0
+            ? policy.hourSlots
+            : null
+
+          if (!hourSlotsToUse) {
+            // Fallback: tìm policy của roomType (PricePolicy có roomTypeId = current room.typeId)
+            try {
+              const roomDoc = await Room.findById(booking.roomId).populate('typeId')
+              if (roomDoc?.typeId?._id) {
+                const altPolicy = await PricePolicy.findOne({
+                  roomTypeId: roomDoc.typeId._id,
+                  hourSlots: { $exists: true, $not: { $size: 0 } },
+                })
+                if (altPolicy && Array.isArray(altPolicy.hourSlots) && altPolicy.hourSlots.length > 0) {
+                  hourSlotsToUse = altPolicy.hourSlots
+                }
+              }
+            } catch (e) {
+              console.warn('[calculateBill v19.3] fallback hourSlots lookup failed:', e.message)
+            }
+          }
+
+          if (hourSlotsToUse) {
+            const hoursRounded = roundHoursWithTolerance(seg2DiffMin, tolerance)
+            const slot = pickSlot(hourSlotsToUse, hoursRounded)
+            if (slot && slot.price > 0) {
+              const pad2 = n => String(n).padStart(2, '0')
+              const fmtDM   = d => `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}`
+              const fmtTime = d => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+              const labelSlot = slot._isMinimum
+                ? `Giá giờ tối thiểu (Khung ${slot.time}h)`
+                : `Giá nghỉ giờ (${fmtDM(lastTransferAt)} ${fmtTime(lastTransferAt)} - ${fmtDM(effectiveCheckOut)} ${fmtTime(effectiveCheckOut)})`
+              seg2Result = {
+                roomAmount: slot.price,
+                breakdown: [{
+                  label:  labelSlot,
+                  amount: slot.price,
+                  type:   'base',
+                  meta:   { hourBased: true, hours: hoursRounded, slotHours: slot.time, fallbackHourSlots: !policy?.hourEnabled },
+                }],
+              }
+            } else {
+              // Không tìm được slot → fallback gọi calculatePrice bình thường
+              seg2Result = calculatePrice({
+                checkIn:   lastTransferAt,
+                checkOut:  effectiveCheckOut,
+                priceType: booking.priceType,
+                policy, branch,
+                adults:    booking.adults,
+                children:  booking.children,
+                maxAdults, maxChildren,
+              })
+            }
+          } else {
+            // Không có hourSlots ở đâu → fallback tính theo ngày
+            seg2Result = calculatePrice({
+              checkIn:   lastTransferAt,
+              checkOut:  effectiveCheckOut,
+              priceType: booking.priceType,
+              policy, branch,
+              adults:    booking.adults,
+              children:  booking.children,
+              maxAdults, maxChildren,
+            })
+          }
+        } else {
+          // ── Qua midnight → tính NGÀY chuẩn
+          seg2Result = calculatePrice({
+            checkIn:   lastTransferAt,
+            checkOut:  effectiveCheckOut,
+            priceType: booking.priceType,
+            policy, branch,
+            adults:    booking.adults,
+            children:  booking.children,
+            maxAdults, maxChildren,
+          })
+        }
+
         const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
           const label = String(b.label || '')
           return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
@@ -3600,7 +3782,6 @@ async function calculateGroupPrice({ branchId, checkIn, checkOut, rooms: roomsIn
     typeGroups: Array.from(byType.values()),
   }
 }
-
 const previewGroup = async (req, res) => {
   try {
     const { branchId, checkIn, checkOut, rooms: roomsInput = [] } = req.body

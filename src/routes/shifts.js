@@ -45,13 +45,41 @@ const applyScopeFilter = (filter, user) => {
 };
 
 /**
- * ⭐ UPDATED 15/05/2026: Sinh mã ca theo counter của branch
- *   Format: #1, #2, ..., #1000 (theo từng branch)
- *   Async + atomic increment
+ * Helper: chuẩn hoá tên branch → prefix code cho shiftCode
+ *   Ưu tiên: branch.code → branch.slug → normalize(branch.name) → fallback "BR"
+ *   Output uppercase, không dấu, không khoảng trắng, chỉ A-Z 0-9
+ *   Ví dụ: "Palm Hotel" → "PALM", "Đào Tấn 123" → "DAOTAN123"
+ */
+const normalizeBranchCode = (branch) => {
+  if (!branch) return 'BR';
+  if (branch.code) return String(branch.code).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (branch.slug) return String(branch.slug).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (branch.name) {
+    // Chuẩn hoá tiếng Việt: bỏ dấu rồi lấy uppercase
+    const normalized = String(branch.name)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')   // bỏ dấu
+      .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '')         // giữ chỉ chữ + số
+      .substring(0, 12);                 // giới hạn 12 ký tự
+    if (normalized) return normalized;
+  }
+  return 'BR';
+};
+
+/**
+ * ⭐ UPDATED 16/05/2026: Sinh mã ca theo BRANCH-N
+ *   Format: PALM-1, PALM-2, DAUTRE-1...
+ *   - prefix lấy từ branch.code / branch.slug / normalize(branch.name)
+ *   - số tăng theo counter của từng branch (atomic)
  */
 const genShiftCode = async (branchId) => {
+  const Branch = require('../models/Branch');
+  const branch = await Branch.findById(branchId).select('code slug name').lean();
+  const prefix = normalizeBranchCode(branch);
   const num = await ShiftCounter.getNext(branchId);
-  return `#${num}`;
+  return `${prefix}-${num}`;
 };
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -117,7 +145,13 @@ const getAll = async (req, res, next) => {
  */
 const getCurrent = async (req, res, next) => {
   try {
-    const branchId = resolveBranchId(req.user);
+    // ⭐ FIX 16/05/2026: Admin có thể chọn branch khác qua query ?branchId=
+    let branchId;
+    if (req.user.role === 'Admin' && req.query.branchId && mongoose.isValidObjectId(req.query.branchId)) {
+      branchId = req.query.branchId;
+    } else {
+      branchId = resolveBranchId(req.user);
+    }
     if (!branchId) {
       return res.json({ success: true, data: { shift: null, reason: 'NO_BRANCH' } });
     }
@@ -140,12 +174,10 @@ const getCurrent = async (req, res, next) => {
 
     // Compute realtime summary
     const summary = await Shift.computeShiftSummary(shift._id);
-    // ⭐ Két dự kiến = đầu ca + tổng thu - tổng chi (TẤT CẢ HTTT)
-    const totalIn = (summary.cashIn || 0) + (summary.transferIn || 0)
-      + (summary.cardIn || 0) + (summary.otherIn || 0);
-    const totalOut = (summary.cashOut || 0) + (summary.transferOut || 0)
-      + (summary.cardOut || 0) + (summary.otherOut || 0);
-    const expectedCash = (shift.openingCash || 0) + totalIn - totalOut;
+    // ⭐ FIX 15/05/2026: Két dự kiến = đầu ca + cashIn - cashOut (CHỈ tiền mặt)
+    //   Banking (CK + Thẻ) không nằm trong két tiền mặt — tính riêng ở expectedBankBalance
+    const expectedCash = (shift.openingCash || 0)
+      + (summary.cashIn || 0) - (summary.cashOut || 0);
 
     // ⭐ Check user có thuộc ca này không (cho UI hiển thị)
     const userId = resolveUserId(req.user);
@@ -251,7 +283,13 @@ const getOne = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Bạn không thuộc chi nhánh của ca này' });
     }
 
-    const transactions = await Transaction.find({ shiftId: shift._id })
+    // ⭐ FIX 15/05/2026: Exclude isCancelled để consistent với computeShiftSummary
+    //   Nếu cần xem cả gd đã huỷ, dùng query ?includeCancelled=true
+    const txFilter = { shiftId: shift._id };
+    if (req.query.includeCancelled !== 'true') {
+      txFilter.isCancelled = { $ne: true };
+    }
+    const transactions = await Transaction.find(txFilter)
       .sort({ occurredOn: -1, createdAt: -1 })
       .populate('recordedBy', 'fullName')
       .lean();
@@ -298,6 +336,10 @@ const getTransactionsInShift = async (req, res, next) => {
     }
     if (req.query.paymentMethod && ['cash', 'transfer', 'card', 'other'].includes(req.query.paymentMethod)) {
       filter.paymentMethod = req.query.paymentMethod;
+    }
+    // ⭐ FIX 15/05/2026: Default ẩn gd đã huỷ (consistent với summary)
+    if (req.query.includeCancelled !== 'true') {
+      filter.isCancelled = { $ne: true };
     }
 
     const txs = await Transaction.find(filter)
@@ -347,7 +389,17 @@ const openShift = async (req, res, next) => {
       return res.status(401).json({ success: false, message: 'Không xác định được userId' });
     }
 
-    const branchId = resolveBranchId(req.user);
+    // ⭐ FIX 16/05/2026: Admin có thể chọn branch khác (từ body.branchId hoặc query.branchId)
+    //   Manager/Receptionist/Staff: luôn dùng branchId của user
+    let branchId;
+    const bodyBranchId = req.body?.branchId;
+    const queryBranchId = req.query?.branchId;
+    const overrideBranchId = bodyBranchId || queryBranchId;
+    if (req.user.role === 'Admin' && overrideBranchId && mongoose.isValidObjectId(overrideBranchId)) {
+      branchId = overrideBranchId;
+    } else {
+      branchId = resolveBranchId(req.user);
+    }
     if (!branchId) {
       return res.status(400).json({
         success: false,
@@ -579,10 +631,13 @@ const closeShift = async (req, res, next) => {
       bankStatementBalance = 0,
       closingNote = '',
       autoChainNewShift = true,
-      // ⭐ NEW: 2 field bàn giao chia
+      // ⭐ NEW: 2 field bàn giao chia (cash)
       handoverToNext = 0,
       handoverToManager = 0,
       handoverReceiver = '',
+      // ⭐ NEW 15/05/2026: 2 field bàn giao banking
+      handoverBankingToNext = 0,
+      handoverBankingToManager = 0,
     } = req.body;
 
     if (!Array.isArray(closingCounts) || closingCounts.length === 0) {
@@ -596,6 +651,18 @@ const closeShift = async (req, res, next) => {
     }
     if (Number(handoverToNext) < 0 || Number(handoverToManager) < 0) {
       return res.status(400).json({ success: false, message: 'Số tiền bàn giao không được âm' });
+    }
+    // ⭐ NEW 15/05/2026: Validate banking handover
+    if (Number(handoverBankingToNext) < 0 || Number(handoverBankingToManager) < 0) {
+      return res.status(400).json({ success: false, message: 'Số tiền bàn giao banking không được âm' });
+    }
+    const totalHandoverBanking = Number(handoverBankingToNext) + Number(handoverBankingToManager);
+    if (totalHandoverBanking > Number(bankStatementBalance)) {
+      return res.status(400).json({
+        success: false,
+        message: `Tổng bàn giao banking (${totalHandoverBanking}) lớn hơn sao kê thực tế (${bankStatementBalance})`,
+        data: { bankStatementBalance, handoverBankingToNext, handoverBankingToManager, totalHandoverBanking },
+      });
     }
 
     // ⭐ UPDATED 15/05/2026: closingCounts không bắt buộc thuộc ca
@@ -672,12 +739,10 @@ const closeShift = async (req, res, next) => {
     // Compute summary
     const summary = await Shift.computeShiftSummary(shift._id);
     shift.summary = summary;
-    // ⭐ Két dự kiến = đầu ca + tổng thu - tổng chi (TẤT CẢ HTTT, không chỉ cash)
-    const totalInSum = (summary.cashIn || 0) + (summary.transferIn || 0)
-      + (summary.cardIn || 0) + (summary.otherIn || 0);
-    const totalOutSum = (summary.cashOut || 0) + (summary.transferOut || 0)
-      + (summary.cardOut || 0) + (summary.otherOut || 0);
-    shift.expectedCash = (shift.openingCash || 0) + totalInSum - totalOutSum;
+    // ⭐ FIX 15/05/2026: Két dự kiến = đầu ca + cashIn - cashOut (CHỈ tiền mặt)
+    //   Banking tính riêng ở expectedBankBalance
+    shift.expectedCash = (shift.openingCash || 0)
+      + (summary.cashIn || 0) - (summary.cashOut || 0);
     shift.expectedBankBalance = (shift.openingBankBalance || 0)
       + (summary.transferIn || 0) + (summary.cardIn || 0)
       - (summary.transferOut || 0) - (summary.cardOut || 0);
@@ -687,6 +752,9 @@ const closeShift = async (req, res, next) => {
     shift.handoverToManager = hMgr;
     shift.handoverReceiver = String(handoverReceiver || '');
     shift.bankStatementBalance = Number(bankStatementBalance) || 0;
+    // ⭐ NEW 15/05/2026: Persist banking handover
+    shift.handoverBankingToNext = Number(handoverBankingToNext) || 0;
+    shift.handoverBankingToManager = Number(handoverBankingToManager) || 0;
     shift.cashDifference = shift.actualCash - shift.expectedCash;
     shift.bankDifference = shift.bankStatementBalance - shift.expectedBankBalance;
     shift.closedAt = new Date();
@@ -698,20 +766,24 @@ const closeShift = async (req, res, next) => {
     let newShift = null;
     // ⭐ Auto-chain: tự mở ca mới với người đóng làm primary
     //   openingCash của ca mới = handoverToNext (không phải actualCash)
-    //   Phần handoverToManager đã nộp cho QL, không thuộc két ca mới
+    //   ⭐ FIX 15/05/2026: openingBankBalance của ca mới = handoverBankingToNext
+    //     (không phải bankStatementBalance — vì NV có thể đã nộp 1 phần banking cho QL)
     if (autoChainNewShift) {
       try {
         const newShiftCode = await genShiftCode(shift.branchId);
+        const newOpeningBanking = Number(handoverBankingToNext) || 0;
+        const bankingToMgr = Number(handoverBankingToManager) || 0;
         newShift = await Shift.create({
           shiftCode: newShiftCode,
           user: userId,
           branchId: shift.branchId,
           label: '',
           openedAt: new Date(),
-          openingCash: hNext,                  // ⭐ Đổi: dùng handoverToNext thay actualCash
-          openingBankBalance: shift.bankStatementBalance,
+          openingCash: hNext,                          // ⭐ handoverToNext (cash)
+          openingBankBalance: newOpeningBanking,       // ⭐ handoverBankingToNext (banking)
           openingNote: `Tự động chain từ ca ${shift.shiftCode}`
-            + (hMgr > 0 ? ` (đã nộp QL ${hMgr.toLocaleString('vi-VN')}đ)` : ''),
+            + (hMgr > 0 ? ` (đã nộp QL ti\u1ec1n m\u1eb7t ${hMgr.toLocaleString('vi-VN')}đ)` : '')
+            + (bankingToMgr > 0 ? ` (đã nộp QL banking ${bankingToMgr.toLocaleString('vi-VN')}đ)` : ''),
           previousShiftId: shift._id,
           status: 'open',
         });
@@ -838,11 +910,110 @@ const reconcile = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Ca chưa đóng — không thể duyệt' });
     }
 
-    const { dispute = false, reason = '' } = req.body;
-    shift.reconciledBy = resolveUserId(req.user);
+    const {
+      dispute = false,
+      reason = '',
+      // ⭐ NEW 16/05/2026: Đối soát
+      actualCashCounted = null,    // QL đếm tiền mặt thực tế
+      cashReason = '',              // Lý do nếu cash chênh lệch
+      bankReason = '',              // Lý do nếu CK chưa tick đủ
+    } = req.body;
+
+    // ⭐ NEW: Lưu thông tin đối soát
+    const userId = resolveUserId(req.user);
+    const userName = req.user.fullName || req.user.username || '';
+
+    if (actualCashCounted !== null) {
+      const cashCounted = Number(actualCashCounted) || 0;
+      const expectedCashForQL = Number(shift.handoverToManager) || 0;
+      const cashDiff = cashCounted - expectedCashForQL;
+
+      shift.reconcileCheck = shift.reconcileCheck || {};
+      shift.reconcileCheck.actualCashCounted = cashCounted;
+      shift.reconcileCheck.cashDifference = cashDiff;
+      shift.reconcileCheck.cashReason = String(cashReason || '').slice(0, 500);
+
+      // Validate: cash chênh lệch phải có lý do
+      if (cashDiff !== 0 && !String(cashReason || '').trim()) {
+        return res.status(400).json({
+          success: false,
+          code: 'CASH_DIFF_NEEDS_REASON',
+          message: `Tiền mặt chênh lệch ${cashDiff.toLocaleString('vi-VN')}đ — vui lòng nhập lý do`,
+        });
+      }
+    }
+
+    // Tính bank reconciliation từ Transaction
+    //   - bankExpectedAmount: tổng amount của tất cả tx CK trong ca (chưa cancel)
+    //   - bankReconciledAmount: tổng amount của tx có isReconciled=true
+    try {
+      const Transaction = require('../models/Transaction');
+      const PaymentMethod = require('../models/PaymentMethod');
+      const transferPMs = await PaymentMethod.find({ type: 'transfer' }).select('_id').lean();
+      const transferPMIds = transferPMs.map(p => String(p._id));
+
+      const bankTxFilter = {
+        shiftId: shift._id,
+        // ⭐ FIX 16/05/2026: Cả Thu (income) + Chi (expense) CK đều cần đối soát
+        isCancelled: { $ne: true },
+        $or: [
+          { paymentMethod: 'transfer' },
+          ...(transferPMIds.length > 0 ? [{ paymentMethod: { $in: transferPMIds } }] : []),
+        ],
+      };
+      const bankTxs = await Transaction.find(bankTxFilter).select('amount type isReconciled').lean();
+      // Net banking = Thu - Chi (cả 2 cùng đối soát)
+      const bankExpected = bankTxs.reduce((s, t) => {
+        const v = t.amount || 0;
+        return t.type === 'expense' ? s - v : s + v;
+      }, 0);
+      const bankReconciled = bankTxs
+        .filter(t => t.isReconciled)
+        .reduce((s, t) => {
+          const v = t.amount || 0;
+          return t.type === 'expense' ? s - v : s + v;
+        }, 0);
+      const bankDiff = bankExpected - bankReconciled;
+
+      shift.reconcileCheck = shift.reconcileCheck || {};
+      shift.reconcileCheck.bankReconciledAmount = bankReconciled;
+      shift.reconcileCheck.bankExpectedAmount = bankExpected;
+      shift.reconcileCheck.bankDifference = bankDiff;
+      shift.reconcileCheck.bankReason = String(bankReason || '').slice(0, 500);
+
+      // Validate: nếu bank chưa khớp 100% → cần lý do
+      if (bankDiff !== 0 && !String(bankReason || '').trim() && !dispute) {
+        return res.status(400).json({
+          success: false,
+          code: 'BANK_DIFF_NEEDS_REASON',
+          message: `Còn ${bankDiff.toLocaleString('vi-VN')}đ giao dịch CK chưa được đối soát — vui lòng nhập lý do`,
+          data: { bankExpected, bankReconciled, bankDiff },
+        });
+      }
+    } catch (bankErr) {
+      console.error('[reconcile] bank check failed:', bankErr.message);
+    }
+
+    shift.reconcileCheck.checkedAt = new Date();
+    shift.reconcileCheck.checkedBy = userId;
+    shift.reconcileCheck.checkedByName = userName;
+
+    shift.reconciledBy = userId;
     shift.reconciledAt = new Date();
     shift.status = dispute ? 'disputed' : 'reconciled';
-    if (dispute && reason) shift.closingNote = (shift.closingNote || '') + `\n[DISPUTED] ${reason}`;
+
+    // ⭐ NEW 16/05/2026: Lưu thông tin tranh chấp đầy đủ
+    if (dispute) {
+      shift.disputeResolution = shift.disputeResolution || {};
+      shift.disputeResolution.initialReason = String(reason || '').slice(0, 1000);
+      shift.disputeResolution.markedBy = userId;
+      shift.disputeResolution.markedByName = userName;
+      shift.disputeResolution.markedAt = new Date();
+      // Reset resolution (nếu trước đó đã resolve mà giờ mở lại tranh chấp — hiếm)
+      shift.disputeResolution.resolution = null;
+      shift.disputeResolution.resolvedAt = null;
+      if (reason) shift.closingNote = (shift.closingNote || '') + `\n[DISPUTED] ${reason}`;
+    }
     await shift.save();
 
     res.json({
@@ -852,6 +1023,179 @@ const reconcile = async (req, res, next) => {
     });
   } catch (err) { next(err); }
 };
+
+/**
+ * ⭐ NEW 16/05/2026: GET /:id/reconcile-check-data
+ *   Trả về dữ liệu cần để QL đối soát trước khi duyệt:
+ *   - bankTransactions: danh sách gd CK trong ca + trạng thái isReconciled
+ *   - summary: { handoverToManager (cash), bankExpected, bankReconciled, ... }
+ */
+const getReconcileCheckData = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'ID không hợp lệ' });
+    }
+
+    const shift = await Shift.findById(req.params.id).lean();
+    if (!shift) return res.status(404).json({ success: false, message: 'Không tìm thấy ca' });
+
+    const Transaction = require('../models/Transaction');
+    const PaymentMethod = require('../models/PaymentMethod');
+    const transferPMs = await PaymentMethod.find({ type: 'transfer' })
+      .select('_id name').lean();
+    const transferPMIds = transferPMs.map(p => String(p._id));
+    const pmNameMap = {};
+    for (const p of transferPMs) pmNameMap[String(p._id)] = p.name;
+
+    const bankTxs = await Transaction.find({
+      shiftId: shift._id,
+      // ⭐ FIX 16/05/2026: Cả Thu + Chi CK đều cần đối soát
+      isCancelled: { $ne: true },
+      $or: [
+        { paymentMethod: 'transfer' },
+        ...(transferPMIds.length > 0 ? [{ paymentMethod: { $in: transferPMIds } }] : []),
+      ],
+    })
+      .populate('recordedBy', 'fullName username')
+      .sort({ occurredOn: -1 })
+      .lean();
+
+    // Enrich với bank name
+    const bankTransactions = bankTxs.map(t => ({
+      ...t,
+      bankName: (typeof t.paymentMethod === 'string' && /^[0-9a-f]{24}$/i.test(t.paymentMethod))
+        ? (pmNameMap[t.paymentMethod] || 'CK không xác định')
+        : 'CK (chưa phân loại)',
+    }));
+
+    // Net = Thu - Chi (cùng đối soát)
+    const bankExpected = bankTransactions.reduce((s, t) => {
+      const v = t.amount || 0;
+      return t.type === 'expense' ? s - v : s + v;
+    }, 0);
+    const bankReconciled = bankTransactions
+      .filter(t => t.isReconciled)
+      .reduce((s, t) => {
+        const v = t.amount || 0;
+        return t.type === 'expense' ? s - v : s + v;
+      }, 0);
+
+    res.json({
+      success: true,
+      data: {
+        handoverToManager: shift.handoverToManager || 0,
+        handoverBankingToManager: shift.handoverBankingToManager || 0,
+        bankTransactions,
+        summary: {
+          bankCount: bankTransactions.length,
+          bankReconciledCount: bankTransactions.filter(t => t.isReconciled).length,
+          bankExpected,
+          bankReconciled,
+          bankDifference: bankExpected - bankReconciled,
+        },
+        existingCheck: shift.reconcileCheck || null,
+      },
+    });
+  } catch (err) { next(err); }
+};
+
+/**
+ * ⭐ NEW 16/05/2026: POST /:id/dispute-comment
+ *   Thêm 1 comment vào thread tranh chấp
+ *   Body: { text }
+ */
+const addDisputeComment = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'ID không hợp lệ' });
+    }
+    const { text } = req.body;
+    if (!text || !String(text).trim()) {
+      return res.status(400).json({ success: false, message: 'Vui lòng nhập nội dung' });
+    }
+
+    const shift = await Shift.findById(req.params.id);
+    if (!shift) return res.status(404).json({ success: false, message: 'Không tìm thấy ca' });
+    if (shift.status !== 'disputed') {
+      return res.status(400).json({ success: false, message: 'Ca không ở trạng thái tranh chấp' });
+    }
+
+    shift.disputeResolution = shift.disputeResolution || {};
+    if (!Array.isArray(shift.disputeResolution.comments)) {
+      shift.disputeResolution.comments = [];
+    }
+    shift.disputeResolution.comments.push({
+      userId: resolveUserId(req.user),
+      userName: req.user.fullName || req.user.username || '',
+      userRole: req.user.role || '',
+      text: String(text).slice(0, 2000),
+      createdAt: new Date(),
+    });
+    await shift.save();
+
+    res.json({ success: true, data: { shift: shift.toObject() } });
+  } catch (err) { next(err); }
+};
+
+/**
+ * ⭐ NEW 16/05/2026: POST /:id/resolve-dispute
+ *   Giải quyết tranh chấp → status chuyển sang 'resolved'
+ *   Body: { resolution, resolutionAmount, resolutionNote }
+ *     resolution: 'compensated' | 'salary_deducted' | 'system_error' | 'ignored'
+ */
+const resolveDispute = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'ID không hợp lệ' });
+    }
+    const {
+      resolution,
+      resolutionAmount = 0,
+      resolutionNote = '',
+    } = req.body;
+
+    const validResolutions = ['compensated', 'salary_deducted', 'system_error', 'ignored'];
+    if (!validResolutions.includes(resolution)) {
+      return res.status(400).json({
+        success: false,
+        message: `Resolution không hợp lệ — phải là một trong: ${validResolutions.join(', ')}`,
+      });
+    }
+    if (!String(resolutionNote || '').trim() || String(resolutionNote).trim().length < 5) {
+      return res.status(400).json({
+        success: false,
+        message: 'Vui lòng nhập ghi chú giải quyết (≥5 ký tự)',
+      });
+    }
+
+    const shift = await Shift.findById(req.params.id);
+    if (!shift) return res.status(404).json({ success: false, message: 'Không tìm thấy ca' });
+    if (shift.status !== 'disputed') {
+      return res.status(400).json({ success: false, message: 'Ca không ở trạng thái tranh chấp' });
+    }
+
+    const userId = resolveUserId(req.user);
+    const userName = req.user.fullName || req.user.username || '';
+
+    shift.disputeResolution = shift.disputeResolution || {};
+    shift.disputeResolution.resolution = resolution;
+    shift.disputeResolution.resolutionAmount = Number(resolutionAmount) || 0;
+    shift.disputeResolution.resolutionNote = String(resolutionNote).slice(0, 1000);
+    shift.disputeResolution.resolvedBy = userId;
+    shift.disputeResolution.resolvedByName = userName;
+    shift.disputeResolution.resolvedAt = new Date();
+
+    shift.status = 'resolved';
+    await shift.save();
+
+    res.json({
+      success: true,
+      message: 'Đã giải quyết tranh chấp',
+      data: { shift: shift.toObject() },
+    });
+  } catch (err) { next(err); }
+};
+
 
 /**
  * POST /:id/backfill-transactions — Gán shiftId cho giao dịch chưa có ca
@@ -923,6 +1267,10 @@ router.post('/:id/close',                    authenticate,                      
 router.post('/:id/handover',                 authenticate,                                handover);
 router.post('/:id/confirm-handover',         authenticate,                                confirmHandover);
 router.post('/:id/reconcile',                authenticate, authorize('Admin', 'Manager'), reconcile);
+router.get('/:id/reconcile-check-data',       authenticate, authorize('Admin', 'Manager'), getReconcileCheckData);
+// ⭐ NEW 16/05/2026: Tranh chấp
+router.post('/:id/dispute-comment',           authenticate,                                addDisputeComment);
+router.post('/:id/resolve-dispute',           authenticate, authorize('Admin', 'Manager'), resolveDispute);
 router.post('/:id/backfill-transactions',    authenticate,                                backfillTransactions);
 
 module.exports = router;

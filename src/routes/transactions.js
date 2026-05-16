@@ -32,6 +32,41 @@ const canEditTransaction = (user, transaction) => {
   return String(transaction.recordedBy) === String(user.id);
 };
 
+// ⭐ NEW 16/05/2026: Check transaction có thuộc ca đã settle không?
+//   Ca đã settle = status ∈ ['handed_over', 'reconciled', 'resolved', 'disputed']
+//   Đã bàn giao = tiền đã thực sự chuyển/báo có → không cho sửa/xoá.
+const TX_LOCKED_STATUS_LABEL = {
+  handed_over: 'đã bàn giao',
+  reconciled:  'đã duyệt',
+  resolved:    'đã giải quyết tranh chấp',
+  disputed:    'đang tranh chấp',
+};
+
+async function checkTransactionLockedByShift(transaction) {
+  try {
+    if (!transaction?.shiftId) return { isLocked: false };
+    // shiftId có thể là ObjectId raw hoặc populated object {_id, ...}
+    const shiftIdRaw = transaction.shiftId;
+    const shiftId = shiftIdRaw._id ? shiftIdRaw._id : shiftIdRaw;
+    const Shift = require('../models/Shift');
+    const shift = await Shift.findById(shiftId).select('shiftCode status').lean();
+    if (!shift) return { isLocked: false };
+    const lockedStatuses = ['handed_over', 'reconciled', 'resolved', 'disputed'];
+    if (lockedStatuses.includes(shift.status)) {
+      return {
+        isLocked: true,
+        shiftCode: shift.shiftCode,
+        shiftStatus: shift.status,
+        statusLabel: TX_LOCKED_STATUS_LABEL[shift.status] || shift.status,
+      };
+    }
+    return { isLocked: false, shiftCode: shift.shiftCode, shiftStatus: shift.status };
+  } catch (err) {
+    console.error('[checkTransactionLockedByShift]', err.message);
+    return { isLocked: false };
+  }
+}
+
 const canViewTransactions = (user) => !!user;   // Mọi role đăng nhập đều xem được
 
 // Filter scope theo role: Manager/Receptionist → chỉ branch của họ
@@ -157,6 +192,17 @@ router.get('/', authenticate, async (req, res) => {
       if (req.query.maxAmount) filter.amount.$lte = Number(req.query.maxAmount) || 0;
     }
 
+    // ─── 9.5. ⭐ NEW 15/05: Filter isCancelled ──────────────────────────
+    //   Default: ẩn giao dịch đã huỷ
+    //   req.query.includeCancelled=true: hiển thị cả gd huỷ
+    //   req.query.onlyCancelled=true: chỉ gd huỷ
+    if (req.query.onlyCancelled === 'true') {
+      filter.isCancelled = true;
+    } else if (req.query.includeCancelled !== 'true') {
+      // Mặc định: ẩn gd huỷ
+      filter.isCancelled = { $ne: true };
+    }
+
     // ─── 10. Text search ───────────────────────────────────────────────
     if (req.query.search) {
       // Nếu đã có $or (từ scope), phải merge — nhưng hiện tại scope dùng filter cứng
@@ -194,6 +240,116 @@ router.get('/', authenticate, async (req, res) => {
         { $group: { _id: '$type', total: { $sum: '$amount' }, count: { $sum: 1 } } },
       ]),
     ]);
+
+    // ⭐ NEW 15/05/2026: Enrich payment editHistory + cancel reason từ Invoice.payments
+    //   Tìm tất cả invoice_payment transactions → lookup payment sub-doc trong Invoice
+    //   Gắn vào tx._payment = { editHistory, deletedReason, deletedByName, isDeleted }
+    try {
+      const Invoice = require('../models/Invoice');
+      const invoicePaymentTxs = data.filter(tx =>
+        tx.relatedType === 'invoice_payment' && tx.relatedId
+      );
+      if (invoicePaymentTxs.length > 0) {
+        const paymentIds = invoicePaymentTxs.map(tx => tx.relatedId);
+        const invoices = await Invoice.find({
+          'payments._id': { $in: paymentIds },
+        }).select('invoiceCode payments customerName roomNumber').lean();
+
+        // Build map: paymentId → payment sub-doc + invoice meta
+        const paymentMap = new Map();
+        for (const inv of invoices) {
+          for (const p of (inv.payments ?? [])) {
+            paymentMap.set(String(p._id), {
+              payment: p,
+              invoiceCode: inv.invoiceCode,
+              customerName: inv.customerName,
+              roomNumber: inv.roomNumber,
+            });
+          }
+        }
+
+        // Attach _payment vào mỗi tx
+        for (const tx of data) {
+          if (tx.relatedType !== 'invoice_payment' || !tx.relatedId) continue;
+          const info = paymentMap.get(String(tx.relatedId));
+          if (!info) continue;
+          tx._payment = {
+            isEdited: !!info.payment.isEdited,
+            editHistory: info.payment.editHistory ?? [],
+            isDeleted: !!info.payment.isDeleted,
+            deletedAt: info.payment.deletedAt,
+            deletedBy: info.payment.deletedBy,
+            deletedByName: info.payment.deletedByName,
+            deletedReason: info.payment.deletedReason,
+            invoiceCode: info.invoiceCode,
+            customerName: info.customerName,
+            roomNumber: info.roomNumber,
+          };
+        }
+      }
+    } catch (enrichErr) {
+      console.error('[GET /transactions] Enrich payment history failed (non-fatal):', enrichErr.message);
+    }
+
+    // ⭐ NEW 16/05/2026: Enrich lockInfo cho từng tx
+    //   Bulk lookup Shift để FE biết tx nào không cho sửa/xoá
+    //   ⚠ tx.shiftId đã bị populate ở trên (line 228) → là object {_id, shiftCode, label}
+    //      Phải dùng tx.shiftId._id để get ObjectId
+    try {
+      const getShiftId = (tx) => {
+        const s = tx.shiftId;
+        if (!s) return null;
+        // Populated → object {_id, ...}; Not populated → ObjectId
+        return s._id ? String(s._id) : String(s);
+      };
+
+      const shiftIds = [...new Set(
+        data.map(tx => getShiftId(tx)).filter(Boolean)
+      )];
+      console.log(`[GET /transactions] Enrich lockInfo — ${data.length} tx, ${shiftIds.length} unique shifts`);
+
+      if (shiftIds.length > 0) {
+        const Shift = require('../models/Shift');
+        // Lookup status (populate trên line 228 chỉ get shiftCode + label, chưa có status)
+        const shifts = await Shift.find({ _id: { $in: shiftIds } })
+          .select('shiftCode status').lean();
+        const shiftMap = new Map(shifts.map(s => [String(s._id), s]));
+        console.log(`[GET /transactions] Found shifts:`, shifts.map(s => `${s.shiftCode}=${s.status}`).join(', '));
+
+        const LOCKED = ['handed_over', 'reconciled', 'resolved', 'disputed'];
+        const LABELS = {
+          handed_over: 'đã bàn giao',
+          reconciled:  'đã duyệt',
+          resolved:    'đã giải quyết tranh chấp',
+          disputed:    'đang tranh chấp',
+        };
+
+        let lockedCount = 0;
+        for (const tx of data) {
+          const sid = getShiftId(tx);
+          if (!sid) { tx.lockInfo = { isLocked: false }; continue; }
+          const sh = shiftMap.get(sid);
+          if (!sh) { tx.lockInfo = { isLocked: false }; continue; }
+          if (LOCKED.includes(sh.status)) {
+            tx.lockInfo = {
+              isLocked: true,
+              shiftCode: sh.shiftCode,
+              shiftStatus: sh.status,
+              statusLabel: LABELS[sh.status] || sh.status,
+            };
+            lockedCount++;
+          } else {
+            tx.lockInfo = { isLocked: false, shiftCode: sh.shiftCode, shiftStatus: sh.status };
+          }
+        }
+        console.log(`[GET /transactions] Locked: ${lockedCount}/${data.length}`);
+      } else {
+        for (const tx of data) tx.lockInfo = { isLocked: false };
+        console.log(`[GET /transactions] No tx has shiftId — all unlocked`);
+      }
+    } catch (lockErr) {
+      console.error('[GET /transactions] Enrich lockInfo failed (non-fatal):', lockErr.message);
+    }
 
     // Format summary
     let filteredIncome = 0, filteredExpense = 0;
@@ -442,6 +598,55 @@ router.get('/:id', authenticate, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Không có quyền xem giao dịch của branch khác' });
     }
 
+    // ⭐ NEW 15/05/2026: Enrich payment history nếu là invoice_payment transaction
+    if (tx.relatedType === 'invoice_payment' && tx.relatedId) {
+      try {
+        const Invoice = require('../models/Invoice');
+        const inv = await Invoice.findOne({ 'payments._id': tx.relatedId })
+          .select('invoiceCode payments customerName roomNumber bookingId')
+          .populate({
+            path: 'payments.editHistory.editedBy',
+            select: 'fullName username',
+          })
+          .lean();
+        if (inv) {
+          const payment = (inv.payments ?? []).find(p =>
+            String(p._id) === String(tx.relatedId)
+          );
+          if (payment) {
+            tx._payment = {
+              paymentId: payment._id,
+              isEdited: !!payment.isEdited,
+              editHistory: payment.editHistory ?? [],
+              isDeleted: !!payment.isDeleted,
+              deletedAt: payment.deletedAt,
+              deletedBy: payment.deletedBy,
+              deletedByName: payment.deletedByName,
+              deletedReason: payment.deletedReason,
+              currentAmount: payment.amount,
+              currentMethod: payment.method,
+              currentNote: payment.note,
+              invoiceCode: inv.invoiceCode,
+              customerName: inv.customerName,
+              roomNumber: inv.roomNumber,
+              bookingId: inv.bookingId,
+            };
+          }
+        }
+      } catch (enrichErr) {
+        console.error('[GET /transactions/:id] Enrich payment failed (non-fatal):', enrichErr.message);
+      }
+    }
+
+    // ⭐ NEW 16/05/2026: Enrich lockInfo
+    try {
+      const lockInfo = await checkTransactionLockedByShift(tx);
+      tx.lockInfo = lockInfo ?? { isLocked: false };
+    } catch (lockErr) {
+      console.error('[GET /transactions/:id] Enrich lockInfo failed (non-fatal):', lockErr.message);
+      tx.lockInfo = { isLocked: false };
+    }
+
     res.json({ success: true, data: { transaction: tx } });
   } catch (err) {
     console.error('[GET /transactions/:id]', err);
@@ -557,6 +762,17 @@ router.put('/:id', authenticate, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Không có quyền sửa giao dịch này' });
     }
 
+    // ⭐ NEW 16/05/2026: Block sửa nếu giao dịch thuộc ca đã settle
+    const lockInfo = await checkTransactionLockedByShift(tx);
+    if (lockInfo.isLocked) {
+      return res.status(409).json({
+        success: false,
+        code: 'TX_LOCKED_BY_SHIFT',
+        message: `Giao dịch này thuộc ca ${lockInfo.shiftCode} đã ${lockInfo.statusLabel} — không thể sửa. Nếu cần điều chỉnh, vui lòng tạo giao dịch ngược chiều mới ở ca hiện tại.`,
+        data: { shiftCode: lockInfo.shiftCode, shiftStatus: lockInfo.shiftStatus },
+      });
+    }
+
     const allowed = ['type', 'category', 'amount', 'description', 'occurredOn', 'paymentMethod', 'note'];
     for (const k of allowed) {
       if (req.body[k] !== undefined) {
@@ -600,10 +816,328 @@ router.delete('/:id', authenticate, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Không có quyền xoá' });
     }
 
+    // ⭐ NEW 16/05/2026: Block xoá nếu giao dịch thuộc ca đã settle
+    const lockInfo = await checkTransactionLockedByShift(tx);
+    if (lockInfo.isLocked) {
+      return res.status(409).json({
+        success: false,
+        code: 'TX_LOCKED_BY_SHIFT',
+        message: `Giao dịch này thuộc ca ${lockInfo.shiftCode} đã ${lockInfo.statusLabel} — không thể xoá. Nếu cần điều chỉnh, vui lòng tạo giao dịch ngược chiều mới ở ca hiện tại.`,
+        data: { shiftCode: lockInfo.shiftCode, shiftStatus: lockInfo.shiftStatus },
+      });
+    }
+
     await tx.deleteOne();
     res.json({ success: true, message: 'Đã xoá giao dịch' });
   } catch (err) {
     console.error('[DELETE /transactions/:id]', err);
+    res.status(500).json({ success: false, message: 'Lỗi server' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// ⭐ NEW 15/05/2026: ĐỐI SOÁT CHUYỂN KHOẢN (Reconciliation v2)
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/transactions/reconciliation/list
+ *   Query: ?fromDate=&toDate=&branchId=&onlyUnmatched=true
+ *
+ * Trả về:
+ *   - groups: [{ paymentMethodId, paymentMethodName, paymentMethodType, transactions[], totalAmount, matchedCount, unmatchedCount }]
+ *   - summary: { totalCount, matchedCount, unmatchedCount, totalAmount, matchedAmount, unmatchedAmount }
+ *
+ * Lọc:
+ *   - Chỉ type='income' (thu)
+ *   - Chỉ paymentMethod là 'transfer' hoặc PaymentMethod có type='transfer'
+ *   - Loại isCancelled
+ */
+router.get('/reconciliation/list', authenticate, async (req, res) => {
+  try {
+    const { fromDate, toDate, branchId } = req.query;
+    const onlyUnmatched = req.query.onlyUnmatched === 'true';
+
+    if (!fromDate || !toDate) {
+      return res.status(400).json({ success: false, message: 'Thiếu fromDate hoặc toDate' });
+    }
+
+    // Scope branch
+    const branchFilter = {};
+    if (req.user.role === 'Admin') {
+      if (branchId && mongoose.isValidObjectId(branchId)) {
+        branchFilter.branchId = new mongoose.Types.ObjectId(branchId);
+      }
+    } else {
+      branchFilter.branchId = new mongoose.Types.ObjectId(req.user.branchId);
+    }
+
+    // ⭐ Tìm tất cả PaymentMethod có type=transfer (để biết ObjectId nào là CK)
+    const PaymentMethod = require('../models/PaymentMethod');
+    const transferPMs = await PaymentMethod.find({ type: 'transfer' })
+      .select('_id name icon').lean();
+    const transferPMIds = transferPMs.map(p => String(p._id));
+    const pmInfoById = {};
+    for (const p of transferPMs) {
+      pmInfoById[String(p._id)] = { name: p.name, icon: p.icon };
+    }
+
+    // Build filter: paymentMethod là 'transfer' (string cũ) HOẶC ObjectId của transfer PM
+    const pmCondition = {
+      $or: [
+        { paymentMethod: 'transfer' },
+        ...(transferPMIds.length > 0 ? [{ paymentMethod: { $in: transferPMIds } }] : []),
+      ],
+    };
+
+    const filter = {
+      ...branchFilter,
+      // ⭐ FIX 16/05/2026: Lấy cả Thu (income) + Chi (expense) — không filter type
+      //   Vì CK chi cũng cần đối soát (hoàn tiền khách, chi phí qua CK...)
+      isCancelled: { $ne: true },
+      occurredOn: {
+        $gte: new Date(fromDate),
+        $lte: new Date(toDate),
+      },
+      ...pmCondition,
+    };
+    if (onlyUnmatched) filter.isReconciled = { $ne: true };
+
+    const txs = await Transaction.find(filter)
+      .populate('recordedBy', 'fullName username')
+      .populate('reconciledBy', 'fullName username')
+      .populate('branchId', 'name')
+      .populate('shiftId', 'shiftCode status')
+      .sort({ occurredOn: -1 })
+      .lean();
+
+    // ⭐ NEW 16/05/2026: Enrich lockInfo cho mỗi tx (giống GET /transactions)
+    //   shiftId đã populate → là object {_id, shiftCode, status}
+    {
+      const LOCKED = ['handed_over', 'reconciled', 'resolved', 'disputed'];
+      const LABELS = {
+        handed_over: 'đã bàn giao',
+        reconciled:  'đã duyệt',
+        resolved:    'đã giải quyết tranh chấp',
+        disputed:    'đang tranh chấp',
+      };
+      for (const t of txs) {
+        const sh = t.shiftId;   // populated object
+        if (!sh || typeof sh !== 'object') {
+          t.lockInfo = { isLocked: false };
+          continue;
+        }
+        if (LOCKED.includes(sh.status)) {
+          t.lockInfo = {
+            isLocked: true,
+            shiftCode: sh.shiftCode,
+            shiftStatus: sh.status,
+            statusLabel: LABELS[sh.status] || sh.status,
+          };
+        } else {
+          t.lockInfo = { isLocked: false, shiftCode: sh.shiftCode, shiftStatus: sh.status };
+        }
+      }
+    }
+
+    // Group theo paymentMethod
+    const groupMap = new Map();   // key = pmId hoặc 'transfer'
+
+    for (const t of txs) {
+      const raw = String(t.paymentMethod || 'transfer');
+      const isObjectId = /^[0-9a-f]{24}$/i.test(raw);
+      const groupKey = isObjectId ? raw : 'transfer';
+      const groupInfo = isObjectId
+        ? (pmInfoById[raw] || { name: 'Chuyển khoản (không xác định)', icon: 'landmark' })
+        : { name: 'Chuyển khoản (chưa phân loại)', icon: 'landmark' };
+
+      if (!groupMap.has(groupKey)) {
+        groupMap.set(groupKey, {
+          paymentMethodId: groupKey,
+          paymentMethodName: groupInfo.name,
+          paymentMethodIcon: groupInfo.icon,
+          isGeneric: !isObjectId,
+          transactions: [],
+          totalAmount: 0,           // Tổng |amount| (cho hiển thị)
+          incomeAmount: 0,
+          expenseAmount: 0,
+          matchedCount: 0,
+          matchedAmount: 0,
+          unmatchedCount: 0,
+          unmatchedAmount: 0,
+        });
+      }
+
+      const g = groupMap.get(groupKey);
+      g.transactions.push(t);
+      const amt = t.amount || 0;
+      g.totalAmount += amt;
+      if (t.type === 'expense') g.expenseAmount += amt;
+      else g.incomeAmount += amt;
+      if (t.isReconciled) {
+        g.matchedCount++;
+        g.matchedAmount += amt;
+      } else {
+        g.unmatchedCount++;
+        g.unmatchedAmount += amt;
+      }
+    }
+
+    // Sort groups: NH có nhiều gd trước, group generic cuối
+    const groups = Array.from(groupMap.values()).sort((a, b) => {
+      if (a.isGeneric !== b.isGeneric) return a.isGeneric ? 1 : -1;
+      return b.transactions.length - a.transactions.length;
+    });
+
+    // Summary
+    const summary = {
+      totalCount: txs.length,
+      matchedCount: txs.filter(t => t.isReconciled).length,
+      unmatchedCount: txs.filter(t => !t.isReconciled).length,
+      totalAmount: txs.reduce((s, t) => s + (t.amount || 0), 0),
+      matchedAmount: txs.filter(t => t.isReconciled).reduce((s, t) => s + (t.amount || 0), 0),
+      unmatchedAmount: txs.filter(t => !t.isReconciled).reduce((s, t) => s + (t.amount || 0), 0),
+    };
+
+    res.json({ success: true, data: { groups, summary } });
+  } catch (err) {
+    console.error('[GET reconciliation/list]', err);
+    res.status(500).json({ success: false, message: 'Lỗi server' });
+  }
+});
+
+/**
+ * POST /api/transactions/:id/reconcile
+ *   Tick/untick 1 giao dịch
+ *   Body: { matched: true|false }
+ */
+router.post('/:id/reconcile', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: 'ID không hợp lệ' });
+    }
+
+    const matched = req.body.matched !== false;
+
+    const tx = await Transaction.findById(id);
+    if (!tx) return res.status(404).json({ success: false, message: 'Không tìm thấy giao dịch' });
+
+    // Scope check
+    if (req.user.role !== 'Admin' && String(tx.branchId) !== String(req.user.branchId)) {
+      return res.status(403).json({ success: false, message: 'Không có quyền' });
+    }
+
+    // ⭐ NEW 16/05/2026: Block tick/untick nếu thuộc ca đã settle
+    const lockInfo = await checkTransactionLockedByShift(tx);
+    if (lockInfo.isLocked) {
+      return res.status(409).json({
+        success: false,
+        code: 'TX_LOCKED_BY_SHIFT',
+        message: `Giao dịch này thuộc ca ${lockInfo.shiftCode} ${lockInfo.statusLabel} — không thể thay đổi trạng thái đối soát.`,
+        data: { shiftCode: lockInfo.shiftCode, shiftStatus: lockInfo.shiftStatus },
+      });
+    }
+
+    if (matched) {
+      tx.isReconciled = true;
+      tx.reconciledAt = new Date();
+      tx.reconciledBy = req.user.id || req.user._id;
+      tx.reconciledByName = req.user.fullName || req.user.username || '';
+    } else {
+      tx.isReconciled = false;
+      tx.reconciledAt = null;
+      tx.reconciledBy = null;
+      tx.reconciledByName = '';
+    }
+    await tx.save();
+
+    res.json({ success: true, data: { transaction: tx.toObject() } });
+  } catch (err) {
+    console.error('[POST reconcile]', err);
+    res.status(500).json({ success: false, message: 'Lỗi server' });
+  }
+});
+
+/**
+ * POST /api/transactions/reconcile-bulk
+ *   Tick/untick nhiều cùng lúc
+ *   Body: { ids: [...], matched: true|false }
+ */
+router.post('/reconcile-bulk', authenticate, async (req, res) => {
+  try {
+    const { ids = [], matched = true } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'Thiếu danh sách ID' });
+    }
+
+    const validIds = ids.filter(id => mongoose.isValidObjectId(id));
+    if (validIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'Không có ID hợp lệ' });
+    }
+
+    // Scope: nếu không phải Admin, chỉ update của branch
+    const filter = { _id: { $in: validIds } };
+    if (req.user.role !== 'Admin') {
+      filter.branchId = req.user.branchId;
+    }
+
+    // ⭐ NEW 16/05/2026: Loại bỏ tx thuộc ca đã settle khỏi danh sách update
+    //   Tránh việc tick "Tick tất cả" vô tình động vào tx ca cũ đã duyệt.
+    const Shift = require('../models/Shift');
+    const LOCKED = ['handed_over', 'reconciled', 'resolved', 'disputed'];
+
+    const allTxs = await Transaction.find(filter).select('_id shiftId').lean();
+    const shiftIds = [...new Set(allTxs.map(t => t.shiftId).filter(Boolean).map(id => String(id)))];
+    const lockedShifts = shiftIds.length > 0
+      ? await Shift.find({ _id: { $in: shiftIds }, status: { $in: LOCKED } }).select('_id').lean()
+      : [];
+    const lockedShiftSet = new Set(lockedShifts.map(s => String(s._id)));
+
+    const allowedIds = allTxs
+      .filter(t => !t.shiftId || !lockedShiftSet.has(String(t.shiftId)))
+      .map(t => t._id);
+    const skippedCount = allTxs.length - allowedIds.length;
+
+    if (allowedIds.length === 0) {
+      return res.status(409).json({
+        success: false,
+        code: 'ALL_TX_LOCKED',
+        message: `Tất cả ${allTxs.length} giao dịch đều thuộc ca đã settle — không thể thay đổi.`,
+      });
+    }
+
+    const update = matched
+      ? {
+          $set: {
+            isReconciled: true,
+            reconciledAt: new Date(),
+            reconciledBy: req.user.id || req.user._id,
+            reconciledByName: req.user.fullName || req.user.username || '',
+          },
+        }
+      : {
+          $set: {
+            isReconciled: false,
+            reconciledAt: null,
+            reconciledBy: null,
+            reconciledByName: '',
+          },
+        };
+
+    const r = await Transaction.updateMany(
+      { _id: { $in: allowedIds } },
+      update
+    );
+    res.json({
+      success: true,
+      data: {
+        modified: r.modifiedCount,
+        skipped: skippedCount,
+        skippedReason: skippedCount > 0 ? 'Thuộc ca đã settle' : null,
+      },
+    });
+  } catch (err) {
+    console.error('[POST reconcile-bulk]', err);
     res.status(500).json({ success: false, message: 'Lỗi server' });
   }
 });
