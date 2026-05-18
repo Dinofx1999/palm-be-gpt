@@ -365,11 +365,27 @@ const previewPrice = async (req, res, next) => {
 
     const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
     const maxChildren = room.typeId?.maxChildren ?? 0
+    const maxOccupancy = room.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
+
+    // ⭐ NEW 18/05/2026: BLOCK nếu tổng người vượt maxOccupancy
+    if ((adults + children) > maxOccupancy) {
+      return res.status(400).json({
+        success: false,
+        code:    'OVER_CAPACITY',
+        message: `Phòng chỉ hỗ trợ tối đa ${maxOccupancy} người.`,
+        data: {
+          maxOccupancy,
+          requested: adults + children,
+          adults, children,
+          maxAdults, maxChildren,
+        },
+      })
+    }
 
     const result = calculatePrice({
       checkIn:  new Date(checkIn),
       checkOut: new Date(checkOut),
-      priceType, policy, branch, adults, children, maxAdults, maxChildren,
+      priceType, policy, branch, adults, children, maxAdults, maxChildren, maxOccupancy,
     })
 
     if (result.error) {
@@ -536,11 +552,28 @@ const create = async (req, res, next) => {
 
     const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
     const maxChildren = room.typeId?.maxChildren ?? 0
+    const maxOccupancy = room.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
+
+    // ⭐ NEW 18/05/2026: BLOCK nếu tổng người vượt maxOccupancy
+    if ((adults + children) > maxOccupancy) {
+      return res.status(400).json({
+        success: false,
+        code:    'OVER_CAPACITY',
+        message: `Phòng chỉ hỗ trợ tối đa ${maxOccupancy} người.`,
+        data: {
+          maxOccupancy,
+          requested: adults + children,
+          adults, children,
+          maxAdults, maxChildren,
+          roomNumber: room.number,
+        },
+      })
+    }
 
     const priceResult = calculatePrice({
       checkIn:  checkInFinal,
       checkOut: checkOutFinal,
-      priceType, policy, branch, adults, children, maxAdults, maxChildren,
+      priceType, policy, branch, adults, children, maxAdults, maxChildren, maxOccupancy,
     })
 
     if (priceResult.error) {
@@ -790,10 +823,11 @@ const changeDates = async (req, res, next) => {
     const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
     const maxChildren = room?.typeId?.maxChildren ?? 0
 
+    const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
     const priceResult = calculatePrice({
       checkIn: newCheckIn, checkOut: newCheckOut,
       priceType: booking.priceType, policy, branch,
-      adults: booking.adults, children: booking.children, maxAdults, maxChildren,
+      adults: booking.adults, children: booking.children, maxAdults, maxChildren, maxOccupancy,
     })
 
     if (priceResult.error) {
@@ -972,6 +1006,7 @@ const changeDatesRoom = async (req, res, next) => {
     const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
     const maxChildren = room?.typeId?.maxChildren ?? 0
 
+    const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
     const priceResult = calculatePrice({
       checkIn:   newCheckIn,
       checkOut:  newCheckOut,
@@ -979,7 +1014,7 @@ const changeDatesRoom = async (req, res, next) => {
       policy, branch,
       adults:    subRoom.adults    ?? booking.adults,
       children:  subRoom.children  ?? booking.children,
-      maxAdults, maxChildren,
+      maxAdults, maxChildren, maxOccupancy,
     })
 
     if (priceResult.error) {
@@ -1584,6 +1619,7 @@ const changePolicy = async (req, res, next) => {
       const branch  = await Branch.findById(booking.branchId)
       const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
       const maxChildren = room?.typeId?.maxChildren ?? 0
+      const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
       const capacity    = room?.typeId?.capacity ?? (maxAdults + maxChildren)
 
       // ⭐ FIX 18/05/2026: Auto-fallback priceType nếu policy mới KHÔNG enable loại cũ
@@ -1614,7 +1650,7 @@ const changePolicy = async (req, res, next) => {
         policy, branch,
         adults:    booking.adults,
         children:  booking.children,
-        maxAdults, maxChildren,
+        maxAdults, maxChildren, maxOccupancy,
       })
 
       if (result.error) {
@@ -2076,6 +2112,7 @@ const checkout = async (req, res, next) => {
         const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
         const maxChildren = room?.typeId?.maxChildren ?? 0
 
+        const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
         // ⭐ FIX 18/05/2026: Nếu booking có transferHistory → dùng moveRoomBreakdown
         //   để tính tiền phòng theo từng đoạn (giống calculate-bill nhánh hasTransferred).
         //   calculatePrice thẳng sẽ tính toàn bộ thời gian theo policy phòng MỚI →
@@ -2154,7 +2191,7 @@ const checkout = async (req, res, next) => {
               policy, branch,
               adults:    booking.adults,
               children:  booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
             if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
               const surchargeOnly = surchargeResult.breakdown.filter(b => b.type === 'surcharge')
@@ -2200,7 +2237,7 @@ const checkout = async (req, res, next) => {
             policy, branch,
             adults:    booking.adults,
             children:  booking.children,
-            maxAdults, maxChildren,
+            maxAdults, maxChildren, maxOccupancy,
           })
 
           if (priceResult.error) {
@@ -2243,6 +2280,7 @@ const checkout = async (req, res, next) => {
           const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
           const maxChildren = room?.typeId?.maxChildren ?? 0
 
+          const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
           const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
           const seg1Items = []
           let splitFromTime = null
@@ -2266,7 +2304,7 @@ const checkout = async (req, res, next) => {
               policy, branch,
               adults:    sub.adults   ?? booking.adults,
               children:  sub.children ?? booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
@@ -2294,7 +2332,7 @@ const checkout = async (req, res, next) => {
               policy, branch,
               adults:    sub.adults   ?? booking.adults,
               children:  sub.children ?? booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
 
             if (subPriceResult.error) {
@@ -2532,6 +2570,7 @@ const checkoutRoom = async (req, res, next) => {
         const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
         const maxChildren = room?.typeId?.maxChildren ?? 0
 
+        const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
         const priceResult = calculatePrice({
           checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
           checkOut:  actualCO,
@@ -2539,7 +2578,7 @@ const checkoutRoom = async (req, res, next) => {
           policy, branch,
           adults:    sub.adults   ?? booking.adults,
           children:  sub.children ?? booking.children,
-          maxAdults, maxChildren,
+          maxAdults, maxChildren, maxOccupancy,
         })
 
         if (priceResult.error) {
@@ -2567,7 +2606,7 @@ const checkoutRoom = async (req, res, next) => {
               policy, branch,
               adults:    sub.adults   ?? booking.adults,
               children:  sub.children ?? booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
@@ -3088,6 +3127,7 @@ const calculateBill = async (req, res, next) => {
         const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
         const maxChildren = room?.typeId?.maxChildren ?? 0
 
+        const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
         let subPriceResult
         if (sr.status === 'checked_out') {
           subPriceResult = {
@@ -3123,7 +3163,7 @@ const calculateBill = async (req, res, next) => {
               policy, branch,
               adults:    sr.adults   ?? booking.adults,
               children:  sr.children ?? booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
             const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
               const label = String(b.label || '')
@@ -3160,7 +3200,7 @@ const calculateBill = async (req, res, next) => {
               policy, branch,
               adults:    sr.adults   ?? booking.adults,
               children:  sr.children ?? booking.children,
-              maxAdults, maxChildren,
+              maxAdults, maxChildren, maxOccupancy,
             })
           }
         }
@@ -3305,6 +3345,7 @@ const calculateBill = async (req, res, next) => {
     const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
     const maxChildren = room?.typeId?.maxChildren ?? 0
 
+    const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
     const hasCustomPrice = (booking.priceBreakdown ?? []).some(b => b.meta?.customPrice === true)
 
     const hasTransferred = (booking.transferHistory ?? []).length > 0
@@ -3484,7 +3525,7 @@ const calculateBill = async (req, res, next) => {
           const newRoomDoc = await Room.findById(booking.roomId).populate('typeId')
           const newMaxAdults   = newRoomDoc?.typeId?.maxAdults   ?? newRoomDoc?.typeId?.capacity ?? 2
           const newMaxChildren = newRoomDoc?.typeId?.maxChildren ?? 0
-
+          const newMaxOccupancy = newRoomDoc?.typeId?.maxOccupancy ?? (newMaxAdults + newMaxChildren)
           // Tính phụ thu theo phòng MỚI từ transferAt → effectiveCheckOut
           const transferAtDate = new Date(lastTransfer.transferAt)
           const surchargeResult = calculatePrice({
@@ -3497,6 +3538,7 @@ const calculateBill = async (req, res, next) => {
             children:  booking.children,
             maxAdults: newMaxAdults,
             maxChildren: newMaxChildren,
+            maxOccupancy: newMaxOccupancy,
           })
 
           if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
@@ -3546,7 +3588,7 @@ const calculateBill = async (req, res, next) => {
         policy, branch,
         adults:    booking.adults,
         children:  booking.children,
-        maxAdults, maxChildren,
+        maxAdults, maxChildren, maxOccupancy,
       })
     }
 
@@ -3710,6 +3752,7 @@ const getAvailableByType = async (req, res, next) => {
       const typeName = room.typeId?.name ?? room.typeName ?? '—'
       const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
       const maxChildren = room.typeId?.maxChildren ?? 0
+      const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
       const isAvailable = !bookedRoomIds.has(String(room._id))
 
       if (!typeMap.has(typeId)) {

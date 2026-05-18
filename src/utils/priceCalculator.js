@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────
 // utils/priceCalculator.js
 // Logic tính giá tập trung — đảm bảo BE trả ra số tiền giống FE
+// v2.0 — 18/05/2026: Surcharge logic v2 (maxOccupancy roomType) + OVER_CAPACITY block
 // ─────────────────────────────────────────────────────────
 
 /**
@@ -113,6 +114,36 @@ const pickSlot = (slots, hours) => {
 }
 
 /**
+ * ⭐ NEW v2 (18/05/2026): Tính phụ thu theo spec mới (maxOccupancy roomType)
+ *
+ *   - extraAdults      = max(0, adults - maxAdults)
+ *   - unusedAdultSlots = max(0, maxAdults - adults)
+ *   - childFreeSlots   = maxChildren + unusedAdultSlots
+ *     (TE có thể "thế chỗ" NL chuẩn còn dư mà không phụ thu)
+ *   - extraChildren    = max(0, children - childFreeSlots)
+ *
+ * Examples (maxA=2, maxC=1):
+ *   2NL+1TE = 0+0  (chuẩn)
+ *   3NL+0TE = 1+0  (NL > maxA → 1NL phụ thu)
+ *   1NL+1TE = 0+0
+ *
+ * Examples (maxA=4, maxC=0):
+ *   4NL     = 0+0
+ *   3NL+1TE = 0+0  (1TE thế chỗ NL chuẩn dư)
+ *   0NL+4TE = 0+0
+ *   5NL     = 1+0
+ *   4NL+1TE = 0+1
+ *   5NL+1TE = 1+1
+ */
+const computeExtra = (adults, children, maxAdults, maxChildren) => {
+  const extraAdults      = Math.max(0, adults - maxAdults)
+  const unusedAdultSlots = Math.max(0, maxAdults - adults)
+  const childFreeSlots   = maxChildren + unusedAdultSlots
+  const extraChildren    = Math.max(0, children - childFreeSlots)
+  return { extraAdults, extraChildren }
+}
+
+/**
  * Tính giá đầy đủ cho 1 booking.
  *
  * @param {Object} input
@@ -123,8 +154,9 @@ const pickSlot = (slots, hours) => {
  * @param {Object} input.branch           - Branch doc (lấy giờ chuẩn + tolerance)
  * @param {number} input.adults
  * @param {number} input.children
- * @param {number} [input.maxAdults]      - Số NL tối đa loại phòng (default: capacity hoặc 2)
- * @param {number} [input.maxChildren]    - Số TE tối đa loại phòng (default: 0)
+ * @param {number} [input.maxAdults]      - Số NL chuẩn loại phòng (default: capacity hoặc 2)
+ * @param {number} [input.maxChildren]    - Số TE chuẩn loại phòng (default: 0)
+ * @param {number} [input.maxOccupancy]   - ⭐ NEW v2: Hard limit. Vượt → OVER_CAPACITY error
  * @param {number} [input.capacity]       - DEPRECATED: dùng maxAdults+maxChildren (backward compat)
  *
  * @returns {Object} {
@@ -134,7 +166,8 @@ const pickSlot = (slots, hours) => {
  *   originalPriceType, // Loại giá user chọn ban đầu
  *   converted,         // boolean — có auto-convert không
  *   notice,            // string — thông báo cho user (nếu converted)
- *   breakdown: [{ label, amount, type: 'base'|'surcharge' }]
+ *   breakdown: [{ label, amount, type: 'base'|'surcharge' }],
+ *   error?: { code: 'OVER_CAPACITY' | 'PRICE_TYPE_NOT_ENABLED' | 'HOUR_BOOKING_CUTOFF', ... }
  * }
  */
 function calculatePrice(input) {
@@ -144,6 +177,7 @@ function calculatePrice(input) {
     capacity,        // ⭐ DEPRECATED — fallback cho code cũ
     maxAdults,       // ⭐ NEW
     maxChildren,     // ⭐ NEW
+    maxOccupancy,    // ⭐ NEW v2 (18/05/2026)
   } = input
 
   // ⭐ Resolve maxAdults / maxChildren từ input
@@ -151,6 +185,8 @@ function calculatePrice(input) {
   //   Nếu chỉ có capacity → coi tất cả là NL (maxAdults=capacity, maxChildren=0)
   const resolvedMaxAdults   = maxAdults   ?? capacity ?? 2
   const resolvedMaxChildren = maxChildren ?? 0
+  // ⭐ NEW v2: Default maxOccupancy = maxA + maxC (chuẩn, không cho extra) nếu không truyền
+  const resolvedMaxOccupancy = maxOccupancy ?? (resolvedMaxAdults + resolvedMaxChildren)
 
   const ci = new Date(checkIn)
   const co = new Date(checkOut)
@@ -205,6 +241,42 @@ function calculatePrice(input) {
 
   if (!policy) {
     return { roomAmount: 0, nights, finalPriceType: finalType, originalPriceType: requestedType, converted, notice, breakdown }
+  }
+
+  // ──────────────────────────────────────────────────
+  // ⭐ NEW v2 (18/05/2026): BLOCK OVER_CAPACITY — phòng không đủ chỗ
+  //   Nếu tổng người (adults + children) > maxOccupancy → từ chối ngay
+  //   Áp dụng cho mọi loại giá (Giờ, Ngày, Đêm...).
+  //
+  //   Spec roomType:
+  //     - maxAdults    = NL chuẩn (không phụ thu)
+  //     - maxChildren  = TE chuẩn (không phụ thu)
+  //     - maxOccupancy = Tổng người tối đa (hard limit, vượt = REJECT)
+  //
+  //   Examples (maxA=2, maxC=1, maxOcc=3):
+  //     2NL+1TE → OK (chuẩn)
+  //     3NL+0TE → OK (1NL phụ thu)
+  //     2NL+2TE → REJECT (4 > 3)
+  //     4NL+0TE → REJECT
+  // ──────────────────────────────────────────────────
+  if ((adults + children) > resolvedMaxOccupancy) {
+    return {
+      roomAmount: 0,
+      nights,
+      finalPriceType: finalType,
+      originalPriceType: requestedType,
+      converted, notice,
+      breakdown: [],
+      error: {
+        code:    'OVER_CAPACITY',
+        message: `Phòng chỉ hỗ trợ tối đa ${resolvedMaxOccupancy} người.`,
+        maxOccupancy: resolvedMaxOccupancy,
+        requested:    adults + children,
+        adults, children,
+        maxAdults:    resolvedMaxAdults,
+        maxChildren:  resolvedMaxChildren,
+      },
+    }
   }
 
   // ⭐ EARLY RETURN: nếu khoảng thời gian ≤ tolerance → MIỄN PHÍ (chưa tính tiền)
@@ -380,21 +452,30 @@ function calculatePrice(input) {
 
     // ⭐ Tính phụ thu MỖI ĐÊM trước (vì sẽ push xen kẽ với từng giá ngày)
     //
-    // Logic mới (maxAdults + maxChildren tách riêng):
-    //   - Phụ thu NL: nếu adults > maxAdults (ƯU TIÊN — luôn áp dụng)
-    //   - Phụ thu TE: chỉ khi tổng (adults+children) > (maxAdults+maxChildren),
-    //                 trừ phần NL đã phụ thu (tránh double count)
+    // ⭐ LOGIC v2 (18/05/2026) — Spec roomType có maxOccupancy:
+    //   - extraAdults      = max(0, adults - maxAdults)        ← NL vượt riêng
+    //   - childFreeSlots   = maxChildren + max(0, maxAdults - adults)
+    //                        (TE có thể "thế chỗ" NL chuẩn còn dư)
+    //   - extraChildren    = max(0, children - childFreeSlots)
     //
-    // Test cases (maxA=2, maxC=1, tổng cap=3):
-    //   A=1, C=2 → 0 NL, 0 TE (tổng=3 ≤ 3, NL ≤ 2) — không phụ thu
-    //   A=3, C=0 → 1 NL, 0 TE (NL > maxA, dù tổng=3 ≤ 3)
-    //   A=2, C=2 → 0 NL, 1 TE (NL OK, tổng=4 > 3 → 1 TE phụ thu)
-    //   A=3, C=2 → 1 NL, 1 TE (NL > maxA → 1 NL; tổng vượt 2, đã 1 NL → còn 1 TE)
-    //   A=4, C=0 → 2 NL, 0 TE (NL > maxA → 2 NL, ưu tiên rule này)
-    const extraAdults = Math.max(0, adults - resolvedMaxAdults)
-    const totalCapacity = resolvedMaxAdults + resolvedMaxChildren
-    const totalExtra    = Math.max(0, (adults + children) - totalCapacity)
-    const extraChildren = Math.max(0, totalExtra - extraAdults)
+    // Test cases (maxA=2, maxC=1):
+    //   2NL+1TE: extraA=0, unusedA=0, childFree=1, extraC=0  → chuẩn
+    //   3NL+0TE: extraA=1, unusedA=0, childFree=1, extraC=0  → 1NL phụ thu
+    //   1NL+1TE: extraA=0, unusedA=1, childFree=2, extraC=0  → chuẩn
+    //
+    // Test cases (maxA=4, maxC=0):
+    //   4NL    : extraA=0, unusedA=0, childFree=0, extraC=0  → chuẩn
+    //   3NL+1TE: extraA=0, unusedA=1, childFree=1, extraC=0  → 1TE thế chỗ NL chuẩn dư
+    //   0NL+4TE: extraA=0, unusedA=4, childFree=4, extraC=0  → 4TE thế chỗ NL chuẩn dư
+    //   5NL    : extraA=1, unusedA=0, childFree=0, extraC=0  → 1NL phụ thu
+    //   4NL+1TE: extraA=0, unusedA=0, childFree=0, extraC=1  → 1TE phụ thu
+    //   5NL+1TE: extraA=1, unusedA=0, childFree=0, extraC=1  → 1NL + 1TE phụ thu
+    //
+    // LƯU Ý: Validation `OVER_CAPACITY` (vượt maxOccupancy → TỪ CHỐI) đã được check
+    // ở block trên TRƯỚC khi xuống đây. Tới đây chắc chắn total <= maxOccupancy.
+    const { extraAdults, extraChildren } = computeExtra(
+      adults, children, resolvedMaxAdults, resolvedMaxChildren
+    )
 
     const adultSurchargePerNight = extraAdults > 0
       ? (policy.dayAdultSurcharge ?? 0) * extraAdults
@@ -529,10 +610,12 @@ function calculatePrice(input) {
         roomAmount += adultSurchargePerNight
       }
       // ⭐ Phụ thu TE của đêm này — push ngay sau phụ thu NL
-      //   Chỉ tính phần TE vượt (extraChildren), không phải tất cả TE
+      //   ⭐ v2 (18/05/2026): TE phụ thu khi children > childFreeSlots
+      //   (childFreeSlots = maxChildren + maxAdults dư). Label "vượt sức chứa chuẩn"
+      //   thay vì "vượt N TE" vì TE phụ thu phụ thuộc tổng (NL+TE) chứ không chỉ TE riêng.
       if (childSurchargePerNight > 0) {
         breakdown.push({
-          label: `Phụ thu ${extraChildren} trẻ em (vượt ${resolvedMaxChildren} TE)`,
+          label: `Phụ thu ${extraChildren} trẻ em (vượt sức chứa chuẩn)`,
           amount: childSurchargePerNight,
           type: 'surcharge',
           meta: { nightIndex: i },
@@ -665,4 +748,5 @@ module.exports = {
   calculatePrice,
   // Export helpers để FE có thể tham chiếu nếu cần
   toMinutes, isSameDay, roundHoursWithTolerance, calcNights, pickSlot,
+  computeExtra,   // ⭐ NEW v2 (18/05/2026) — export for testing
 }

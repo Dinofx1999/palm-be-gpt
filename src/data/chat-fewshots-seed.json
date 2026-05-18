@@ -166,5 +166,45 @@
     "priority": 15,
     "userInput": "30 Người Lớn, 6 trẻ em",
     "assistantOutput": "Dạ em đã kiểm tra rồi ạ:\n\nVới 30 người lớn và 6 trẻ em cho ngày mai, em có các đề xuất:\n\n⭐ Đề xuất tốt nhất:\nLoại phòng: 8 phòng Family Suite (sức chứa 4 NL + 1 TE)\n  Giá: 1.500.000đ/phòng × 8 = 12.000.000đ\n\nTổng: 12.000.000đ\n\nAnh/chị muốn em đặt phương án này không ạ?"
+  },
+  {
+    "category": "room_check",
+    "title": "Sức chứa phòng có extra slots (maxOccupancy)",
+    "pattern": "phòng X ở mấy người, tối đa mấy người, vượt sức chứa, sức chứa phòng",
+    "priority": 12,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Phòng 603 ở được mấy người?",
+    "assistantOutput": "Dạ phòng 603 (Superior Quadruple Room) ở được **tối đa 6 người** ạ:\n\n**Sức chứa chuẩn:** 4 NL (không phụ thu)\n**Sức chứa tối đa:** 6 người (phần vượt chuẩn sẽ có phụ thu)\n**Diện tích:** 25m²\n\nVí dụ:\n- 4 NL → giá thường, không phụ thu\n- 5 NL → giá + phụ thu 1 NL\n- 6 NL → giá + phụ thu 2 NL\n- 7 NL trở lên → không nhận được ạ\n\nAdmin muốn đặt cho mấy khách ạ?"
+  },
+  {
+    "category": "pricing",
+    "title": "Báo giá có phụ thu vượt sức chứa",
+    "pattern": "vượt sức chứa, phụ thu nhiều người, 6 người lớn giá, X NL giá bao nhiêu",
+    "priority": 12,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Phòng 603 cho 6 NL 1 đêm bao nhiêu?",
+    "assistantOutput": "Dạ em tính cho admin nhé:\n\n**Phòng 603** — Superior Quadruple Room (sức chứa chuẩn 4 NL, tối đa 6 NL)\n\n**Giá ngày:** 500.000đ\n**Phụ thu 2 NL vượt chuẩn:** 2 × 100.000 = 200.000đ\n\n**Tổng: 700.000đ/đêm**\n\nAdmin có muốn em đặt luôn không ạ?"
+  },
+  {
+    "category": "room_check",
+    "title": "Kiểm tra phòng cụ thể theo số (v2 — có maxOccupancy)",
+    "pattern": "phòng X còn không, phòng X trống không, tình trạng phòng",
+    "priority": 11,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Phòng 603 còn không?",
+    "assistantOutput": "Dạ em vừa kiểm tra giúp anh/chị ạ:\n\n**Phòng 603** — Superior Quadruple Room\n**Sức chứa chuẩn:** 4 NL (không phụ thu)\n**Sức chứa tối đa:** 6 người (có phụ thu phần vượt chuẩn)\n**Diện tích:** 25m²\n**Trạng thái:** Đang hoạt động — phòng trống, sẵn sàng đón khách\n\nAnh/chị có muốn em đặt phòng này không ạ?"
+  },
+  {
+    "category": "room_check",
+    "title": "Từ chối khách vượt maxOccupancy",
+    "pattern": "phòng cho X người không được, quá đông, vượt giới hạn",
+    "priority": 11,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Phòng 603 cho 8 NL được không?",
+    "assistantOutput": "Dạ phòng 603 (Superior Quadruple Room) chỉ hỗ trợ **tối đa 6 người** thôi ạ, nên 8 NL thì em không đặt được vào phòng này.\n\nMột số gợi ý cho admin:\n- Tách thành 2 phòng (vd 4 + 4)\n- Chọn loại phòng lớn hơn nếu khách sạn có\n- Em có thể tìm phương án 2 phòng cùng loại 603 (4 NL/phòng, không phụ thu) — tổng 1.000.000đ/đêm\n\nAdmin muốn em check thử phương án nào ạ?"
   }
 ]
