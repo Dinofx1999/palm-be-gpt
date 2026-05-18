@@ -157,7 +157,10 @@ function computeMoveRoomBreakdown(input) {
   }
 
   // MODE A: 1 đêm duy nhất, label phòng MỚI
-  if (earlyMorning || (nightsBefore === 0 && totalNights === 1)) {
+  //   Áp dụng:
+  //     - Rạng sáng + checkout cùng ngày (#5 spec)
+  //     - Hoặc chưa qua đêm + booking 1 đêm tổng (#1, #2, #3)
+  if ((earlyMorning && checkoutSameDay) || (nightsBefore === 0 && totalNights === 1)) {
     const labelPrefix = sameType
       ? `[${newRoom.number}]`
       : `[${newRoom.number}] ${typeLabelCurr} -`
@@ -181,7 +184,11 @@ function computeMoveRoomBreakdown(input) {
     !isSameDay(actualCheckIn, transferAt) &&
     isSameDay(new Date(actualCheckIn.getTime() + 86400000), transferAt)
 
-  if (transferBeforeStdCO && isFirstDayAfterCI && totalNights >= 2 && !earlyMorning) {
+  // MODE D: Chuyển ngày kế CI trước 12:00 → ở tiếp qua đêm
+  //   Áp dụng:
+  //     - Rạng sáng + booking ≥ 2 đêm (rạng sáng được chứa trong seg1)
+  //     - Chuyển trước std CO ngày hôm sau + ở tiếp
+  if (transferBeforeStdCO && isFirstDayAfterCI && totalNights >= 2) {
     items.push({
       label: `[${oldRoom.number}] Giá ngày (${fmtDT(actualCheckIn)} → ${fmtDT(transferAt)})`,
       amount: oldRoom.policy.dayPrice,
@@ -198,9 +205,14 @@ function computeMoveRoomBreakdown(input) {
       meta: { segment: 'D2', roomNumber: newRoom.number, policy: 'new' },
     })
 
+    // Seg 3 chỉ tạo khi plannedCheckOut CROSS midnight sau seg2End (tức là khách thực sự ở thêm đêm).
+    // Nếu plannedCheckOut chỉ trễ vài giờ sau 12:00 (late checkout same day), KHÔNG tạo seg3 —
+    // phần trễ sẽ được tính như late checkout surcharge ở BE (calculatePrice).
     if (seg2End < plannedCheckOut) {
       const seg3Start = standardCheckinOf(seg2End)
-      if (seg3Start < plannedCheckOut) {
+      // Check cross-midnight: plannedCheckOut phải qua midnight sau seg3Start
+      const midnightAfterSeg3Start = dayStart(new Date(seg3Start.getTime() + 86400000))
+      if (plannedCheckOut >= midnightAfterSeg3Start) {
         const nights3 = countNights(seg3Start, plannedCheckOut)
         items.push({
           label: `[${newRoom.number}] Giá ngày (${fmtDT(seg3Start)} → ${fmtDT(plannedCheckOut)})`,

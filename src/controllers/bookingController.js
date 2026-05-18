@@ -1586,10 +1586,31 @@ const changePolicy = async (req, res, next) => {
       const maxChildren = room?.typeId?.maxChildren ?? 0
       const capacity    = room?.typeId?.capacity ?? (maxAdults + maxChildren)
 
+      // ⭐ FIX 18/05/2026: Auto-fallback priceType nếu policy mới KHÔNG enable loại cũ
+      //   Ví dụ: booking đang là 'hour', đổi sang policy chỉ có 'day' → tự đổi sang 'day'
+      //   Ưu tiên: day > night > hour > week > month (theo nhu cầu thực tế khách sạn)
+      let resolvedPriceType = booking.priceType
+      const enableMap = {
+        hour:  policy.hourEnabled,
+        day:   policy.dayEnabled,
+        night: policy.nightEnabled,
+        week:  policy.weekEnabled,
+        month: policy.monthEnabled,
+      }
+      if (!enableMap[resolvedPriceType]) {
+        // Tìm loại enable đầu tiên theo thứ tự ưu tiên
+        const priority = ['day', 'night', 'hour', 'week', 'month']
+        const fallback = priority.find(t => enableMap[t] === true)
+        if (fallback) {
+          console.log(`[changePolicy] Auto-switch priceType: ${booking.priceType} → ${fallback} (policy "${policy.name}" không hỗ trợ ${booking.priceType})`)
+          resolvedPriceType = fallback
+        }
+      }
+
       const result = calculatePrice({
         checkIn:   booking.checkIn,
         checkOut:  booking.checkOut,
-        priceType: booking.priceType,
+        priceType: resolvedPriceType,
         policy, branch,
         adults:    booking.adults,
         children:  booking.children,
@@ -1615,6 +1636,10 @@ const changePolicy = async (req, res, next) => {
       booking.policyId       = policy._id
       booking.policyName     = policy.name
       booking.policySnapshot = buildPolicySnapshot(policy, capacity)
+      // ⭐ Cập nhật priceType nếu đã auto-switch
+      if (resolvedPriceType !== booking.priceType) {
+        booking.priceType = resolvedPriceType
+      }
     }
 
     if (discountPercent !== null) booking.discountPercent = Number(discountPercent) || 0
@@ -2051,33 +2076,151 @@ const checkout = async (req, res, next) => {
         const maxAdults   = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
         const maxChildren = room?.typeId?.maxChildren ?? 0
 
-        const priceResult = calculatePrice({
-          checkIn:   booking.actualCheckIn ?? booking.checkIn,
-          checkOut:  actualCO,
-          priceType: booking.priceType,
-          policy, branch,
-          adults:    booking.adults,
-          children:  booking.children,
-          maxAdults, maxChildren,
-        })
+        // ⭐ FIX 18/05/2026: Nếu booking có transferHistory → dùng moveRoomBreakdown
+        //   để tính tiền phòng theo từng đoạn (giống calculate-bill nhánh hasTransferred).
+        //   calculatePrice thẳng sẽ tính toàn bộ thời gian theo policy phòng MỚI →
+        //   không bằng "tiền phòng cũ + tiền phòng mới" → lệch số.
+        const hasTransfer = Array.isArray(booking.transferHistory) && booking.transferHistory.length > 0
 
-        if (priceResult.error) {
-          console.warn('[checkout] Recalc skipped due to policy mismatch:', priceResult.error.message)
-        } else {
+        if (hasTransfer) {
+          const transfers = booking.transferHistory
+            .filter(t => t?.transferAt && t?.fromRoomNumber && t?.toRoomNumber)
+            .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+          const lastTransfer = transfers[transfers.length - 1]
+
+          // Resolve old policy (phòng cũ trước transfer)
+          let oldPolicy = null
+          if (lastTransfer?.oldPolicyId) {
+            try { oldPolicy = await PricePolicy.findById(lastTransfer.oldPolicyId) } catch {}
+          }
+          if (!oldPolicy && booking.policySnapshot && booking.policySnapshot.dayPrice) {
+            oldPolicy = booking.policySnapshot
+          }
+
+          // Resolve room types
+          let oldRoomType = ''
+          try {
+            const oldRoomDoc = await Room.findOne({
+              number: lastTransfer.fromRoomNumber,
+              branchId: booking.branchId,
+            }).populate('typeId')
+            if (oldRoomDoc) {
+              oldRoomType = oldRoomDoc.typeId?.name || oldRoomDoc.typeName || ''
+            }
+          } catch {}
+          const newRoomType = room?.typeId?.name || booking.roomType || ''
+
+          const hourSlotsOf = (pol) => {
+            if (!pol) return []
+            return (pol.hourSlots || []).map(s => {
+              const time = s.time || s.duration || ''
+              const m = String(time).match(/(\d+)/)
+              return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
+            })
+          }
+
+          const moveItems = computeMoveRoomBreakdown({
+            actualCheckIn:   booking.actualCheckIn ?? booking.checkIn,
+            plannedCheckOut: actualCO,
+            transferAt:      new Date(lastTransfer.transferAt),
+            oldRoom: {
+              number: lastTransfer.fromRoomNumber,
+              type:   oldRoomType,
+              policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+            },
+            newRoom: {
+              number: lastTransfer.toRoomNumber,
+              type:   newRoomType,
+              policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
+            },
+            transferFee: Number(lastTransfer.fee) || 0,
+            changeRate:  oldRoomType !== newRoomType,
+            isFreeRoom:  !!booking.isFreeRoom,
+          })
+
+          const breakdownItems = moveItems.map(it => ({
+            label:  it.label,
+            amount: it.amount,
+            type:   it.type === 'surcharge' ? 'surcharge' : 'base',
+            meta:   it.meta || {},
+          }))
+
+          // Bổ sung phụ thu (extra people, late checkout) theo policy phòng mới từ transferAt → actualCO
+          try {
+            const surchargeResult = calculatePrice({
+              checkIn:   new Date(lastTransfer.transferAt),
+              checkOut:  actualCO,
+              priceType: booking.priceType,
+              policy, branch,
+              adults:    booking.adults,
+              children:  booking.children,
+              maxAdults, maxChildren,
+            })
+            if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
+              const surchargeOnly = surchargeResult.breakdown.filter(b => b.type === 'surcharge')
+              for (const sur of surchargeOnly) {
+                breakdownItems.push({
+                  label:  `[${lastTransfer.toRoomNumber}] ${sur.label}`,
+                  amount: sur.amount,
+                  type:   'surcharge',
+                  meta:   { ...(sur.meta || {}), roomNumber: lastTransfer.toRoomNumber },
+                })
+              }
+            }
+          } catch (surErr) {
+            console.warn('[checkout v20] surcharge calc failed:', surErr.message)
+          }
+
+          const newRoomAmount = breakdownItems
+            .filter(b => !(b.meta && b.meta.transferFee))
+            .reduce((s, b) => s + (b.amount || 0), 0)
+
           let recalcDiscount = booking.discount ?? 0
           if (booking.discountPercent > 0 || booking.discountAmount > 0 || booking.isFreeRoom) {
-            const roomPart = booking.isFreeRoom ? 0 : priceResult.roomAmount
+            const roomPart = booking.isFreeRoom ? 0 : newRoomAmount
             const subtotal = roomPart + (booking.servicesAmount ?? 0)
             const pctDiscount = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
             recalcDiscount = pctDiscount + (booking.discountAmount ?? 0)
           }
 
-          const roomPart = booking.isFreeRoom ? 0 : priceResult.roomAmount
-          booking.roomAmount     = priceResult.roomAmount
-          booking.nights         = priceResult.nights
-          booking.priceBreakdown = priceResult.breakdown
+          const roomPart = booking.isFreeRoom ? 0 : newRoomAmount
+          booking.roomAmount     = newRoomAmount
+          booking.priceBreakdown = breakdownItems
           booking.discount       = recalcDiscount
-          booking.totalAmount    = Math.max(0, roomPart + (booking.servicesAmount ?? 0) - recalcDiscount)
+          // ⭐ KHÔNG cộng booking.transferFee thêm vì đã filter bỏ fee item khỏi roomAmount
+          //    (fee được track riêng trong booking.transferFee, nhưng đã có dòng "Phụ thu chuyển phòng"
+          //     trong breakdown nếu lastTransfer.fee > 0 — em filter bỏ ra khỏi roomAmount để
+          //     totalAmount = roomAmount + transferFee không double count)
+          booking.totalAmount    = Math.max(0, roomPart + (booking.servicesAmount ?? 0) - recalcDiscount + (booking.transferFee || 0))
+        } else {
+          const priceResult = calculatePrice({
+            checkIn:   booking.actualCheckIn ?? booking.checkIn,
+            checkOut:  actualCO,
+            priceType: booking.priceType,
+            policy, branch,
+            adults:    booking.adults,
+            children:  booking.children,
+            maxAdults, maxChildren,
+          })
+
+          if (priceResult.error) {
+            console.warn('[checkout] Recalc skipped due to policy mismatch:', priceResult.error.message)
+          } else {
+            let recalcDiscount = booking.discount ?? 0
+            if (booking.discountPercent > 0 || booking.discountAmount > 0 || booking.isFreeRoom) {
+              const roomPart = booking.isFreeRoom ? 0 : priceResult.roomAmount
+              const subtotal = roomPart + (booking.servicesAmount ?? 0)
+              const pctDiscount = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
+              recalcDiscount = pctDiscount + (booking.discountAmount ?? 0)
+            }
+
+            const roomPart = booking.isFreeRoom ? 0 : priceResult.roomAmount
+            booking.roomAmount     = priceResult.roomAmount
+            booking.nights         = priceResult.nights
+            booking.priceBreakdown = priceResult.breakdown
+            booking.discount       = recalcDiscount
+            booking.totalAmount    = Math.max(0, roomPart + (booking.servicesAmount ?? 0) - recalcDiscount + (booking.transferFee || 0))
+          }
         }
       } catch (calcErr) {
         console.error('Recalc on checkout failed:', calcErr)
@@ -3333,8 +3476,47 @@ const calculateBill = async (req, res, next) => {
           meta: it.meta || {},
         }))
 
+        // ⭐ FIX 18/05/2026: Bổ sung phụ thu (extra people, late checkout, early checkin)
+        //   moveRoomBreakdown CHỈ trả tiền phòng. Phụ thu phải tính riêng để khớp checkout flow.
+        //   Gọi calculatePrice với phòng MỚI (policy hiện tại) để lấy surcharge items,
+        //   sau đó thêm prefix [roomNumber] và đẩy vào cuối breakdown.
+        try {
+          const newRoomDoc = await Room.findById(booking.roomId).populate('typeId')
+          const newMaxAdults   = newRoomDoc?.typeId?.maxAdults   ?? newRoomDoc?.typeId?.capacity ?? 2
+          const newMaxChildren = newRoomDoc?.typeId?.maxChildren ?? 0
+
+          // Tính phụ thu theo phòng MỚI từ transferAt → effectiveCheckOut
+          const transferAtDate = new Date(lastTransfer.transferAt)
+          const surchargeResult = calculatePrice({
+            checkIn:   transferAtDate,
+            checkOut:  effectiveCheckOut,
+            priceType: booking.priceType,
+            policy:    newPolicy,
+            branch,
+            adults:    booking.adults,
+            children:  booking.children,
+            maxAdults: newMaxAdults,
+            maxChildren: newMaxChildren,
+          })
+
+          if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
+            // Chỉ lấy item type='surcharge' (phụ thu NL, early/late check)
+            const surchargeOnly = surchargeResult.breakdown.filter(b => b.type === 'surcharge')
+            for (const sur of surchargeOnly) {
+              breakdownItems.push({
+                label: `[${newRoomNum}] ${sur.label}`,
+                amount: sur.amount,
+                type:   'surcharge',
+                meta:   { ...(sur.meta || {}), roomNumber: newRoomNum },
+              })
+            }
+          }
+        } catch (surErr) {
+          console.warn('[calculateBill v20] surcharge calc failed:', surErr.message)
+        }
+
         priceResult = {
-          // ⭐ roomAmount = chỉ tiền phòng (không tính fee item, vì fee được cộng vào totalAmount riêng qua transferFee)
+          // ⭐ roomAmount = chỉ tiền phòng + phụ thu (không tính fee chuyển phòng vì transferFee tách riêng)
           roomAmount:       breakdownItems
             .filter(b => !(b.meta && b.meta.transferFee))
             .reduce((s, b) => s + (b.amount || 0), 0),
@@ -3373,25 +3555,20 @@ const calculateBill = async (req, res, next) => {
     }
 
     // ⭐ FIX v20.0: Đồng bộ label breakdown giữa mode 'now' và 'checkout'
-    //   - Mode 'checkout' đọc từ booking.priceBreakdown (đã có prefix [roomNum] type -)
+    //   - Mode 'checkout' đọc từ booking.priceBreakdown (có thể có/không prefix)
     //   - Mode 'now' gọi calculatePrice → label trần "Giá ngày (...)"
-    //   → Thêm prefix vào label của mode 'now' để hiển thị nhất quán.
-    //   Áp dụng cho mọi item có label bắt đầu bằng "Giá ngày" / "Giá đêm" / "Giá nghỉ giờ"
-    //   mà chưa có "[" ở đầu (chưa được prefix bởi recalcMoveBreakdown).
+    //   → Thêm prefix [roomNumber] vào label của mode 'now' để hiển thị nhất quán.
+    //   KHÔNG thêm roomType (chỉ là tên loại phòng) để label gọn hơn.
     if (priceResult.breakdown && Array.isArray(priceResult.breakdown)) {
       const roomNumPrefix = booking.roomNumber || ''
-      const roomTypeLabel = booking.roomType || ''
       priceResult.breakdown = priceResult.breakdown.map(b => {
         const lbl = String(b.label || '')
         // Đã có prefix [...] rồi → giữ nguyên
         if (lbl.startsWith('[')) return b
-        // Là dòng giá phòng (Giá ngày / Giá đêm / Giá nghỉ giờ) → thêm prefix
+        // Là dòng giá phòng (Giá ngày / Giá đêm / Giá nghỉ giờ) → thêm prefix [roomNumber]
         const isPriceLine = /^Giá\s+(ngày|đêm|nghỉ giờ|giờ|tuần|tháng)/i.test(lbl)
         if (!isPriceLine || !roomNumPrefix) return b
-        const newLabel = roomTypeLabel
-          ? `[${roomNumPrefix}] ${roomTypeLabel} - ${lbl}`
-          : `[${roomNumPrefix}] ${lbl}`
-        return { ...b, label: newLabel }
+        return { ...b, label: `[${roomNumPrefix}] ${lbl}` }
       })
     }
 
@@ -3414,6 +3591,19 @@ const calculateBill = async (req, res, next) => {
     const paidAmount      = invoice?.paidAmount ?? 0
     const remainingAmount = Math.max(0, totalAmount - paidAmount)
 
+    // ⭐ FIX 18/05/2026: Strip roomType prefix khỏi label cũ (legacy data)
+    //   Label cũ có format: "[604] 1🛏 Deluxe Garden View Room - Giá ngày (...)"
+    //   → strip thành: "[604] Giá ngày (...)"
+    //   Pattern: [XXX] <bất cứ gì> - Giá <type> (...)  →  [XXX] Giá <type> (...)
+    const cleanedBreakdown = (priceResult.breakdown || []).map(b => {
+      const lbl = String(b.label || '')
+      const stripped = lbl.replace(
+        /^(\[[^\]]+\])\s+.+?\s+-\s+(Giá\s+(ngày|đêm|nghỉ giờ|giờ|tuần|tháng))/i,
+        '$1 $2'
+      )
+      return stripped === lbl ? b : { ...b, label: stripped }
+    })
+
     res.json({
       success: true,
       data: {
@@ -3427,7 +3617,7 @@ const calculateBill = async (req, res, next) => {
         totalAmount,
         paidAmount,
         remainingAmount,
-        breakdown:        priceResult.breakdown,
+        breakdown:        cleanedBreakdown,
         usedStoredBreakdown: hasTransferred && mode === 'checkout',
         finalPriceType:   priceResult.finalPriceType,
         converted:        priceResult.converted,
