@@ -71,6 +71,19 @@ const bookingSchema = new mongoose.Schema({
   isFreeRoom:      { type: Boolean, default: false }, // miễn phí tiền phòng
   discount:        { type: Number, default: 0 },   // tổng giảm thực tế (computed)
 
+  // ⭐ NEW 19/05/2026: Discount tracking — ai chịu trách nhiệm + lý do
+  //   - discountReason: bắt buộc nếu có discount > 0 (>= 5 ký tự)
+  //   - discountChargedTo: null = KS chịu, có giá trị = NV chịu (trừ lương cuối tháng)
+  //   - Cache name+role để hiển thị nhanh + report aggregate không cần $lookup
+  //   - appliedAt/By: audit trail cho thao tác cuối cùng
+  discountReason:           { type: String, default: '' },
+  discountChargedTo:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  discountChargedToName:    { type: String, default: null },
+  discountChargedToRole:    { type: String, default: null },
+  discountAppliedAt:        { type: Date, default: null },
+  discountAppliedBy:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  discountAppliedByName:    { type: String, default: null },
+
   totalAmount:     { type: Number, required: true },
 
   // ⭐ Breakdown chi tiết — lưu để hiển thị lại y hệt khi xem booking
@@ -148,6 +161,11 @@ const bookingSchema = new mongoose.Schema({
 bookingSchema.index({ status: 1, branchId: 1 });
 bookingSchema.index({ customerId: 1 });
 bookingSchema.index({ roomId: 1 });
+
+// ⭐ NEW 19/05/2026: Index cho report discount cuối tháng
+//   Query: tổng discount theo NV trong khoảng thời gian → cần index compound
+bookingSchema.index({ discountChargedTo: 1, discountAppliedAt: -1 });
+bookingSchema.index({ branchId: 1, discountChargedTo: 1, discountAppliedAt: -1 });
 
 // ⭐ Pre-save hook: tự sinh bookingCode nếu chưa có
 //   Format: BK_XXXXXX (6 ký tự alphanumeric uppercase)

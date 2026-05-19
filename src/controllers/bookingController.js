@@ -896,37 +896,17 @@ const changeDates = async (req, res, next) => {
         oldRoom: {
           number: lastTransfer.fromRoomNumber,
           type:   oldRoomType,
-          policy: {
-            dayPrice:        oldPolicy?.dayPrice || 0,
-            hourSlots:       oldPolicy?.hourSlots || [],
-            dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
-            dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
-            dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
-            dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
-          },
+          policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
         },
         newRoom: {
           number: lastTransfer.toRoomNumber,
           type:   newRoomType,
-          policy: {
-            dayPrice:        policy?.dayPrice || 0,
-            hourSlots:       policy?.hourSlots || [],
-            dayCheckInTime:  policy?.dayCheckInTime || '14:00',
-            dayCheckOutTime: policy?.dayCheckOutTime || '12:00',
-            dayEarlyCheckIn: policy?.dayEarlyCheckIn || [],
-            dayLateCheckOut: policy?.dayLateCheckOut || [],
-          },
+          policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
         },
         transferFee: Number(lastTransfer.fee) || 0,
         changeRate:  oldRoomType !== newRoomType,
         isFreeRoom:  !!booking.isFreeRoom,
-        branchConfig: branch ? {
-          checkInTime:        branch.checkInTime,
-          checkOutTime:       branch.checkOutTime,
-          earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
-          toleranceMinutes:   branch.toleranceMinutes ?? 15,
-          dayEquivalentHours: branch.dayEquivalentHours ?? 23,
-        } : null,
+        branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
       })
 
       const breakdownItems = moveItems.map(it => ({
@@ -1427,9 +1407,6 @@ const moveRoom = async (req, res, next) => {
         })
       }
 
-      // ⭐ Load branch config để truyền vào moveRoomBreakdown
-      const branch = booking.branchId ? await Branch.findById(booking.branchId) : null
-
       const breakdownInput = {
         actualCheckIn:   new Date(sourceActualCheckIn || sourceCheckIn),
         plannedCheckOut: new Date(sourceCheckOut),
@@ -1438,36 +1415,21 @@ const moveRoom = async (req, res, next) => {
           number: oldRoomNumber,
           type:   oldRoomType,
           policy: {
-            dayPrice:        oldPolicy?.dayPrice || 0,
-            hourSlots:       oldPolicy?.hourSlots || [],
-            dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
-            dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
-            dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
-            dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
+            dayPrice:  oldPolicy?.dayPrice || 0,
+            hourSlots: hourSlotsOf(oldPolicy),
           },
         },
         newRoom: {
           number: newRoom.number,
           type:   newRoomType,
           policy: {
-            dayPrice:        newPolicy?.dayPrice || 0,
-            hourSlots:       newPolicy?.hourSlots || [],
-            dayCheckInTime:  newPolicy?.dayCheckInTime || '14:00',
-            dayCheckOutTime: newPolicy?.dayCheckOutTime || '12:00',
-            dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn || [],
-            dayLateCheckOut: newPolicy?.dayLateCheckOut || [],
+            dayPrice:  newPolicy.dayPrice || 0,
+            hourSlots: hourSlotsOf(newPolicy),
           },
         },
         transferFee: 0,    // fee được handle riêng ở booking.transferFee
         changeRate:  oldRoomType !== newRoomType,  // chỉ đổi rate khi khác loại
         isFreeRoom:  !!booking.isFreeRoom,
-        branchConfig: branch ? {
-          checkInTime:        branch.checkInTime,
-          checkOutTime:       branch.checkOutTime,
-          earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
-          toleranceMinutes:   branch.toleranceMinutes ?? 15,
-          dayEquivalentHours: branch.dayEquivalentHours ?? 23,
-        } : null,
       }
 
       let items = []
@@ -2423,37 +2385,17 @@ const checkout = async (req, res, next) => {
             oldRoom: {
               number: lastTransfer.fromRoomNumber,
               type:   oldRoomType,
-              policy: {
-                dayPrice:        oldPolicy?.dayPrice || 0,
-                hourSlots:       oldPolicy?.hourSlots || [],
-                dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
-                dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
-                dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
-                dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
-              },
+              policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
             },
             newRoom: {
               number: lastTransfer.toRoomNumber,
               type:   newRoomType,
-              policy: {
-                dayPrice:        policy?.dayPrice || 0,
-                hourSlots:       policy?.hourSlots || [],
-                dayCheckInTime:  policy?.dayCheckInTime || '14:00',
-                dayCheckOutTime: policy?.dayCheckOutTime || '12:00',
-                dayEarlyCheckIn: policy?.dayEarlyCheckIn || [],
-                dayLateCheckOut: policy?.dayLateCheckOut || [],
-              },
+              policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
             },
             transferFee: Number(lastTransfer.fee) || 0,
             changeRate:  oldRoomType !== newRoomType,
             isFreeRoom:  !!booking.isFreeRoom,
-            branchConfig: branch ? {
-              checkInTime:        branch.checkInTime,
-              checkOutTime:       branch.checkOutTime,
-              earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
-              toleranceMinutes:   branch.toleranceMinutes ?? 15,
-              dayEquivalentHours: branch.dayEquivalentHours ?? 23,
-            } : null,
+            branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
           })
 
           const breakdownItems = moveItems.map(it => ({
@@ -3293,13 +3235,58 @@ const getAvailableByDate = async (req, res, next) => {
 }
 const applyDiscount = async (req, res, next) => {
   try {
-    const { discountPercent = 0, discountAmount = 0, isFreeRoom = false } = req.body
-    const pct = Math.max(0, Math.min(100, Number(discountPercent) || 0))
-    const amt = Math.max(0, Number(discountAmount) || 0)
+    const {
+      discountPercent = 0,
+      discountAmount  = 0,
+      isFreeRoom      = false,
+      // ⭐ NEW 19/05/2026: Lý do + nhân viên chịu trách nhiệm
+      discountReason   = '',
+      discountChargedTo = null,   // userId nhân viên chịu (null = KS chịu)
+    } = req.body
+    const pct  = Math.max(0, Math.min(100, Number(discountPercent) || 0))
+    const amt  = Math.max(0, Number(discountAmount) || 0)
     const free = !!isFreeRoom
+    const reason = String(discountReason || '').trim()
+
+    // ⭐ Validate: nếu có discount > 0 (% hoặc số tiền hoặc free) → bắt buộc lý do >= 5 ký tự
+    const hasAnyDiscount = pct > 0 || amt > 0 || free
+    if (hasAnyDiscount && reason.length < 5) {
+      return res.status(400).json({
+        success: false,
+        code: 'DISCOUNT_REASON_REQUIRED',
+        message: 'Vui lòng nhập lý do chiết khấu (≥ 5 ký tự)',
+      })
+    }
 
     const booking = await Booking.findById(req.params.id)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+
+    // ⭐ Validate chargedTo (nếu có): phải là user thật + cùng branch + role admin/manager/receptionist
+    let chargedToUser = null
+    let chargedToName = null
+    if (discountChargedTo) {
+      try {
+        const User = require('../models/User')   // adjust path nếu khác
+        chargedToUser = await User.findById(discountChargedTo).select('_id fullName username email role branchId')
+        if (!chargedToUser) {
+          return res.status(400).json({ success: false, message: 'Không tìm thấy nhân viên được chọn' })
+        }
+        // Cùng branch
+        if (String(chargedToUser.branchId) !== String(booking.branchId)) {
+          return res.status(400).json({ success: false, message: 'Nhân viên không thuộc chi nhánh này' })
+        }
+        // Role hợp lệ (case-insensitive)
+        const validRoles = ['admin', 'manager', 'receptionist']
+        const roleNormalized = String(chargedToUser.role || '').toLowerCase().trim()
+        if (!validRoles.includes(roleNormalized)) {
+          return res.status(400).json({ success: false, message: 'Vai trò nhân viên không hợp lệ để chịu chiết khấu' })
+        }
+        chargedToName = chargedToUser.fullName || chargedToUser.username || chargedToUser.email || ''
+      } catch (e) {
+        console.error('[applyDiscount] User validation error:', e.message)
+        return res.status(500).json({ success: false, message: 'Lỗi xác thực nhân viên' })
+      }
+    }
 
     const roomPart  = free ? 0 : (booking.roomAmount ?? 0)
     const subtotal  = roomPart + (booking.servicesAmount ?? 0)
@@ -3310,6 +3297,14 @@ const applyDiscount = async (req, res, next) => {
     booking.discountAmount  = amt
     booking.isFreeRoom      = free
     booking.discount        = totalDiscount
+    // ⭐ NEW: Lưu lý do + người chịu trách nhiệm
+    booking.discountReason         = hasAnyDiscount ? reason : ''
+    booking.discountChargedTo      = chargedToUser?._id ?? null
+    booking.discountChargedToName  = chargedToName
+    booking.discountChargedToRole  = chargedToUser ? String(chargedToUser.role || '').toLowerCase().trim() : null
+    booking.discountAppliedAt      = hasAnyDiscount ? new Date() : null
+    booking.discountAppliedBy      = req.user?._id ?? null
+    booking.discountAppliedByName  = req.user?.fullName || req.user?.username || req.user?.email || null
 
     // ⭐ FIX 19/05/2026 v3: Cộng transferFee vào totalAmount (trước đây bỏ sót).
     //   Fallback từ transferHistory nếu booking.transferFee chưa sync.
@@ -3337,12 +3332,20 @@ const applyDiscount = async (req, res, next) => {
     if (pct > 0) desc.push(`${pct}%`)
     if (amt > 0) desc.push(`${amt.toLocaleString('vi-VN')}đ`)
     if (free)    desc.push('Miễn phí phòng')
+    const chargedDesc = chargedToName ? ` (NV chịu: ${chargedToName})` : ''
     await logAction({
       entityType: 'Booking', entityId: booking._id,
       action: 'apply_discount',
-      description: `Áp dụng chiết khấu: ${desc.join(' + ') || 'không có'}`,
+      description: `Áp dụng chiết khấu: ${desc.join(' + ') || 'không có'}${chargedDesc}${reason ? ` — ${reason}` : ''}`,
       user: req.user, branchId: booking.branchId,
-      metadata: { discountPercent: pct, discountAmount: amt, isFreeRoom: free, totalDiscount, newTotal: booking.totalAmount },
+      metadata: {
+        discountPercent: pct, discountAmount: amt, isFreeRoom: free,
+        totalDiscount, newTotal: booking.totalAmount,
+        discountReason: reason,
+        discountChargedTo: chargedToUser?._id ?? null,
+        discountChargedToName: chargedToName,
+        discountChargedToRole: chargedToUser ? String(chargedToUser.role || '').toLowerCase().trim() : null,
+      },
     })
 
     res.json({ success: true, message: 'Đã áp dụng chiết khấu', data: { booking } })
@@ -3836,24 +3839,16 @@ const calculateBill = async (req, res, next) => {
             number: oldRoomNum,
             type:   oldRoomType,
             policy: {
-              dayPrice:        oldPolicy?.dayPrice || 0,
-              hourSlots:       oldPolicy?.hourSlots || [],
-              dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
-              dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
-              dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
-              dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
+              dayPrice:  oldPolicy?.dayPrice || 0,
+              hourSlots: hourSlotsOf(oldPolicy),
             },
           },
           newRoom: {
             number: newRoomNum,
             type:   newRoomType,
             policy: {
-              dayPrice:        newPolicy?.dayPrice || 0,
-              hourSlots:       newPolicy?.hourSlots || [],
-              dayCheckInTime:  newPolicy?.dayCheckInTime || '14:00',
-              dayCheckOutTime: newPolicy?.dayCheckOutTime || '12:00',
-              dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn || [],
-              dayLateCheckOut: newPolicy?.dayLateCheckOut || [],
+              dayPrice:  newPolicy?.dayPrice || 0,
+              hourSlots: hourSlotsOf(newPolicy),
             },
           },
           // ⭐ FIX: Truyền fee từ transferHistory để module sinh dòng phụ thu
@@ -3861,13 +3856,7 @@ const calculateBill = async (req, res, next) => {
           transferFee: Number(lastTransfer.fee) || 0,
           changeRate:  oldRoomType !== newRoomType,
           isFreeRoom:  !!booking.isFreeRoom,
-          branchConfig: branch ? {
-            checkInTime:        branch.checkInTime,
-            checkOutTime:       branch.checkOutTime,
-            earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
-            toleranceMinutes:   branch.toleranceMinutes ?? 15,
-            dayEquivalentHours: branch.dayEquivalentHours ?? 23,
-          } : null,
+          branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
         })
 
         // ⭐ FIX: KHÔNG filter fee item nữa — để nó hiển thị trong breakdown

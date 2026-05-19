@@ -79,6 +79,19 @@ const PenaltySnapshotSchema = new Schema(
 // ─────────────────────────────────────────────────────────────────────────
 // SalaryRecord
 // ─────────────────────────────────────────────────────────────────────────
+const DiscountChargeSnapshotSchema = new Schema(
+  {
+    bookingId:    { type: Schema.Types.ObjectId, ref: 'Booking' },
+    bookingCode:  { type: String, default: '' },
+    roomNumber:   { type: String, default: '' },
+    customerName: { type: String, default: '' },
+    amount:       { type: Number, required: true, min: 0 },
+    reason:       { type: String, default: '' },
+    appliedAt:    { type: Date },
+  },
+  { _id: false }
+);
+
 const SalaryRecordSchema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
@@ -100,6 +113,10 @@ const SalaryRecordSchema = new Schema(
     // ⭐ Phạt
     penalties: { type: [PenaltySnapshotSchema], default: [] },
     penaltyTotal: { type: Number, default: 0 },
+
+    // ⭐ NEW 19/05/2026: Discount NV chịu trách nhiệm (trừ vào lương cuối tháng)
+    discountCharges:      { type: [DiscountChargeSnapshotSchema], default: [] },
+    discountChargesTotal: { type: Number, default: 0 },
 
     total: { type: Number, default: 0 },
 

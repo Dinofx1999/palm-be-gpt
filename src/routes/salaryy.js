@@ -10,6 +10,7 @@ const mongoose = require('mongoose');
 const router = express.Router();
 
 const User = require('../models/User');
+const Booking = require('../models/Booking');                                   // ⭐ NEW 19/05: discount charges
 const { SalaryConfig, KpiConfig, SalaryRecord } = require('../models/Salary');
 const { PenaltyRecord } = require('../models/Penalty');
 const SalaryAdvance = require('../models/SalaryAdvance');                       // ⭐ NEW
@@ -94,7 +95,34 @@ async function getAdvancesForPeriod(userId, year, month) {
   }));
 }
 
-// Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt + lương ứng)
+// ⭐ NEW 19/05/2026: Lấy danh sách chiết khấu NV chịu trách nhiệm trong tháng
+//   Query Booking collection theo discountChargedTo + discountAppliedAt
+//   Booking đã `cancelled` không tính (KS không thu tiền)
+async function getDiscountChargesForPeriod(userId, year, month) {
+  const start = new Date(year, month - 1, 1);
+  const end   = new Date(year, month, 0, 23, 59, 59, 999);
+
+  const bookings = await Booking.find({
+    discountChargedTo: userId,
+    discountAppliedAt: { $gte: start, $lte: end },
+    status: { $nin: ['cancelled'] },
+  })
+    .select('_id bookingCode roomNumber customerName discount discountReason discountAppliedAt')
+    .sort({ discountAppliedAt: -1 })
+    .lean();
+
+  return bookings.map((b) => ({
+    bookingId:    b._id,
+    bookingCode:  b.bookingCode || '',
+    roomNumber:   b.roomNumber  || '',
+    customerName: b.customerName|| '',
+    amount:       Number(b.discount) || 0,
+    reason:       b.discountReason || '',
+    appliedAt:    b.discountAppliedAt,
+  }));
+}
+
+// Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt + lương ứng + chiết khấu chịu)
 async function computeSnapshot(userId, year, month) {
   const [cfg, user] = await Promise.all([
     SalaryConfig.findOne({ user: userId }).lean(),
@@ -119,11 +147,23 @@ async function computeSnapshot(userId, year, month) {
   // ⭐ NEW 11/05/2026: Thêm advance vào snapshot
   const advances = await getAdvancesForPeriod(userId, year, month);
   const advanceTotal = advances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
-  const remainingToPay = Math.max(0, (result.total || 0) - advanceTotal);
+
+  // ⭐ NEW 19/05/2026: Discount charges (NV chịu trách nhiệm) — trừ vào total
+  const discountCharges = await getDiscountChargesForPeriod(userId, year, month);
+  const discountChargesTotal = discountCharges.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+
+  // Tổng lương sau khi trừ discount charges = result.total (đã trừ phạt) - discountChargesTotal
+  const totalAfterCharges = Math.max(0, (result.total || 0) - discountChargesTotal);
+  const remainingToPay    = Math.max(0, totalAfterCharges - advanceTotal);
+
+  // Override total trong result để các nơi khác (POST /calculate, /pay) dùng đúng
+  result.total = totalAfterCharges;
 
   return {
     user, cfg, kpi, revenue, result, penalties,
-    advances, advanceTotal, remainingToPay,
+    advances, advanceTotal,
+    discountCharges, discountChargesTotal,
+    remainingToPay,
   };
 }
 
@@ -370,6 +410,7 @@ router.post('/calculate', authenticate, async (req, res) => {
       if (existing) {
         // ⭐ NEW 11/05/2026: Đọc advanceTotal từ snapshot (đã chốt thì giữ nguyên)
         const existingAdvanceTotal   = existing.advanceTotal   || 0;
+        const existingDiscountChargesTotal = existing.discountChargesTotal || 0;   // ⭐ NEW 19/05
         const existingRemainingToPay = existing.remainingToPay ?? Math.max(0, existing.total - existingAdvanceTotal);
 
         return res.json({
@@ -383,6 +424,9 @@ router.post('/calculate', authenticate, async (req, res) => {
           advanceTotal:   existingAdvanceTotal,
           remainingToPay: existingRemainingToPay,
           advances:       existing.advances || [],
+          // ⭐ NEW 19/05: Discount charges từ snapshot
+          discountCharges:      existing.discountCharges || [],
+          discountChargesTotal: existingDiscountChargesTotal,
           breakdown: {
             target: existing.target,
             revenue: existing.revenue,
@@ -411,10 +455,11 @@ router.post('/calculate', authenticate, async (req, res) => {
         });
       }
 
-      // Chưa chốt → tính realtime (đã có sẵn advance trong computeSnapshot)
+      // Chưa chốt → tính realtime (đã có sẵn advance + discountCharges trong computeSnapshot)
       const {
         user, kpi, revenue: rev, result, penalties,
         advances, advanceTotal, remainingToPay,
+        discountCharges, discountChargesTotal,
       } = await computeSnapshot(userId, y, m);
 
       return res.json({
@@ -424,6 +469,9 @@ router.post('/calculate', authenticate, async (req, res) => {
         advanceTotal,
         remainingToPay,
         advances,
+        // ⭐ NEW 19/05
+        discountCharges,
+        discountChargesTotal,
         revenue: rev,
         year: y,
         month: m,
@@ -492,6 +540,7 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
     const {
       user, cfg, kpi, revenue, result, penalties,
       advances, advanceTotal, remainingToPay,
+      discountCharges, discountChargesTotal,
     } = await computeSnapshot(userId, year, month);
 
     const record = await SalaryRecord.findOneAndUpdate(
@@ -522,6 +571,19 @@ router.post('/pay/:userId', authenticate, async (req, res) => {
             occurredOn: p.occurredOn,
           })),
           penaltyTotal: result.penaltyTotal,
+
+          // ⭐ NEW 19/05/2026: Snapshot discount charges
+          discountCharges: discountCharges.map((d) => ({
+            bookingId:    d.bookingId,
+            bookingCode:  d.bookingCode,
+            roomNumber:   d.roomNumber,
+            customerName: d.customerName,
+            amount:       d.amount,
+            reason:       d.reason,
+            appliedAt:    d.appliedAt,
+          })),
+          discountChargesTotal,
+
           total: result.total,
 
           // ⭐ NEW 11/05/2026: Snapshot lương ứng
@@ -623,6 +685,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
       if (record) {
         // ⭐ NEW 11/05/2026: Đọc advanceTotal từ snapshot
         const recAdvanceTotal   = record.advanceTotal   || 0;
+        const recDiscountChargesTotal = record.discountChargesTotal || 0;   // ⭐ NEW 19/05
         const recRemainingToPay = record.remainingToPay ?? Math.max(0, record.total - recAdvanceTotal);
 
         history.push({
@@ -635,6 +698,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           total: record.total,
           advanceTotal:   recAdvanceTotal,
           remainingToPay: recRemainingToPay,
+          discountChargesTotal: recDiscountChargesTotal,   // ⭐ NEW 19/05
           revenue: record.revenue,
           target: record.target,
           paidStatus: record.paidStatus,
@@ -646,7 +710,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
         });
       } else if (p.year === currentYear && p.month === currentMonth) {
         try {
-          const { result, revenue, kpi, advanceTotal, remainingToPay } =
+          const { result, revenue, kpi, advanceTotal, remainingToPay, discountChargesTotal } =
             await computeSnapshot(userId, p.year, p.month);
           history.push({
             year: p.year,
@@ -658,6 +722,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             total: result.total,
             advanceTotal,
             remainingToPay,
+            discountChargesTotal,    // ⭐ NEW 19/05
             revenue,
             target: kpi?.target || 0,
             paidStatus: 'unpaid',
@@ -675,6 +740,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             total: 0,
             advanceTotal: 0,
             remainingToPay: 0,
+            discountChargesTotal: 0,   // ⭐ NEW 19/05
             revenue: 0,
             target: 0,
             paidStatus: 'unpaid',
@@ -693,6 +759,7 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           total: 0,
           advanceTotal: 0,
           remainingToPay: 0,
+          discountChargesTotal: 0,   // ⭐ NEW 19/05
           revenue: 0,
           target: 0,
           paidStatus: 'unpaid',

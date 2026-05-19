@@ -79,7 +79,7 @@ app.use('/api/workshift',         require('./routes/workshift'));
 app.use('/api/attendance',        require('./routes/attendance'));
 app.use('/api/admin',             require('./routes/device-security'));
 app.use('/api/chat',              require('./routes/chat'));
-
+app.use('/api/reports', require('./routes/reports'));
 // ⭐ NEW 13/05/2026: AI Chat Feedback + Few-shot management
 app.use('/api',                   require('./routes/chatFeedback'));
 

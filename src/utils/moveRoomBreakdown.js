@@ -197,7 +197,8 @@ function isEarlyMorningTransferOfFirstNight({ actualCheckIn, transferAt, earlyCh
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
 function computeMoveRoomBreakdown(input) {
-  const {
+  // ⭐ let cho newRoom + transferFee để có thể override khi vừa chuyển trong tolerance
+  let {
     actualCheckIn,
     plannedCheckOut,
     transferAt,
@@ -217,23 +218,35 @@ function computeMoveRoomBreakdown(input) {
 
   const ci = new Date(actualCheckIn);
   const co = new Date(plannedCheckOut);
-  const tAt = new Date(transferAt);
+  let tAt = new Date(transferAt);   // ⭐ let để có thể override
 
   const dayEquivalentHours = branchConfig?.dayEquivalentHours ?? DEFAULT_CONFIG.DAY_EQUIVALENT_HOURS;
   const earlyCheckinUntil = branchConfig?.earlyCheckinUntil ?? DEFAULT_CONFIG.EARLY_CHECKIN_UNTIL;
   const tolerance = branchConfig?.toleranceMinutes ?? DEFAULT_CONFIG.TOLERANCE_MINUTES;
 
-  // ⭐ EARLY RETURN: nếu effectiveCheckOut - actualCheckIn ≤ tolerance → 0đ
-  //   Áp dụng cho tab "Đến hiện tại" khi khách vừa CI vài phút.
-  //   Khớp với logic priceCalculator.js (line 282-289).
+  // ⭐ EARLY RETURN 1: Tab "Đến hiện tại" — khách vừa CI ≤ tolerance phút → 0đ
+  //   Áp dụng cho cả booking thường + booking đã chuyển phòng.
+  //   Khớp logic priceCalculator.js (line 282-289).
   const stayMinutes = (co - ci) / 60000;
-  if (stayMinutes <= tolerance && stayMinutes >= 0) {
+  if (stayMinutes >= 0 && stayMinutes <= tolerance) {
     return [{
       label: `Mới ${Math.max(0, Math.floor(stayMinutes))} phút (Linh hoạt ${tolerance} phút — Miễn phí)`,
       amount: 0,
       type: 'base',
       meta: { freeGracePeriod: true, tolerance, diffMinutes: stayMinutes },
     }];
+  }
+
+  // ⭐ MUTATE: Tab "Đến hiện tại" — khách vừa chuyển phòng ≤ tolerance phút trước
+  //   → Coi như CHƯA chuyển, chỉ tính phòng CŨ từ CI → effectiveCheckOut.
+  //   Vd: CI 15/05 14:00, transfer 19/05 16:00, now=19/05 16:05 → tính phòng cũ tới 16:05.
+  //   Cách làm: ép newRoom = oldRoom + transferAt = co + transferFee = 0 → logic phía dưới
+  //   sẽ tính như chưa chuyển.
+  const sinceTransfer = (co - tAt) / 60000;
+  if (sinceTransfer >= 0 && sinceTransfer <= tolerance && tAt > ci) {
+    newRoom = oldRoom;
+    tAt = co;  // = plannedCheckOut → findTransferNightIndex sẽ trả index cuối
+    transferFee = 0;
   }
 
   const items = [];
