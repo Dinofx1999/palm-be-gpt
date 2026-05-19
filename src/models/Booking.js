@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 
+const { BookingSegmentSchema } = require('./BookingSegment');
 // ⭐ Sub-schema cho breakdown từng dòng giá
 const breakdownItemSchema = new mongoose.Schema({
   label:  { type: String, required: true },
@@ -136,6 +137,8 @@ const bookingSchema = new mongoose.Schema({
     by:             { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     _id: false,
   }],
+
+  segments: { type: [BookingSegmentSchema], default: [] },
 
   // ⭐ NEW: Mã đặt phòng — format BK_XXXXXX (6 ký tự alphanumeric uppercase, random)
   //   Auto-generate ở pre-save hook nếu chưa có. Unique + sparse (cho phép null tạm thời).

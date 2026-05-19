@@ -6,7 +6,8 @@ const helmet      = require('helmet');
 const morgan      = require('morgan');
 const compression = require('compression');
 const path = require('path');
-
+console.log('🕐 Server TZ:', Intl.DateTimeFormat().resolvedOptions().timeZone)
+console.log('🕐 Now:', new Date().toString())
 const app  = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 4000;

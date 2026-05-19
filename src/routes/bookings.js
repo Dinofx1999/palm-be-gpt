@@ -35,8 +35,6 @@ router.post('/group',              authenticate, createGroup);
 router.post('/',                   authenticate, create);
 
 // ⭐ NEW 11/05/2026: Gộp đoàn / Tách đoàn
-//   Hiện không gắn authorize → mọi role đăng nhập đều dùng được.
-//   Nếu muốn limit chỉ Admin/Manager: thêm authorize('Admin','Manager') như undo
 router.post('/:id/merge-group',    authenticate, mergeGroup);
 router.post('/:id/split-room',     authenticate, splitRoom);
 

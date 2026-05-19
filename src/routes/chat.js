@@ -246,6 +246,7 @@ async function computeRoomRealStatus(branchId = null) {
 // ============================================================
 const tools = [{
   functionDeclarations: [
+    
     {
       name: 'get_rooms_overview',
       description: 'Tổng quan trạng thái phòng (tổng số, đang ở, trống, đặt trước, dọn dẹp, bảo trì). Dùng khi user hỏi: "có bao nhiêu phòng trống", "tình hình phòng", "phòng nào đang ở".',
@@ -257,7 +258,58 @@ const tools = [{
         },
       },
     },
-
+       {
+      name: 'prepare_checkin',
+      description: 'BƯỚC 1 của check-in — Preview booking + tính phí phát sinh (CI sớm), KHÔNG check-in thật. Internal only. Phải gọi tool này TRƯỚC để user xem & xác nhận. Tìm booking theo bookingCode HOẶC roomNumber + customerName.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingCode: { type: 'string', description: 'Mã booking (vd BK_W8X6UE)' },
+          roomNumber:  { type: 'string', description: 'Số phòng (fallback nếu không có bookingCode)' },
+          customerName: { type: 'string', description: 'Tên khách (kèm roomNumber nếu cần)' },
+        },
+      },
+    },
+ 
+    {
+      name: 'confirm_checkin',
+      description: 'BƯỚC 2 — Thực hiện check-in thật (đổi status thành "checked_in", set actualCheckIn=now). CHỈ gọi sau khi user xác nhận rõ ràng. Internal only. confirmed=true là BẮT BUỘC.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingCode: { type: 'string', description: 'Mã booking — BẮT BUỘC' },
+          confirmed:   { type: 'boolean', description: 'BẮT BUỘC = true' },
+          notes:       { type: 'string', description: 'Ghi chú thêm (tuỳ chọn)' },
+        },
+        required: ['bookingCode', 'confirmed'],
+      },
+    },
+ 
+    {
+      name: 'prepare_cancellation',
+      description: 'BƯỚC 1 của HỦY booking — Preview thông tin booking sẽ bị hủy. CHỈ ADMIN được dùng. KHÔNG hủy thật, chỉ hiển thị cho user xem. Phải có bookingCode.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingCode: { type: 'string', description: 'Mã booking cần hủy (BẮT BUỘC)' },
+        },
+        required: ['bookingCode'],
+      },
+    },
+ 
+    {
+      name: 'confirm_cancellation',
+      description: 'BƯỚC 2 — Thực hiện HỦY booking thật (đổi status thành "cancelled", giải phóng phòng). CHỈ ADMIN. BẮT BUỘC: confirmed=true + reason (lý do hủy). KHÔNG có lý do = từ chối.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bookingCode: { type: 'string', description: 'Mã booking — BẮT BUỘC' },
+          reason:      { type: 'string', description: 'Lý do hủy — BẮT BUỘC, tối thiểu 5 ký tự (vd "Khách đổi ý", "Trùng booking", "Khách không tới")' },
+          confirmed:   { type: 'boolean', description: 'BẮT BUỘC = true' },
+        },
+        required: ['bookingCode', 'reason', 'confirmed'],
+      },
+    },
     {
       name: 'check_room_availability',
       description: 'Kiểm tra phòng trống VÀ tính GIÁ ĐẦY ĐỦ (bao gồm phụ thu). HỖ TRỢ CHIA NHÓM (gia đình/đoàn): truyền groups[] để mỗi group được ở 1 phòng riêng, hệ thống tự chọn phòng tối ưu.',
@@ -1043,6 +1095,7 @@ const makeHandlers = (ctx) => ({
           children: occupancyChildren,
           maxAdults: type?.maxAdults ?? 2,
           maxChildren: type?.maxChildren ?? 0,
+          maxOccupancy: type?.maxOccupancy ?? ((type?.maxAdults ?? 2) + (type?.maxChildren ?? 0)),
         });
 
         if (result.error) return null;
@@ -2514,6 +2567,7 @@ const makeHandlers = (ctx) => ({
       children,
       maxAdults: roomType.maxAdults || roomType.capacity || 2,
       maxChildren: roomType.maxChildren || 0,
+      maxOccupancy: roomType.maxOccupancy || ((roomType.maxAdults || roomType.capacity || 2) + (roomType.maxChildren || 0)),
     });
 
     if (priceResult.error) {
@@ -2748,6 +2802,7 @@ const makeHandlers = (ctx) => ({
       children,
       maxAdults: roomType.maxAdults || roomType.capacity || 2,
       maxChildren: roomType.maxChildren || 0,
+      maxOccupancy: roomType.maxOccupancy || ((roomType.maxAdults || roomType.capacity || 2) + (roomType.maxChildren || 0)),
     });
 
     if (priceResult.error) {
@@ -2871,6 +2926,447 @@ const makeHandlers = (ctx) => ({
       _hint: 'BOOKING ĐÃ TẠO THÀNH CÔNG. Hiển thị bookingCode + thông tin cho user với tone vui mừng. Kết thúc bằng "Anh/chị cần em hỗ trợ thêm gì không ạ?"',
     };
   },
+  // ════════════════════════════════════════════════════════════
+// PHẦN B — HANDLERS (thêm vào makeHandlers, sau 'create_booking')
+// ════════════════════════════════════════════════════════════
+ 
+  // ── 7d. PREPARE CHECKIN — Preview, không check-in thật ──
+  async prepare_checkin({ bookingCode, roomNumber, customerName }) {
+    if (!ctx.isInternal) {
+      return {
+        error: 'external_not_allowed',
+        message: 'Khách hàng không thể tự check-in qua chat ạ.',
+      };
+    }
+ 
+    // Tìm booking
+    let booking = null;
+    if (bookingCode) {
+      const raw = String(bookingCode).trim().toUpperCase();
+      const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+      const withoutPrefix = raw.replace(/^BK_/, '');
+      const q = {
+        $or: [
+          { bookingCode: raw },
+          { bookingCode: withPrefix },
+          { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+        ],
+      };
+      if (ctx.role !== 'Admin' && ctx.userBranchId) {
+        q.branchId = ctx.userBranchId;
+      }
+      booking = await Booking.findOne(q)
+        .populate('branchId', 'name')
+        .populate('roomId', 'number typeId')
+        .lean();
+    } else if (roomNumber) {
+      // Fallback: tìm theo số phòng + tên khách
+      const numClean = String(roomNumber).trim();
+      const q = {
+        roomNumber: numClean,
+        status: { $in: ['reserved', 'confirmed'] },
+      };
+      if (customerName) {
+        q.customerName = new RegExp(customerName.trim(), 'i');
+      }
+      if (ctx.role !== 'Admin' && ctx.userBranchId) {
+        q.branchId = ctx.userBranchId;
+      }
+      booking = await Booking.findOne(q)
+        .populate('branchId', 'name')
+        .populate('roomId', 'number typeId')
+        .sort({ checkIn: 1 })
+        .lean();
+    }
+ 
+    if (!booking) {
+      return {
+        error: 'not_found',
+        message: `Không tìm thấy booking phù hợp${bookingCode ? ` với mã ${bookingCode}` : ''}.`,
+      };
+    }
+ 
+    // Check status
+    if (booking.status === 'checked_in') {
+      return {
+        error: 'already_checked_in',
+        message: `Booking ${booking.bookingCode || ''} đã check-in rồi ạ (lúc ${new Date(booking.actualCheckIn).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false })}).`,
+      };
+    }
+    if (booking.status === 'checked_out') {
+      return {
+        error: 'already_checked_out',
+        message: `Booking ${booking.bookingCode || ''} đã check-out rồi ạ.`,
+      };
+    }
+    if (booking.status === 'cancelled') {
+      return {
+        error: 'cancelled',
+        message: `Booking ${booking.bookingCode || ''} đã bị hủy ạ.`,
+      };
+    }
+    if (!['reserved', 'confirmed'].includes(booking.status)) {
+      return {
+        error: 'invalid_status',
+        message: `Booking đang ở trạng thái "${booking.status}" — không thể check-in.`,
+      };
+    }
+ 
+    // Tính chênh lệch giờ check-in
+    const now = new Date();
+    const scheduledCI = new Date(booking.checkIn);
+    const diffMs = now.getTime() - scheduledCI.getTime();
+    const diffMinutes = Math.round(diffMs / 60000);
+    const diffHours = (diffMinutes / 60).toFixed(1);
+ 
+    let timingNote = '';
+    let isEarly = false;
+    if (diffMinutes < -15) {
+      isEarly = true;
+      const earlyHours = Math.abs(diffMinutes / 60).toFixed(1);
+      timingNote = `Khách đến sớm hơn ${earlyHours} giờ so với giờ chuẩn.`;
+    } else if (diffMinutes > 60) {
+      timingNote = `Khách đến trễ ${diffHours} giờ so với giờ đặt.`;
+    } else {
+      timingNote = 'Khách đến đúng giờ.';
+    }
+ 
+    const fmtVN = (d) => new Date(d).toLocaleString('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+ 
+    return {
+      _previewOnly: true,
+      summary: {
+        bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+        customerName: booking.customerName,
+        customerPhone: booking.customerPhone,
+        roomNumber: booking.roomNumber,
+        roomType: booking.roomType,
+        adults: booking.adults,
+        children: booking.children,
+        nights: booking.nights,
+        scheduledCheckIn: booking.checkIn,
+        scheduledCheckInFormatted: fmtVN(booking.checkIn),
+        actualCheckInTime: now,
+        actualCheckInFormatted: fmtVN(now),
+        timingNote,
+        isEarly,
+        diffMinutes,
+        totalAmount: booking.totalAmount,
+        totalAmountFormatted: fmt(booking.totalAmount || 0),
+        currentStatus: booking.status,
+        branch: booking.branchId?.name,
+      },
+      _hint: 'ĐÂY LÀ PREVIEW. Hiển thị thông tin cho user xác nhận. Nếu isEarly=true → nhắc admin về CI sớm có thể phụ thu (xem chính sách). PHẢI hỏi "Anh/chị xác nhận check-in giúp em nhé?" trước khi gọi confirm_checkin.',
+    };
+  },
+ 
+  // ── 7e. CONFIRM CHECKIN — Thực hiện check-in thật ──
+  async confirm_checkin({ bookingCode, confirmed, notes }) {
+    if (!ctx.isInternal) {
+      return { error: 'external_not_allowed', message: 'Khách hàng không thể check-in qua chat.' };
+    }
+    if (!confirmed) {
+      return {
+        error: 'not_confirmed',
+        message: 'Phải gọi prepare_checkin trước + user xác nhận, rồi mới gọi confirm_checkin với confirmed=true.',
+      };
+    }
+    if (!bookingCode) {
+      return { error: 'missing_code', message: 'Thiếu bookingCode' };
+    }
+ 
+    const raw = String(bookingCode).trim().toUpperCase();
+    const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+    const withoutPrefix = raw.replace(/^BK_/, '');
+    const q = {
+      $or: [
+        { bookingCode: raw },
+        { bookingCode: withPrefix },
+        { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+      ],
+    };
+    if (ctx.role !== 'Admin' && ctx.userBranchId) {
+      q.branchId = ctx.userBranchId;
+    }
+ 
+    const booking = await Booking.findOne(q);
+    if (!booking) {
+      return { error: 'not_found', message: `Không tìm thấy booking ${bookingCode}` };
+    }
+    if (booking.status === 'checked_in') {
+      return { error: 'already_checked_in', message: 'Booking đã check-in rồi.' };
+    }
+    if (!['reserved', 'confirmed'].includes(booking.status)) {
+      return { error: 'invalid_status', message: `Booking trạng thái "${booking.status}" không thể check-in.` };
+    }
+ 
+    // Thực hiện check-in
+    const now = new Date();
+    try {
+      booking.status = 'checked_in';
+      booking.actualCheckIn = now;
+      if (notes?.trim()) {
+        booking.notes = (booking.notes || '') + `\n[AI Chat CI ${now.toLocaleString('vi-VN')}] ${notes.trim()}`;
+      }
+      await booking.save();
+ 
+      // Update Room.currentBookingId nếu chưa có
+      if (booking.roomId) {
+        await Room.findByIdAndUpdate(booking.roomId, {
+          currentBookingId: booking._id,
+          currentGuestName: booking.customerName,
+        });
+      }
+ 
+      // Audit log
+      try {
+        await logAction({
+          entityType: 'Booking',
+          entityId: booking._id,
+          action: 'check_in',
+          description: `[AI Chat] Check-in ${booking.roomNumber} cho ${booking.customerName}`,
+          user: { id: ctx.userId, role: ctx.role, _id: ctx.userId },
+          branchId: booking.branchId,
+          metadata: {
+            source: 'AI Chat',
+            bookingCode: booking.bookingCode,
+            roomNumber: booking.roomNumber,
+            customerName: booking.customerName,
+            actualCheckIn: now,
+            createdByAI: true,
+          },
+        });
+      } catch (e) {
+        console.warn('[confirm_checkin] audit log failed:', e.message);
+      }
+ 
+      const fmtVN = (d) => new Date(d).toLocaleString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+      });
+ 
+      return {
+        success: true,
+        bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+        customerName: booking.customerName,
+        roomNumber: booking.roomNumber,
+        actualCheckIn: now,
+        actualCheckInFormatted: fmtVN(now),
+        status: 'checked_in',
+        _hint: 'CHECK-IN THÀNH CÔNG. Hiển thị tone vui mừng kèm thông tin. Kết thúc "Anh/chị cần em hỗ trợ thêm gì không ạ?"',
+      };
+    } catch (err) {
+      console.error('[confirm_checkin] error:', err);
+      return { error: 'db_error', message: 'Không check-in được: ' + err.message };
+    }
+  },
+ 
+  // ── 7f. PREPARE CANCELLATION — Preview hủy phòng (Admin only) ──
+  async prepare_cancellation({ bookingCode }) {
+    // ⭐ CHỈ ADMIN
+    if (ctx.role !== 'Admin') {
+      return {
+        error: 'forbidden',
+        message: 'Hủy phòng chỉ dành cho Admin ạ. Anh/chị liên hệ Admin để xử lý.',
+      };
+    }
+    if (!bookingCode) {
+      return { error: 'missing_code', message: 'Cần bookingCode' };
+    }
+ 
+    const raw = String(bookingCode).trim().toUpperCase();
+    const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+    const withoutPrefix = raw.replace(/^BK_/, '');
+    const q = {
+      $or: [
+        { bookingCode: raw },
+        { bookingCode: withPrefix },
+        { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+      ],
+    };
+ 
+    const booking = await Booking.findOne(q)
+      .populate('branchId', 'name')
+      .lean();
+ 
+    if (!booking) {
+      return { error: 'not_found', message: `Không tìm thấy booking ${bookingCode}` };
+    }
+    if (booking.status === 'cancelled') {
+      return { error: 'already_cancelled', message: 'Booking này đã bị hủy rồi.' };
+    }
+    if (booking.status === 'checked_out') {
+      return {
+        error: 'already_checked_out',
+        message: 'Booking đã check-out, không thể hủy. Nếu cần hoàn tiền, liên hệ kế toán ạ.',
+      };
+    }
+    if (booking.status === 'checked_in') {
+      return {
+        error: 'currently_checked_in',
+        message: 'Khách đang ở phòng — không thể hủy. Phải check-out trước rồi mới xử lý hoàn tiền ạ.',
+      };
+    }
+ 
+    // Tính thông tin: có phụ thu hủy không, đã thanh toán bao nhiêu
+    const now = new Date();
+    const scheduledCI = new Date(booking.checkIn);
+    const hoursToCI = (scheduledCI.getTime() - now.getTime()) / 3600000;
+ 
+    const fmtVN = (d) => new Date(d).toLocaleString('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+ 
+    return {
+      _previewOnly: true,
+      summary: {
+        bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+        customerName: booking.customerName,
+        customerPhone: booking.customerPhone,
+        roomNumber: booking.roomNumber,
+        roomType: booking.roomType,
+        scheduledCheckIn: booking.checkIn,
+        scheduledCheckInFormatted: fmtVN(booking.checkIn),
+        scheduledCheckOut: booking.checkOut,
+        scheduledCheckOutFormatted: fmtVN(booking.checkOut),
+        nights: booking.nights,
+        totalAmount: booking.totalAmount,
+        totalAmountFormatted: fmt(booking.totalAmount || 0),
+        paidAmount: booking.paidAmount || 0,
+        paidAmountFormatted: fmt(booking.paidAmount || 0),
+        currentStatus: booking.status,
+        hoursToCheckIn: Math.round(hoursToCI * 10) / 10,
+        branch: booking.branchId?.name,
+      },
+      _hint: `ĐÂY LÀ PREVIEW HỦY PHÒNG. Hiển thị đầy đủ thông tin cho admin xem. Lưu ý:
+- Nếu paidAmount > 0 → nhắc "khách đã thanh toán {paidAmount}, cần xử lý hoàn tiền"
+- Nếu hoursToCheckIn < 24 → nhắc "còn dưới 24h tới giờ check-in"
+PHẢI HỎI: "Anh xác nhận hủy booking này không? Vui lòng cho em biết LÝ DO hủy ạ." Đợi user trả lời rồi mới gọi confirm_cancellation.`,
+    };
+  },
+ 
+  // ── 7g. CONFIRM CANCELLATION — Hủy thật (Admin only) ──
+  async confirm_cancellation({ bookingCode, reason, confirmed }) {
+    // ⭐ CHỈ ADMIN
+    if (ctx.role !== 'Admin') {
+      return {
+        error: 'forbidden',
+        message: 'Hủy phòng chỉ dành cho Admin ạ.',
+      };
+    }
+    if (!confirmed) {
+      return {
+        error: 'not_confirmed',
+        message: 'Phải gọi prepare_cancellation trước + user xác nhận + cung cấp lý do.',
+      };
+    }
+    if (!bookingCode) {
+      return { error: 'missing_code', message: 'Thiếu bookingCode' };
+    }
+    // ⭐ Bắt buộc lý do, tối thiểu 5 ký tự
+    if (!reason || String(reason).trim().length < 5) {
+      return {
+        error: 'reason_required',
+        message: 'Phải có lý do hủy (tối thiểu 5 ký tự). Vd: "Khách đổi ý", "Trùng booking", "Khách không tới".',
+      };
+    }
+ 
+    const raw = String(bookingCode).trim().toUpperCase();
+    const withPrefix = raw.startsWith('BK_') ? raw : `BK_${raw}`;
+    const withoutPrefix = raw.replace(/^BK_/, '');
+    const q = {
+      $or: [
+        { bookingCode: raw },
+        { bookingCode: withPrefix },
+        { bookingCode: new RegExp(withoutPrefix + '$', 'i') },
+      ],
+    };
+ 
+    const booking = await Booking.findOne(q);
+    if (!booking) {
+      return { error: 'not_found', message: `Không tìm thấy booking ${bookingCode}` };
+    }
+    if (booking.status === 'cancelled') {
+      return { error: 'already_cancelled', message: 'Booking đã bị hủy rồi.' };
+    }
+    if (booking.status === 'checked_out') {
+      return { error: 'already_checked_out', message: 'Booking đã check-out, không thể hủy.' };
+    }
+    if (booking.status === 'checked_in') {
+      return { error: 'currently_checked_in', message: 'Khách đang ở phòng — phải check-out trước.' };
+    }
+ 
+    // Thực hiện hủy
+    const now = new Date();
+    const reasonClean = String(reason).trim();
+    try {
+      booking.status = 'cancelled';
+      booking.cancelledAt = now;
+      booking.cancelledReason = reasonClean;
+      booking.cancelledBy = ctx.userId || null;
+      booking.notes = (booking.notes || '') + `\n[AI Chat HỦY ${now.toLocaleString('vi-VN')}] Lý do: ${reasonClean}`;
+      await booking.save();
+ 
+      // Giải phóng phòng
+      if (booking.roomId) {
+        await Room.findByIdAndUpdate(booking.roomId, {
+          currentBookingId: null,
+          currentGuestName: null,
+        });
+      }
+ 
+      // Audit log
+      try {
+        await logAction({
+          entityType: 'Booking',
+          entityId: booking._id,
+          action: 'cancel',
+          description: `[AI Chat] Hủy booking ${booking.bookingCode} — ${reasonClean}`,
+          user: { id: ctx.userId, role: ctx.role, _id: ctx.userId },
+          branchId: booking.branchId,
+          metadata: {
+            source: 'AI Chat',
+            bookingCode: booking.bookingCode,
+            roomNumber: booking.roomNumber,
+            customerName: booking.customerName,
+            reason: reasonClean,
+            cancelledAt: now,
+            createdByAI: true,
+          },
+        });
+      } catch (e) {
+        console.warn('[confirm_cancellation] audit log failed:', e.message);
+      }
+ 
+      return {
+        success: true,
+        bookingCode: booking.bookingCode || `BK_${String(booking._id).slice(-6).toUpperCase()}`,
+        customerName: booking.customerName,
+        roomNumber: booking.roomNumber,
+        cancelledAt: now,
+        cancelledAtFormatted: new Date(now).toLocaleString('vi-VN', {
+          timeZone: 'Asia/Ho_Chi_Minh',
+          day: '2-digit', month: '2-digit', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', hour12: false,
+        }),
+        reason: reasonClean,
+        paidAmount: booking.paidAmount || 0,
+        paidAmountFormatted: fmt(booking.paidAmount || 0),
+        _hint: 'HỦY THÀNH CÔNG. Hiển thị thông báo: phòng đã giải phóng, lý do hủy. Nếu paidAmount > 0 → nhắc "khách đã thanh toán X, cần xử lý hoàn tiền với kế toán".',
+      };
+    } catch (err) {
+      console.error('[confirm_cancellation] error:', err);
+      return { error: 'db_error', message: 'Không hủy được: ' + err.message };
+    }
+  },
+ 
 
   // ════════════════════════════════════════════════════
   // ⭐ KPI + PHÂN TÍCH KINH DOANH (gọi module riêng)

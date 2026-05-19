@@ -38,6 +38,9 @@ const checkUndoPermission = (user) => {
 }
 
 // ⭐ Lấy log checkout gần nhất của 1 booking
+//   Note: KHÔNG filter `undone` — sau khi undo, user thường muốn recheckout với
+//   giờ cũ làm gợi ý. Audit trail (ai làm gì) là việc của AuditLog, không phải
+//   của hàm này.
 const getLastCheckoutLog = async (bookingId, roomNumber = null) => {
   try {
     const filter = {
@@ -824,11 +827,182 @@ const changeDates = async (req, res, next) => {
     const maxChildren = room?.typeId?.maxChildren ?? 0
 
     const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
-    const priceResult = calculatePrice({
-      checkIn: newCheckIn, checkOut: newCheckOut,
-      priceType: booking.priceType, policy, branch,
-      adults: booking.adults, children: booking.children, maxAdults, maxChildren, maxOccupancy,
-    })
+
+    // ⭐ FIX 19/05/2026: Nếu đã có transferHistory, KHÔNG dùng calculatePrice thẳng
+    //   vì sẽ tính toàn bộ thời gian theo policy phòng MỚI → mất segment phòng cũ.
+    //   Dùng computeMoveRoomBreakdown để phân đoạn đúng [oldRoom → transferAt → newRoom].
+    const hasTransfer = Array.isArray(booking.transferHistory) && booking.transferHistory.length > 0
+    let priceResult
+
+    if (hasTransfer) {
+      const transfers = booking.transferHistory
+        .filter(t => t?.transferAt && t?.fromRoomNumber && t?.toRoomNumber)
+        .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+
+      // ⭐ FIX 19/05/2026 v3: Detect multi-transfer.
+      //   computeMoveRoomBreakdown chỉ support 1 transfer. Với ≥ 2 transfer, breakdown
+      //   được build incrementally khi mỗi lần move. Rebuild từ đầu trong changeDates
+      //   sẽ mất segment trung gian → sai tiền.
+      //   → Trả lỗi, yêu cầu user xử lý thủ công (vd: undo các lần move rồi đổi ngày).
+      if (transfers.length >= 2) {
+        return res.status(400).json({
+          success: false,
+          message:
+            `Booking đã chuyển phòng ${transfers.length} lần. ` +
+            `Hệ thống chưa hỗ trợ đổi ngày tự động cho booking có nhiều lần chuyển phòng. ` +
+            `Vui lòng undo các lần chuyển phòng trước khi đổi ngày, hoặc liên hệ admin.`,
+          data: { transferCount: transfers.length },
+        })
+      }
+
+      const lastTransfer = transfers[transfers.length - 1]
+
+      // Resolve oldPolicy
+      let oldPolicy = null
+      if (lastTransfer?.oldPolicyId) {
+        try { oldPolicy = await PricePolicy.findById(lastTransfer.oldPolicyId) } catch {}
+      }
+      if (!oldPolicy && booking.policySnapshot && booking.policySnapshot.dayPrice) {
+        oldPolicy = booking.policySnapshot
+      }
+
+      // Resolve room types
+      let oldRoomType = ''
+      try {
+        const oldRoomDoc = await Room.findOne({
+          number: lastTransfer.fromRoomNumber,
+          branchId: booking.branchId,
+        }).populate('typeId')
+        if (oldRoomDoc) {
+          oldRoomType = oldRoomDoc.typeId?.name || oldRoomDoc.typeName || ''
+        }
+      } catch {}
+      const newRoomType = room?.typeId?.name || booking.roomType || ''
+
+      const hourSlotsOf = (pol) => {
+        if (!pol) return []
+        return (pol.hourSlots || []).map(s => {
+          const time = s.time || s.duration || ''
+          const m = String(time).match(/(\d+)/)
+          return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
+        })
+      }
+
+      const actualCI = booking.actualCheckIn ?? newCheckIn
+      const moveItems = computeMoveRoomBreakdown({
+        actualCheckIn:   actualCI,
+        plannedCheckOut: newCheckOut,
+        transferAt:      new Date(lastTransfer.transferAt),
+        oldRoom: {
+          number: lastTransfer.fromRoomNumber,
+          type:   oldRoomType,
+          policy: {
+            dayPrice:        oldPolicy?.dayPrice || 0,
+            hourSlots:       oldPolicy?.hourSlots || [],
+            dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
+            dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
+            dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
+            dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
+          },
+        },
+        newRoom: {
+          number: lastTransfer.toRoomNumber,
+          type:   newRoomType,
+          policy: {
+            dayPrice:        policy?.dayPrice || 0,
+            hourSlots:       policy?.hourSlots || [],
+            dayCheckInTime:  policy?.dayCheckInTime || '14:00',
+            dayCheckOutTime: policy?.dayCheckOutTime || '12:00',
+            dayEarlyCheckIn: policy?.dayEarlyCheckIn || [],
+            dayLateCheckOut: policy?.dayLateCheckOut || [],
+          },
+        },
+        transferFee: Number(lastTransfer.fee) || 0,
+        changeRate:  oldRoomType !== newRoomType,
+        isFreeRoom:  !!booking.isFreeRoom,
+        branchConfig: branch ? {
+          checkInTime:        branch.checkInTime,
+          checkOutTime:       branch.checkOutTime,
+          earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
+          toleranceMinutes:   branch.toleranceMinutes ?? 15,
+          dayEquivalentHours: branch.dayEquivalentHours ?? 23,
+        } : null,
+      })
+
+      const breakdownItems = moveItems.map(it => ({
+        label:  it.label,
+        amount: it.amount,
+        type:   it.type === 'surcharge' ? 'surcharge' : 'base',
+        meta:   it.meta || {},
+      }))
+
+      // Bổ sung phụ thu vượt sức chứa theo policy phòng mới từ transferAt → newCheckOut
+      try {
+        const surchargeResult = calculatePrice({
+          checkIn:   new Date(lastTransfer.transferAt),
+          checkOut:  newCheckOut,
+          priceType: booking.priceType,
+          policy, branch,
+          adults:    booking.adults,
+          children:  booking.children,
+          maxAdults, maxChildren, maxOccupancy,
+        })
+        if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
+          const surchargeOnly = surchargeResult.breakdown.filter(b => {
+            if (b.type !== 'surcharge') return false
+            const lbl = String(b.label || '')
+            // Bỏ "Nhận phòng sớm" (không áp dụng cho giai đoạn sau transfer) + "Trả phòng muộn"
+            return !lbl.includes('Nhận phòng sớm')
+                && !lbl.includes('early_checkin')
+                && !lbl.includes('Trả phòng muộn')
+                && !lbl.includes('late_checkout')
+          })
+          for (const sur of surchargeOnly) {
+            breakdownItems.push({
+              label:  `[${lastTransfer.toRoomNumber}] ${sur.label}`,
+              amount: sur.amount,
+              type:   'surcharge',
+              meta:   { ...(sur.meta || {}), roomNumber: lastTransfer.toRoomNumber },
+            })
+          }
+        }
+      } catch (surErr) {
+        console.warn('[changeDates] surcharge calc failed:', surErr.message)
+      }
+
+      // roomAmount KHÔNG bao gồm fee chuyển phòng (fee được track riêng trong booking.transferFee)
+      const newRoomAmount = breakdownItems
+        .filter(b => !(b.meta && b.meta.transferFee))
+        .reduce((s, b) => s + (b.amount || 0), 0)
+
+      // ⭐ FIX 19/05/2026 v3: Tính lại nights theo actualCheckIn / newCheckOut.
+      //   Trước đây giữ booking.nights → khi đổi ngày trả, nights không update.
+      //   Dùng dayStart-based diff: nights = ceil(ngày trả - ngày nhận thực tế).
+      const actualCIForNights = booking.actualCheckIn ?? newCheckIn
+      const dayStartOf = (d) => {
+        const x = new Date(d)
+        x.setHours(0, 0, 0, 0)
+        return x
+      }
+      const newNights = Math.max(1, Math.round(
+        (dayStartOf(newCheckOut) - dayStartOf(actualCIForNights)) / 86400000
+      ))
+
+      priceResult = {
+        roomAmount:        newRoomAmount,
+        nights:            newNights,
+        breakdown:         breakdownItems,
+        finalPriceType:    booking.priceType,
+        converted:         false,
+        notice:            null,
+      }
+    } else {
+      priceResult = calculatePrice({
+        checkIn: newCheckIn, checkOut: newCheckOut,
+        priceType: booking.priceType, policy, branch,
+        adults: booking.adults, children: booking.children, maxAdults, maxChildren, maxOccupancy,
+      })
+    }
 
     if (priceResult.error) {
       return res.status(400).json({
@@ -857,7 +1031,23 @@ const changeDates = async (req, res, next) => {
     booking.nights      = priceResult.nights
     booking.priceType   = priceResult.finalPriceType
     booking.roomAmount  = priceResult.roomAmount
-    booking.totalAmount = priceResult.roomAmount + (booking.servicesAmount ?? 0) - (booking.discount ?? 0)
+    // ⭐ FIX 19/05/2026: Lưu priceBreakdown mới vào DB (trước đây chỉ trả response).
+    //   Nếu không lưu, mode='checkout' của calculateBill sẽ đọc DB stale.
+    if (Array.isArray(priceResult.breakdown)) {
+      booking.priceBreakdown = priceResult.breakdown.map(b => ({
+        label:  b.label,
+        amount: b.amount,
+        type:   b.type,
+        meta:   b.meta || {},
+      }))
+    }
+    // ⭐ FIX 19/05/2026: Include transferFee trong totalAmount (trước đây bỏ sót).
+    booking.totalAmount = Math.max(0,
+      priceResult.roomAmount
+        + (booking.servicesAmount ?? 0)
+        - (booking.discount ?? 0)
+        + (booking.transferFee ?? 0)
+    )
 
     let updatedActualCheckIn = false
     if (booking.status === 'checked_in') {
@@ -1200,6 +1390,7 @@ const moveRoom = async (req, res, next) => {
       sourcePolicySnapshot, sourcePolicyId,
       sourcePriceType, sourceAdults, sourceChildren,
       currentRoomAmount, currentNights,
+      sourcePriceBreakdown,   // ⭐ NEW: priceBreakdown gốc của phòng cũ — để preserve surcharge "Nhận phòng sớm"
     }) => {
       const newPolicy = await PricePolicy.findById(newPolicyId)
       if (!newPolicy) throw new Error('Không tìm thấy chính sách giá mới')
@@ -1236,6 +1427,9 @@ const moveRoom = async (req, res, next) => {
         })
       }
 
+      // ⭐ Load branch config để truyền vào moveRoomBreakdown
+      const branch = booking.branchId ? await Branch.findById(booking.branchId) : null
+
       const breakdownInput = {
         actualCheckIn:   new Date(sourceActualCheckIn || sourceCheckIn),
         plannedCheckOut: new Date(sourceCheckOut),
@@ -1244,21 +1438,36 @@ const moveRoom = async (req, res, next) => {
           number: oldRoomNumber,
           type:   oldRoomType,
           policy: {
-            dayPrice:  oldPolicy?.dayPrice || 0,
-            hourSlots: hourSlotsOf(oldPolicy),
+            dayPrice:        oldPolicy?.dayPrice || 0,
+            hourSlots:       oldPolicy?.hourSlots || [],
+            dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
+            dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
+            dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
+            dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
           },
         },
         newRoom: {
           number: newRoom.number,
           type:   newRoomType,
           policy: {
-            dayPrice:  newPolicy.dayPrice || 0,
-            hourSlots: hourSlotsOf(newPolicy),
+            dayPrice:        newPolicy?.dayPrice || 0,
+            hourSlots:       newPolicy?.hourSlots || [],
+            dayCheckInTime:  newPolicy?.dayCheckInTime || '14:00',
+            dayCheckOutTime: newPolicy?.dayCheckOutTime || '12:00',
+            dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn || [],
+            dayLateCheckOut: newPolicy?.dayLateCheckOut || [],
           },
         },
         transferFee: 0,    // fee được handle riêng ở booking.transferFee
         changeRate:  oldRoomType !== newRoomType,  // chỉ đổi rate khi khác loại
         isFreeRoom:  !!booking.isFreeRoom,
+        branchConfig: branch ? {
+          checkInTime:        branch.checkInTime,
+          checkOutTime:       branch.checkOutTime,
+          earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
+          toleranceMinutes:   branch.toleranceMinutes ?? 15,
+          dayEquivalentHours: branch.dayEquivalentHours ?? 23,
+        } : null,
       }
 
       let items = []
@@ -1287,11 +1496,53 @@ const moveRoom = async (req, res, next) => {
           meta: it.meta || {},
         }))
 
-      const totalAmount = breakdownItems.reduce((s, b) => s + (b.amount || 0), 0)
+      // ⭐ FIX 18/05/2026 (v20.1) — PRESERVE surcharge "Nhận phòng sớm" của phòng cũ
+      //   moveRoomBreakdown CHỈ tính tiền phòng base, không có surcharge.
+      //   Nhưng "Nhận phòng sớm" của phòng CŨ (201) là sự kiện đã xảy ra lúc CI thật
+      //   → PHẢI giữ lại trong priceBreakdown sau move, nếu không sẽ MẤT 100K phụ thu.
+      //
+      //   Lấy từ sourcePriceBreakdown (caller truyền vào): booking.priceBreakdown (single)
+      //   hoặc subRoom.priceBreakdown (group). Filter type='surcharge' + label early CI.
+      const sourceBreakdown = Array.isArray(sourcePriceBreakdown) ? sourcePriceBreakdown : []
+      const preservedEarlyCI = sourceBreakdown
+        .filter(b => {
+          if (b?.type !== 'surcharge') return false
+          const lbl = String(b?.label || '')
+          return lbl.includes('Nhận phòng sớm') || lbl.includes('early_checkin')
+        })
+        .map(b => {
+          const plain = (b && typeof b.toObject === 'function') ? b.toObject() : b
+          const lblRaw = String(plain.label || '')
+          const hasPrefix = /^\[[^\]]+\]\s/.test(lblRaw)
+          return {
+            label: hasPrefix ? lblRaw : `[${oldRoomNumber}] ${lblRaw}`,
+            amount: plain.amount || 0,
+            type: 'surcharge',
+            meta: { ...(plain.meta || {}), roomNumber: oldRoomNumber, preserved: true },
+          }
+        })
+
+      // Đặt early-CI surcharge ngay sau item base đầu tiên của phòng cũ (vị trí tự nhiên)
+      const finalBreakdown = [...breakdownItems]
+      if (preservedEarlyCI.length > 0) {
+        let insertAt = -1
+        for (let i = finalBreakdown.length - 1; i >= 0; i--) {
+          const it = finalBreakdown[i]
+          const itRoomNum = it?.meta?.roomNumber
+          if (it?.type === 'base' && String(itRoomNum) === String(oldRoomNumber)) {
+            insertAt = i + 1
+            break
+          }
+        }
+        if (insertAt < 0) insertAt = finalBreakdown.length
+        finalBreakdown.splice(insertAt, 0, ...preservedEarlyCI)
+      }
+
+      const totalAmount = finalBreakdown.reduce((s, b) => s + (b.amount || 0), 0)
 
       return {
         roomAmount:     totalAmount,
-        priceBreakdown: breakdownItems,
+        priceBreakdown: finalBreakdown,
         usedSplit:      splitAt,
         newPolicy,
         newMaxAdults,
@@ -1338,6 +1589,7 @@ const moveRoom = async (req, res, next) => {
           sourceChildren:       subRoom.children  ?? booking.children,
           currentRoomAmount:    subRoom.roomAmount ?? 0,
           currentNights:        subRoom.nights ?? booking.nights,
+          sourcePriceBreakdown: subRoom.priceBreakdown ?? [],  // ⭐ FIX v20.1: preserve "Nhận phòng sớm"
         })
         newSubRoomAmount     = recalc.roomAmount
         newSubPriceBreakdown = recalc.priceBreakdown
@@ -1472,6 +1724,7 @@ const moveRoom = async (req, res, next) => {
         sourceChildren:       booking.children,
         currentRoomAmount:    booking.roomAmount,
         currentNights:        booking.nights,
+        sourcePriceBreakdown: booking.priceBreakdown ?? [],  // ⭐ FIX v20.1: preserve "Nhận phòng sớm"
       })
       newRoomAmount     = recalc.roomAmount
       newPriceBreakdown = recalc.priceBreakdown
@@ -2158,21 +2411,49 @@ const checkout = async (req, res, next) => {
 
           const moveItems = computeMoveRoomBreakdown({
             actualCheckIn:   booking.actualCheckIn ?? booking.checkIn,
-            plannedCheckOut: actualCO,
+            // ⭐ FIX 19/05/2026 v2: plannedCheckOut = min(booking.checkOut, actualCO)
+            //   - actualCO > booking.checkOut (overstay): dùng booking.checkOut, phần trễ
+            //     được calculatePrice push "Trả phòng muộn" surcharge phía dưới.
+            //   - actualCO < booking.checkOut (trả sớm / past-checkout): dùng actualCO,
+            //     module tính đến đúng giờ trả sớm, KHÔNG tính dư.
+            plannedCheckOut: actualCO < new Date(booking.checkOut)
+              ? actualCO
+              : new Date(booking.checkOut),
             transferAt:      new Date(lastTransfer.transferAt),
             oldRoom: {
               number: lastTransfer.fromRoomNumber,
               type:   oldRoomType,
-              policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+              policy: {
+                dayPrice:        oldPolicy?.dayPrice || 0,
+                hourSlots:       oldPolicy?.hourSlots || [],
+                dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
+                dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
+                dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
+                dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
+              },
             },
             newRoom: {
               number: lastTransfer.toRoomNumber,
               type:   newRoomType,
-              policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
+              policy: {
+                dayPrice:        policy?.dayPrice || 0,
+                hourSlots:       policy?.hourSlots || [],
+                dayCheckInTime:  policy?.dayCheckInTime || '14:00',
+                dayCheckOutTime: policy?.dayCheckOutTime || '12:00',
+                dayEarlyCheckIn: policy?.dayEarlyCheckIn || [],
+                dayLateCheckOut: policy?.dayLateCheckOut || [],
+              },
             },
             transferFee: Number(lastTransfer.fee) || 0,
             changeRate:  oldRoomType !== newRoomType,
             isFreeRoom:  !!booking.isFreeRoom,
+            branchConfig: branch ? {
+              checkInTime:        branch.checkInTime,
+              checkOutTime:       branch.checkOutTime,
+              earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
+              toleranceMinutes:   branch.toleranceMinutes ?? 15,
+              dayEquivalentHours: branch.dayEquivalentHours ?? 23,
+            } : null,
           })
 
           const breakdownItems = moveItems.map(it => ({
@@ -3030,8 +3311,15 @@ const applyDiscount = async (req, res, next) => {
     booking.isFreeRoom      = free
     booking.discount        = totalDiscount
 
-    booking.totalAmount = roomPart + (booking.servicesAmount ?? 0) - totalDiscount
-    if (booking.totalAmount < 0) booking.totalAmount = 0
+    // ⭐ FIX 19/05/2026 v3: Cộng transferFee vào totalAmount (trước đây bỏ sót).
+    //   Fallback từ transferHistory nếu booking.transferFee chưa sync.
+    const historyFee = Array.isArray(booking.transferHistory)
+      ? booking.transferHistory.reduce((s, t) => s + (Number(t?.fee) || 0), 0)
+      : 0
+    const transferFee = Math.max(booking.transferFee ?? 0, historyFee)
+    booking.totalAmount = Math.max(0,
+      roomPart + (booking.servicesAmount ?? 0) - totalDiscount + transferFee
+    )
 
     await booking.save()
 
@@ -3431,18 +3719,69 @@ const calculateBill = async (req, res, next) => {
           notice:           null,
         }
       }
-    } else if (hasTransferred && mode === 'checkout') {
-      priceResult = {
-        roomAmount:       booking.roomAmount,
-        nights:           booking.nights,
-        breakdown:        booking.priceBreakdown ?? [],
-        finalPriceType:   booking.priceType,
-        converted:        false,
-        notice:           null,
-      }
-    } else if (hasTransferred && mode === 'now') {
-      // ⭐ v20.0: Dùng moveRoomBreakdown để tính breakdown đúng spec
-      //   Replay lần transfer cuối với plannedCheckOut = effectiveCheckOut (giờ hiện tại)
+    } else if (hasTransferred) {
+      // ⭐ FIX 19/05/2026: Gộp 2 mode 'now' và 'checkout' vào chung logic v20.1.
+      //   Khác biệt duy nhất: effectiveCheckOut.
+      //     - mode='now'      → now()           → có overstay → push "Trả phòng muộn"
+      //     - mode='checkout' → booking.checkOut → không overstay → không push
+      //   Nhánh cũ mode='checkout' đọc thẳng booking.priceBreakdown/roomAmount — sai
+      //   khi DB stale (vd: sau changeDates với booking đã transfer thì DB lưu giá
+      //   theo policy phòng MỚI × toàn bộ thời gian, không phân đoạn cũ/mới).
+      //   v20.0: Dùng moveRoomBreakdown để tính breakdown đúng spec
+      //   Replay lần transfer cuối với plannedCheckOut = booking.checkOut (giờ trả CHUẨN)
+
+      // ⭐ FIX 19/05/2026 v3: Multi-transfer fallback.
+      //   computeMoveRoomBreakdown chỉ build cho 1 transfer. Với ≥ 2 transfer,
+      //   booking.priceBreakdown được build incrementally trong moveRoom handler
+      //   (mỗi lần move thêm seg mới). Recompute từ đầu sẽ mất segment trung gian.
+      //   → Ưu tiên đọc từ DB, không recompute.
+      const transferCount = (booking.transferHistory ?? []).length
+      if (transferCount >= 2) {
+        priceResult = {
+          roomAmount:       booking.roomAmount,
+          nights:           booking.nights,
+          breakdown:        booking.priceBreakdown ?? [],
+          finalPriceType:   booking.priceType,
+          converted:        false,
+          notice:           `Booking đã chuyển phòng ${transferCount} lần — breakdown đọc từ DB`,
+        }
+        // Thêm late checkout surcharge nếu effectiveCheckOut > booking.checkOut
+        if (mode === 'now' && effectiveCheckOut > new Date(booking.checkOut)) {
+          try {
+            const lateMs = effectiveCheckOut.getTime() - new Date(booking.checkOut).getTime()
+            const lateH = Math.floor(lateMs / 3600000)
+            const lateM = Math.round((lateMs % 3600000) / 60000)
+            const lateLabel = lateH >= 24
+              ? `Trả phòng muộn (${Math.floor(lateH / 24)}d ${lateH % 24}h)`
+              : `Trả phòng muộn (${lateH}h${lateM > 0 ? lateM + 'm' : ''})`
+            // Tính phí trễ = calculatePrice từ booking.checkOut → now
+            const lateResult = calculatePrice({
+              checkIn:   new Date(booking.checkOut),
+              checkOut:  effectiveCheckOut,
+              priceType: booking.priceType,
+              policy, branch,
+              adults:    booking.adults,
+              children:  booking.children,
+              maxAdults, maxChildren, maxOccupancy,
+            })
+            const lateAmount = lateResult?.roomAmount || 0
+            if (lateAmount > 0) {
+              priceResult.breakdown = [
+                ...priceResult.breakdown,
+                {
+                  label:  `[${booking.roomNumber}] ${lateLabel}`,
+                  amount: lateAmount,
+                  type:   'surcharge',
+                  meta:   { roomNumber: booking.roomNumber, lateCheckout: true },
+                },
+              ]
+              priceResult.roomAmount += lateAmount
+            }
+          } catch (e) {
+            console.warn('[calculateBill multi-transfer] late checkout calc failed:', e.message)
+          }
+        }
+      } else {
       try {
         const oldRoomNum = lastTransfer.fromRoomNumber
         const newRoomNum = lastTransfer.toRoomNumber
@@ -3483,22 +3822,38 @@ const calculateBill = async (req, res, next) => {
 
         const items = computeMoveRoomBreakdown({
           actualCheckIn:   effectiveCheckIn,
-          plannedCheckOut: effectiveCheckOut,   // ⭐ Khác mode 'checkout': dùng now
+          // ⭐ FIX 19/05/2026 v2: plannedCheckOut = min(booking.checkOut, effectiveCheckOut)
+          //   - effectiveCheckOut > booking.checkOut (overstay): dùng booking.checkOut,
+          //     phần trễ được block baseline-vs-overstay (3609–3656) push "Trả phòng muộn"
+          //   - effectiveCheckOut < booking.checkOut (trả sớm / past-checkout): dùng
+          //     effectiveCheckOut, module tính đến đúng giờ trả sớm, KHÔNG tính dư.
+          //   Phiên bản cũ luôn dùng booking.checkOut → tính dư khi past-checkout < planned CO.
+          plannedCheckOut: effectiveCheckOut < new Date(booking.checkOut)
+            ? effectiveCheckOut
+            : new Date(booking.checkOut),
           transferAt:      new Date(lastTransfer.transferAt),
           oldRoom: {
             number: oldRoomNum,
             type:   oldRoomType,
             policy: {
-              dayPrice:  oldPolicy?.dayPrice || 0,
-              hourSlots: hourSlotsOf(oldPolicy),
+              dayPrice:        oldPolicy?.dayPrice || 0,
+              hourSlots:       oldPolicy?.hourSlots || [],
+              dayCheckInTime:  oldPolicy?.dayCheckInTime || '14:00',
+              dayCheckOutTime: oldPolicy?.dayCheckOutTime || '12:00',
+              dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn || [],
+              dayLateCheckOut: oldPolicy?.dayLateCheckOut || [],
             },
           },
           newRoom: {
             number: newRoomNum,
             type:   newRoomType,
             policy: {
-              dayPrice:  newPolicy?.dayPrice || 0,
-              hourSlots: hourSlotsOf(newPolicy),
+              dayPrice:        newPolicy?.dayPrice || 0,
+              hourSlots:       newPolicy?.hourSlots || [],
+              dayCheckInTime:  newPolicy?.dayCheckInTime || '14:00',
+              dayCheckOutTime: newPolicy?.dayCheckOutTime || '12:00',
+              dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn || [],
+              dayLateCheckOut: newPolicy?.dayLateCheckOut || [],
             },
           },
           // ⭐ FIX: Truyền fee từ transferHistory để module sinh dòng phụ thu
@@ -3506,6 +3861,13 @@ const calculateBill = async (req, res, next) => {
           transferFee: Number(lastTransfer.fee) || 0,
           changeRate:  oldRoomType !== newRoomType,
           isFreeRoom:  !!booking.isFreeRoom,
+          branchConfig: branch ? {
+            checkInTime:        branch.checkInTime,
+            checkOutTime:       branch.checkOutTime,
+            earlyCheckinUntil:  branch.earlyCheckinUntil ?? 5,
+            toleranceMinutes:   branch.toleranceMinutes ?? 15,
+            dayEquivalentHours: branch.dayEquivalentHours ?? 23,
+          } : null,
         })
 
         // ⭐ FIX: KHÔNG filter fee item nữa — để nó hiển thị trong breakdown
@@ -3517,20 +3879,51 @@ const calculateBill = async (req, res, next) => {
           meta: it.meta || {},
         }))
 
-        // ⭐ FIX 18/05/2026: Bổ sung phụ thu (extra people, late checkout, early checkin)
-        //   moveRoomBreakdown CHỈ trả tiền phòng. Phụ thu phải tính riêng để khớp checkout flow.
-        //   Gọi calculatePrice với phòng MỚI (policy hiện tại) để lấy surcharge items,
-        //   sau đó thêm prefix [roomNumber] và đẩy vào cuối breakdown.
+        // ⭐ FIX 18/05/2026 (v20.1) — Bổ sung phụ thu
+        //   moveRoomBreakdown CHỈ trả tiền phòng. Cần thêm:
+        //   1. "Nhận phòng sớm" của phòng CŨ → đọc từ booking.priceBreakdown (đã preserve ở moveRoom)
+        //   2. "Trả phòng muộn" của phòng MỚI → tính từ giờ chuẩn CO → effectiveCheckOut
+        //   3. Phụ thu vượt sức chứa → tính từ phòng MỚI
+        //
+        //   KHÔNG gọi calculatePrice với checkIn=transferAt vì sẽ sinh "Nhận phòng sớm" SAI
         try {
+          // ⭐ FIX 19/05/2026 v21: Bỏ block (1) "PRESERVE Nhận phòng sớm" từ DB.
+          //   Module moveRoomBreakdown v21 đã tự tính phụ thu "Nhận phòng sớm" của phòng cũ
+          //   dựa trên policy.dayEarlyCheckIn (computeTimeSurcharge) khi actualCheckIn < CI chuẩn
+          //   cùng ngày. → KHÔNG cần preserve từ DB nữa (sẽ double count).
+          //   Lưu ý: bookings cũ có dòng "Nhận phòng sớm" trong DB sẽ bị "thay thế" bằng
+          //   recompute từ policy hiện tại → đảm bảo nhất quán.
+
+          // ── (2) Tính phụ thu CO trễ cho phòng MỚI ──
+          //   Approach: Gọi calculatePrice 2 lần:
+          //     - Lần 1: với plannedCheckOut (giờ chuẩn) → roomAmount baseline
+          //     - Lần 2: với effectiveCheckOut (giờ hiện tại) → roomAmount overstay
+          //   Diff = phụ thu CO trễ. Bằng cách này bắt được cả "convert to night" case
+          //   (priceCalculator add 1 base night thay vì surcharge khi co.getHours() >= dayEquivHours).
           const newRoomDoc = await Room.findById(booking.roomId).populate('typeId')
-          const newMaxAdults   = newRoomDoc?.typeId?.maxAdults   ?? newRoomDoc?.typeId?.capacity ?? 2
-          const newMaxChildren = newRoomDoc?.typeId?.maxChildren ?? 0
+          const newMaxAdults    = newRoomDoc?.typeId?.maxAdults   ?? newRoomDoc?.typeId?.capacity ?? 2
+          const newMaxChildren  = newRoomDoc?.typeId?.maxChildren ?? 0
           const newMaxOccupancy = newRoomDoc?.typeId?.maxOccupancy ?? (newMaxAdults + newMaxChildren)
-          // Tính phụ thu theo phòng MỚI từ transferAt → effectiveCheckOut
+
           const transferAtDate = new Date(lastTransfer.transferAt)
-          const surchargeResult = calculatePrice({
-            checkIn:   transferAtDate,
-            checkOut:  effectiveCheckOut,
+          const ciHourStr = branch?.checkInTime || '14:00'
+          const [ciH, ciM] = String(ciHourStr).split(':').map(Number)
+          const standardCIofTransferDay = new Date(transferAtDate)
+          standardCIofTransferDay.setHours(ciH || 14, ciM || 0, 0, 0)
+          const surchargeCheckIn = transferAtDate > standardCIofTransferDay
+            ? transferAtDate
+            : standardCIofTransferDay
+
+          // Baseline: với plannedCheckOut (không trễ).
+          //   ⭐ FIX 19/05/2026 v2: dùng min(booking.checkOut, effectiveCheckOut) để
+          //   khi past-checkout (effectiveCheckOut < booking.checkOut), baseline không
+          //   tính dư đêm ở phụ thu vượt sức chứa (NL/TE).
+          const baselineCheckOut = effectiveCheckOut < new Date(booking.checkOut)
+            ? effectiveCheckOut
+            : new Date(booking.checkOut)
+          const baselineResult = calculatePrice({
+            checkIn:   surchargeCheckIn,
+            checkOut:  baselineCheckOut,
             priceType: booking.priceType,
             policy:    newPolicy,
             branch,
@@ -3541,10 +3934,60 @@ const calculateBill = async (req, res, next) => {
             maxOccupancy: newMaxOccupancy,
           })
 
-          if (!surchargeResult.error && Array.isArray(surchargeResult.breakdown)) {
-            // Chỉ lấy item type='surcharge' (phụ thu NL, early/late check)
-            const surchargeOnly = surchargeResult.breakdown.filter(b => b.type === 'surcharge')
-            for (const sur of surchargeOnly) {
+          const baselineAmount = baselineResult?.roomAmount || 0
+
+          // Overstay: với effectiveCheckOut (= now)
+          const overstayResult = calculatePrice({
+            checkIn:   surchargeCheckIn,
+            checkOut:  effectiveCheckOut,           // ⭐ now
+            priceType: booking.priceType,
+            policy:    newPolicy,
+            branch,
+            adults:    booking.adults,
+            children:  booking.children,
+            maxAdults: newMaxAdults,
+            maxChildren: newMaxChildren,
+            maxOccupancy: newMaxOccupancy,
+          })
+
+          const overstayAmount = overstayResult?.roomAmount || 0
+          const overstayDiff = Math.max(0, overstayAmount - baselineAmount)
+
+          // ── Thêm dòng "Trả phòng muộn" nếu có chênh lệch ──
+          if (overstayDiff > 0 && effectiveCheckOut > new Date(booking.checkOut)) {
+            const lateMs = effectiveCheckOut.getTime() - new Date(booking.checkOut).getTime()
+            const lateH = Math.floor(lateMs / 3600000)
+            const lateM = Math.round((lateMs % 3600000) / 60000)
+            const lateLabel = lateH >= 24
+              ? `Trả phòng muộn (${Math.floor(lateH / 24)}d ${lateH % 24}h)`
+              : `Trả phòng muộn (${lateH}h${lateM > 0 ? lateM + 'm' : ''})`
+            breakdownItems.push({
+              label: `[${newRoomNum}] ${lateLabel}`,
+              amount: overstayDiff,
+              type:   'surcharge',
+              meta:   { roomNumber: newRoomNum, lateCheckout: true },
+            })
+          }
+
+          // ⭐ FIX 19/05/2026 v21: Bỏ block (2.5) cũ.
+          //   Module moveRoomBreakdown v21 đã tự tính phụ thu "Trả phòng trễ"
+          //   của phòng mới dựa trên policy.dayLateCheckOut khi plannedCheckOut
+          //   vượt CO chuẩn cùng ngày → KHÔNG cần BE patch nữa.
+
+          // ── (3) Phụ thu vượt sức chứa (NL/TE) — đọc từ baseline ──
+          //   Baseline đã chứa các phụ thu này vì policy có dayAdultSurcharge.
+          //   Lấy từ baseline (không từ overstay) để khớp với plannedCheckOut.
+          if (baselineResult && Array.isArray(baselineResult.breakdown)) {
+            const capacitySurcharges = baselineResult.breakdown.filter(b => {
+              if (b.type !== 'surcharge') return false
+              const lbl = String(b.label || '')
+              // Bỏ "Nhận phòng sớm" (đã preserve ở (1)) + "Trả phòng muộn" (đã thêm ở (2))
+              return !lbl.includes('Nhận phòng sớm')
+                  && !lbl.includes('early_checkin')
+                  && !lbl.includes('Trả phòng muộn')
+                  && !lbl.includes('late_checkout')
+            })
+            for (const sur of capacitySurcharges) {
               breakdownItems.push({
                 label: `[${newRoomNum}] ${sur.label}`,
                 amount: sur.amount,
@@ -3554,7 +3997,7 @@ const calculateBill = async (req, res, next) => {
             }
           }
         } catch (surErr) {
-          console.warn('[calculateBill v20] surcharge calc failed:', surErr.message)
+          console.warn('[calculateBill v20.1] surcharge calc failed:', surErr.message)
         }
 
         priceResult = {
@@ -3580,6 +4023,7 @@ const calculateBill = async (req, res, next) => {
           notice:           null,
         }
       }
+      }  // ⭐ end of else { (multi-transfer fallback)
     } else {
       priceResult = calculatePrice({
         checkIn:   effectiveCheckIn,
@@ -3626,7 +4070,14 @@ const calculateBill = async (req, res, next) => {
     }
 
     const roomPart    = booking.isFreeRoom ? 0 : priceResult.roomAmount
-    const transferFee = booking.transferFee ?? 0
+    // ⭐ FIX 19/05/2026 v2: Fallback transferFee từ transferHistory khi booking.transferFee
+    //   chưa được sync (booking cũ tạo trước khi có logic cộng dồn vào field này).
+    //   Sum tất cả fee trong transferHistory, dùng booking.transferFee nếu nó lớn hơn
+    //   (trường hợp đã sync đúng) hoặc giá trị transferHistory (nếu booking.transferFee=0).
+    const historyFee = Array.isArray(booking.transferHistory)
+      ? booking.transferHistory.reduce((s, t) => s + (Number(t?.fee) || 0), 0)
+      : 0
+    const transferFee = Math.max(booking.transferFee ?? 0, historyFee)
     const totalAmount = Math.max(0, roomPart + servicesAmount - recalcDiscount + transferFee)
 
     const invoice = await Invoice.findOne({ bookingId: booking._id })
