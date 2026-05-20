@@ -59,7 +59,7 @@ function pickSlot(slots, hoursNeeded) {
   if (!Array.isArray(slots) || slots.length === 0) return null;
   const normalized = slots
     .map(s => {
-      const raw = s.time ?? s.duration ?? '';
+      const raw = s.time ?? s.duration ?? s.durationHours ?? '';
       const m = String(raw).match(/(\d+)/);
       return { hours: m ? parseInt(m[1], 10) : 0, price: Number(s.price) || 0 };
     })
@@ -76,6 +76,70 @@ function pickSlot(slots, hoursNeeded) {
     else break;
   }
   return best;
+}
+
+/**
+ * ⭐ NEW 20/05: Tính giá GIỜ phòng mới — COPY logic từ priceCalculator.js để nhất quán.
+ *
+ *   Cấu trúc hourSlots thực tế = bảng giá LŨY TIẾN theo mốc giờ:
+ *     { time: '02:00', price: 250000 }  → ở 2h = 250k
+ *     { time: '03:00', price: 270000 }  → ở 3h = 270k
+ *     ...
+ *   (time có thể là "HH:mm" hoặc số "2" hoặc field durationHours)
+ *
+ *   Quy trình:
+ *     1. roundHoursWithTolerance: làm tròn số giờ với tolerance
+ *        Vd tolerance=10: 2h58m → remainder 58 > 10 → 3h. 2h08m → remainder 8 ≤ 10 → 2h.
+ *     2. pickSlotHourly: lấy mốc giờ LỚN NHẤT ≤ số giờ đã làm tròn.
+ *        < mốc nhỏ nhất → áp mốc nhỏ nhất (minimum charge).
+ *        > mốc lớn nhất → cap ở mốc lớn nhất.
+ */
+const getSlotHoursVal = (s) => {
+  const v = s?.time ?? s?.hours ?? s?.duration ?? s?.durationHours ?? s?.h ?? null;
+  if (v === null || v === undefined) return null;
+  const str = String(v).trim();
+  if (str.includes(':')) {
+    const [h] = str.split(':').map(Number);
+    return Number.isFinite(h) ? h : null;
+  }
+  const n = parseInt(str, 10);
+  return Number.isFinite(n) ? n : null;
+};
+
+const roundHoursWithTolerance = (totalMinutes, toleranceMin = 0) => {
+  const fullHours = Math.floor(totalMinutes / 60);
+  const remainder = totalMinutes - fullHours * 60;
+  if (remainder <= toleranceMin) return fullHours;
+  return fullHours + 1;
+};
+
+/**
+ * pickSlotHourly: chọn mốc giá giờ theo số giờ (đã làm tròn).
+ *   - hours < mốc nhỏ nhất → mốc nhỏ nhất (minimum charge)
+ *   - bình thường → mốc LỚN NHẤT ≤ hours
+ *   - hours vượt mốc lớn nhất → cap mốc lớn nhất
+ */
+function pickSlotHourly(slots, hours) {
+  if (!Array.isArray(slots) || slots.length === 0) return null;
+  const valid = slots
+    .map(s => {
+      const h = getSlotHoursVal(s);
+      const p = Number(s?.price ?? s?.amount ?? s?.value ?? 0) || 0;
+      if (h === null || h <= 0) return null;
+      return { hours: h, price: p };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.hours - b.hours);
+
+  if (valid.length === 0) return null;
+
+  // hours < mốc nhỏ nhất → minimum charge
+  if (hours < valid[0].hours) {
+    return { ...valid[0], isMinimum: true };
+  }
+  // mốc lớn nhất ≤ hours (nếu vượt mốc lớn nhất → cap mốc lớn nhất)
+  const eligible = valid.filter(s => s.hours <= hours);
+  return eligible.length > 0 ? eligible[eligible.length - 1] : valid[valid.length - 1];
 }
 
 function fmtDuration(minutes) {
@@ -239,11 +303,18 @@ function computeMoveRoomBreakdown(input) {
 
   // ⭐ MUTATE: Tab "Đến hiện tại" — khách vừa chuyển phòng ≤ tolerance phút trước
   //   → Coi như CHƯA chuyển, chỉ tính phòng CŨ từ CI → effectiveCheckOut.
-  //   Vd: CI 15/05 14:00, transfer 19/05 16:00, now=19/05 16:05 → tính phòng cũ tới 16:05.
-  //   Cách làm: ép newRoom = oldRoom + transferAt = co + transferFee = 0 → logic phía dưới
-  //   sẽ tính như chưa chuyển.
+  //   Vd: CI 15/05 14:00, transfer 15/05 14:05, now=15/05 14:10 → tính phòng cũ.
+  //   ⭐ FIX 20/05/2026: CHỈ áp dụng khi CHƯA QUA ĐÊM nào ở phòng cũ.
+  //     Nếu khách đã ở nhiều đêm rồi mới chuyển (vd ở 201 từ 18/05, chuyển 204 ngày 20/05),
+  //     thì việc "vừa chuyển xem ngay" KHÔNG được coi như chưa chuyển — phí + phòng mới
+  //     vẫn phải hiện. Logic này chỉ dành cho case vừa CI vừa chuyển (booking ngắn).
   const sinceTransfer = (co - tAt) / 60000;
-  if (sinceTransfer >= 0 && sinceTransfer <= tolerance && tAt > ci) {
+  //   "Chưa qua đêm" = transferAt còn trong đêm 1 (trước CO_chuẩn của ngày sau CI).
+  const coTimeForCheck = parseTimeStr(branchConfig?.checkOutTime ?? '12:00', DEFAULT_CONFIG.CO_HOUR);
+  const firstNightEnd = new Date(setHM(ci, coTimeForCheck.h, coTimeForCheck.m).getTime() + 86400000);
+  const transferStillInFirstNight = tAt < firstNightEnd;
+
+  if (sinceTransfer >= 0 && sinceTransfer <= tolerance && tAt > ci && transferStillInFirstNight) {
     newRoom = oldRoom;
     tAt = co;  // = plannedCheckOut → findTransferNightIndex sẽ trả index cuối
     transferFee = 0;
@@ -402,30 +473,7 @@ function computeMoveRoomBreakdown(input) {
   // Gộp 2 trường hợp: rạng sáng HOẶC trong tolerance → đè đêm 1
   const shouldOverrideFirstNight = (isEarlyMorning || isWithinTolerance) && transferNightIdx === 0;
 
-  // ─── Phòng cũ: các đêm TRƯỚC đêm chuyển ───
-  //   (Nếu đêm chuyển = đêm 1 + earlyMorning → không có đêm phòng cũ thật)
-  if (transferNightIdx > 0) {
-    const oldNights = nights.slice(0, transferNightIdx);
-    const total = oldNights.length;
-    const firstNight = oldNights[0];
-    const lastNight = oldNights[total - 1];
-    items.push({
-      label: `[${oldRoom.number}] Giá ngày (${fmtDT(firstNight.startAt)} → ${fmtDT(lastNight.endAt)})`,
-      amount: (oldRoom.policy.dayPrice || 0) * total,
-      type: 'base',
-      meta: {
-        roomNumber: oldRoom.number,
-        nights: total,
-        policy: 'old',
-        segment: 'oldNights',
-        rangeStart: firstNight.startAt.toISOString(),
-        rangeEnd: lastNight.endAt.toISOString(),
-        dayPrice: oldRoom.policy.dayPrice || 0,
-      },
-    });
-  }
-
-  // ─── Early CI surcharge (sau phòng cũ) ───
+  // ─── Early CI surcharge ───
   pushEarlyCI();
 
   // ─── Edge case rạng sáng / trong tolerance (đêm 1 đè bằng phòng mới + log phòng cũ gạch bỏ) ───
@@ -484,25 +532,175 @@ function computeMoveRoomBreakdown(input) {
       });
     }
   } else {
-    // ─── Không phải rạng sáng đêm 1: đêm chuyển + các đêm sau = phòng MỚI ───
-    pushFee();
+    // ─── Không phải rạng sáng đêm 1 ───
+    //   ⭐ Phân biệt theo giờ transfer so với CO chuẩn (12:00) của ngày chuyển:
+    //
+    //   [A] Transfer TRƯỚC CO chuẩn (vd 09:50 < 12:00) — BK_YCDMHF:
+    //       Đêm chứa transfer = phòng CŨ (khách ngủ đêm qua ở cũ, sáng nay mới chuyển).
+    //       → Phòng cũ = đêm 0..transferNightIdx. Phòng mới từ CO chuẩn (12:00).
+    //
+    //   [B] Transfer SAU CO chuẩn (vd 13:37 > 12:00) — BK_D9CMKA:
+    //       Đêm cũ đã đóng lúc 12:00. Khách ở quá giờ rồi mới chuyển.
+    //       → Phòng cũ = đêm 0..transferNightIdx-1 (KHÔNG gồm đêm chứa transfer).
+    //       → Khe 12:00 → transferAt:
+    //           • ≤ tolerance (15p): phụ thu TRỄ phòng cũ (dayLateCheckOut)
+    //           • > tolerance: bỏ qua (không tính)
+    //       → Phòng mới từ transferAt (giờ/ngày tùy độ dài).
 
-    const newNights = nights.slice(transferNightIdx);
-    if (newNights.length > 0) {
-      const first = newNights[0];
-      const last = newNights[newNights.length - 1];
+    // CO chuẩn của ngày transfer
+    const coStdTime = parseTimeStr(branchConfig?.checkOutTime ?? '12:00', DEFAULT_CONFIG.CO_HOUR);
+    const coStdOfTransferDay = setHM(tAt, coStdTime.h, coStdTime.m);
+    const transferAfterCoStd = tAt > coStdOfTransferDay;
+    const delayAfterCoMin = transferAfterCoStd ? (tAt - coStdOfTransferDay) / 60000 : 0;
+
+    // ⭐ Phòng CŨ
+    //   [A] transfer trước CO chuẩn: gồm đêm chứa transfer (0..transferNightIdx)
+    //   [B] transfer sau CO chuẩn: KHÔNG gồm đêm chứa transfer (0..transferNightIdx-1)
+    //       vì đêm đó đã kết thúc lúc 12:00, phần sau là phòng mới.
+    const oldNightCount = transferAfterCoStd ? transferNightIdx : (transferNightIdx + 1);
+    const oldNights = nights.slice(0, oldNightCount);
+    if (oldNights.length > 0) {
+      const firstOld = oldNights[0];
+      const lastOld = oldNights[oldNights.length - 1];
+      // ⭐ Label endpoint:
+      //   [A] transfer TRƯỚC CO chuẩn (< 12:00): hiển thị kết thúc tại transferAt
+      //       (vì đoạn mới đã bắt đầu từ transferAt — tránh label trùng 09:50→12:00).
+      //       Tiền VẪN tính trọn đêm (amount không đổi).
+      //   [B] transfer SAU CO chuẩn (> 12:00): giữ endAt (12:00) vì đoạn cũ dừng ở 12:00.
+      const oldDisplayEnd = (!transferAfterCoStd && tAt < lastOld.endAt) ? tAt : lastOld.endAt;
       items.push({
-        label: `[${newRoom.number}] Giá ngày (${fmtDT(first.startAt)} → ${fmtDT(last.endAt)})`,
-        amount: (newRoom.policy.dayPrice || 0) * newNights.length,
+        label: `[${oldRoom.number}] Giá ngày (${fmtDT(firstOld.startAt)} → ${fmtDT(oldDisplayEnd)})`,
+        amount: (oldRoom.policy.dayPrice || 0) * oldNights.length,
         type: 'base',
         meta: {
-          roomNumber: newRoom.number,
-          nights: newNights.length,
-          policy: 'new',
-          segment: 'newNights',
-          dayPrice: newRoom.policy.dayPrice || 0,
+          roomNumber: oldRoom.number,
+          nights: oldNights.length,
+          policy: 'old',
+          segment: 'oldNights',
+          rangeStart: firstOld.startAt.toISOString(),
+          rangeEnd: lastOld.endAt.toISOString(),   // meta giữ endAt thật (cho tính toán)
+          displayEnd: oldDisplayEnd.toISOString(),  // ⭐ endpoint hiển thị
+          dayPrice: oldRoom.policy.dayPrice || 0,
         },
       });
+    }
+
+    // ⭐ [B] Phụ thu TRỄ phòng cũ nếu transfer sau CO chuẩn ≤ tolerance phút
+    if (transferAfterCoStd && delayAfterCoMin > 0 && delayAfterCoMin <= tolerance) {
+      const lateSlots = oldRoom.policy.dayLateCheckOut || [];
+      const lateHours = roundHoursWithTolerance(delayAfterCoMin, 0);  // số giờ trễ (làm tròn)
+      const lateSlot = pickSlotHourly(lateSlots, Math.max(1, lateHours));
+      if (lateSlot) {
+        items.push({
+          label: `[${oldRoom.number}] Trả phòng trễ: ${fmtDuration(Math.round(delayAfterCoMin))} (Slot ${lateSlot.hours}h)`,
+          amount: lateSlot.price,
+          type: 'surcharge',
+          meta: {
+            roomNumber: oldRoom.number,
+            lateCheckout: true,
+            policy: 'old',
+            segment: 'oldLateCheckout',
+            slotHours: lateSlot.hours,
+          },
+        });
+      }
+    }
+
+    // Phí chuyển phòng
+    pushFee();
+
+    // ⭐ Đoạn phòng MỚI LUÔN bắt đầu từ transferAt (chấp nhận overlap với đêm cũ).
+    //   [A] transfer trước CO: overlap transferAt → 12:00 với đêm cũ (đã chốt).
+    //   [B] transfer sau CO: không overlap (đêm cũ đã đóng lúc 12:00).
+    const newStart = tAt;
+    const newRoomDurationH = (co - newStart) / 3600000;
+    const newRoomHourSlots = newRoom.policy.hourSlots || [];
+    const newRoomMinutes = (co - newStart) / 60000;
+    const roundedHours = roundHoursWithTolerance(newRoomMinutes, tolerance);
+
+    const maxSlotHours = newRoomHourSlots.length > 0
+      ? Math.max(...newRoomHourSlots.map(s => getSlotHoursVal(s) || 0))
+      : 0;
+
+    // ⭐ Ngưỡng giờ→ngày theo GIỜ ĐỒNG HỒ (dayEquivalentHours, mặc định 23):
+    //   Nếu checkout/now vượt mốc 23:00 cùng ngày → đoạn mới tính giá NGÀY (cộng 1 đêm).
+    //   Vd: transfer 13:37, now 23:01 → 23:01 ≥ 23:00 → tính NGÀY (700k), không giờ.
+    //       transfer 13:37, now 22:59 → < 23:00 → tính GIỜ.
+    //   Lưu ý: chỉ áp dụng khi co và transferAt CÙNG NGÀY (chưa qua đêm calendar).
+    const coClockHour = co.getHours() + co.getMinutes() / 60;
+    const sameDayAsTransfer = co.getFullYear() === tAt.getFullYear()
+      && co.getMonth() === tAt.getMonth()
+      && co.getDate() === tAt.getDate();
+    const coExceedsDayEquiv = sameDayAsTransfer && coClockHour >= dayEquivalentHours;
+
+    const canHourly = newRoomHourSlots.length > 0
+      && roundedHours > 0
+      && roundedHours <= maxSlotHours
+      && !coExceedsDayEquiv;   // ⭐ vượt 23:00 đồng hồ → KHÔNG giờ, fallback ngày
+
+    if (canHourly) {
+      const slot = pickSlotHourly(newRoomHourSlots, roundedHours);
+      if (slot) {
+        items.push({
+          label: `[${newRoom.number}] Giá giờ (${fmtDT(newStart)} → ${fmtDT(co)}) — ${roundedHours}h`,
+          amount: slot.price,
+          type: 'base',
+          meta: {
+            roomNumber: newRoom.number,
+            policy: 'new',
+            segment: 'newHourly',
+            mode: 'hour',
+            slotHours: slot.hours,
+            roundedHours,
+            durationHours: newRoomDurationH,
+            hourPrice: slot.price,
+            isMinimum: !!slot.isMinimum,
+          },
+        });
+      }
+    } else {
+      // ⭐ Phòng MỚI tính giá NGÀY.
+      //   [A] transfer trước CO: lấy các đêm SAU đêm chuyển (nights.slice).
+      //   [B] transfer sau CO: tính số đêm từ newStart (transferAt) → co.
+      let newNights;
+      if (transferAfterCoStd) {
+        // Từ transferAt → co: tính số đêm calendar
+        newNights = nights.slice(transferNightIdx);  // đêm chứa transfer trở đi = phòng mới
+      } else {
+        newNights = nights.slice(transferNightIdx + 1);
+      }
+      if (newNights.length > 0) {
+        const first = newNights[0];
+        const last = newNights[newNights.length - 1];
+        // [B]: dòng bắt đầu từ transferAt (không phải đầu đêm)
+        const displayStart = transferAfterCoStd ? newStart : first.startAt;
+        items.push({
+          label: `[${newRoom.number}] Giá ngày (${fmtDT(displayStart)} → ${fmtDT(last.endAt)})`,
+          amount: (newRoom.policy.dayPrice || 0) * newNights.length,
+          type: 'base',
+          meta: {
+            roomNumber: newRoom.number,
+            nights: newNights.length,
+            policy: 'new',
+            segment: 'newNights',
+            dayPrice: newRoom.policy.dayPrice || 0,
+          },
+        });
+      } else if (newRoomDurationH > 0) {
+        // Cùng ngày, vượt slot giờ → 1 đêm phòng mới
+        items.push({
+          label: `[${newRoom.number}] Giá ngày (${fmtDT(newStart)} → ${fmtDT(co)})`,
+          amount: newRoom.policy.dayPrice || 0,
+          type: 'base',
+          meta: {
+            roomNumber: newRoom.number,
+            nights: 1,
+            policy: 'new',
+            segment: 'newDaySameDay',
+            dayPrice: newRoom.policy.dayPrice || 0,
+          },
+        });
+      }
     }
   }
 
@@ -523,6 +721,9 @@ module.exports = {
     findTransferNightIndex,
     isEarlyMorningTransferOfFirstNight,
     pickSlot,
+    pickSlotHourly,
+    roundHoursWithTolerance,
+    getSlotHoursVal,
     fmtDuration,
   },
 };

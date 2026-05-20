@@ -10,6 +10,24 @@ const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 const { computeMoveRoomBreakdown } = require('../utils/moveRoomBreakdown');
 
+// ⭐ NEW 20/05/2026: Tìm policy hourEnabled=true của roomType để lấy bảng giá GIỜ chuẩn.
+//   Dùng khi tính giá giờ cho đoạn chuyển phòng — phải lấy "Giá Nghỉ Giờ" (hourEnabled)
+//   chứ KHÔNG phải policy giá ngày booking đang dùng (vd "Giá Ngày 1" có hourSlots khác).
+//   Mỗi roomType chỉ có 1 policy hourEnabled → lấy displayOrder nhỏ nhất nếu nhiều.
+const resolveHourlyPolicy = async (roomTypeId, branchId) => {
+  if (!roomTypeId || !branchId) return null;
+  try {
+    return await PricePolicy.findOne({
+      roomTypeId,
+      branchId,
+      hourEnabled: true,
+      isActive: true,
+    }).sort({ displayOrder: 1 }).lean();
+  } catch (_) {
+    return null;
+  }
+};
+
 // ⭐ Role guard cho undo check-in/check-out — chỉ Admin/Manager
 const ALLOWED_UNDO_ROLES = ['Admin', 'Manager']
 
@@ -888,6 +906,13 @@ const changeDates = async (req, res, next) => {
         })
       }
 
+      // ⭐ NEW 20/05/2026: Bảng giá GIỜ từ policy hourEnabled của roomType phòng MỚI
+      const newRoomTypeIdCD = room?.typeId?._id || room?.typeId || null
+      const newHourlyPolicyCD = await resolveHourlyPolicy(newRoomTypeIdCD, booking.branchId)
+      const newRoomHourSlotsCD = newHourlyPolicyCD
+        ? hourSlotsOf(newHourlyPolicyCD)
+        : hourSlotsOf(policy)
+
       const actualCI = booking.actualCheckIn ?? newCheckIn
       const moveItems = computeMoveRoomBreakdown({
         actualCheckIn:   actualCI,
@@ -901,12 +926,18 @@ const changeDates = async (req, res, next) => {
         newRoom: {
           number: lastTransfer.toRoomNumber,
           type:   newRoomType,
-          policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
+          policy: { dayPrice: policy?.dayPrice || 0, hourSlots: newRoomHourSlotsCD },
         },
         transferFee: Number(lastTransfer.fee) || 0,
         changeRate:  oldRoomType !== newRoomType,
         isFreeRoom:  !!booking.isFreeRoom,
-        branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
+        branchConfig: branch ? {
+            checkInTime: branch.checkInTime,
+            checkOutTime: branch.checkOutTime,
+            earlyCheckinUntil: branch.earlyCheckinUntil,
+            toleranceMinutes: branch.toleranceMinutes,
+            dayEquivalentHours: branch.dayEquivalentHours,
+          } : null,
       })
 
       const breakdownItems = moveItems.map(it => ({
@@ -1407,6 +1438,13 @@ const moveRoom = async (req, res, next) => {
         })
       }
 
+      // ⭐ NEW 20/05/2026: Bảng giá GIỜ từ policy hourEnabled của roomType phòng MỚI
+      const newRoomTypeIdMV = newRoom.typeId?._id || newRoom.typeId || null
+      const newHourlyPolicyMV = await resolveHourlyPolicy(newRoomTypeIdMV, booking.branchId)
+      const newRoomHourSlotsMV = newHourlyPolicyMV
+        ? hourSlotsOf(newHourlyPolicyMV)
+        : hourSlotsOf(newPolicy)
+
       const breakdownInput = {
         actualCheckIn:   new Date(sourceActualCheckIn || sourceCheckIn),
         plannedCheckOut: new Date(sourceCheckOut),
@@ -1424,7 +1462,7 @@ const moveRoom = async (req, res, next) => {
           type:   newRoomType,
           policy: {
             dayPrice:  newPolicy.dayPrice || 0,
-            hourSlots: hourSlotsOf(newPolicy),
+            hourSlots: newRoomHourSlotsMV,
           },
         },
         transferFee: 0,    // fee được handle riêng ở booking.transferFee
@@ -2371,6 +2409,13 @@ const checkout = async (req, res, next) => {
             })
           }
 
+          // ⭐ NEW 20/05/2026: Bảng giá GIỜ từ policy hourEnabled của roomType phòng MỚI
+          const newRoomTypeIdCO = room?.typeId?._id || room?.typeId || null
+          const newHourlyPolicyCO = await resolveHourlyPolicy(newRoomTypeIdCO, booking.branchId)
+          const newRoomHourSlotsCO = newHourlyPolicyCO
+            ? hourSlotsOf(newHourlyPolicyCO)
+            : hourSlotsOf(policy)
+
           const moveItems = computeMoveRoomBreakdown({
             actualCheckIn:   booking.actualCheckIn ?? booking.checkIn,
             // ⭐ FIX 19/05/2026 v2: plannedCheckOut = min(booking.checkOut, actualCO)
@@ -2390,12 +2435,18 @@ const checkout = async (req, res, next) => {
             newRoom: {
               number: lastTransfer.toRoomNumber,
               type:   newRoomType,
-              policy: { dayPrice: policy?.dayPrice || 0, hourSlots: hourSlotsOf(policy) },
+              policy: { dayPrice: policy?.dayPrice || 0, hourSlots: newRoomHourSlotsCO },
             },
             transferFee: Number(lastTransfer.fee) || 0,
             changeRate:  oldRoomType !== newRoomType,
             isFreeRoom:  !!booking.isFreeRoom,
-            branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
+            branchConfig: branch ? {
+            checkInTime: branch.checkInTime,
+            checkOutTime: branch.checkOutTime,
+            earlyCheckinUntil: branch.earlyCheckinUntil,
+            toleranceMinutes: branch.toleranceMinutes,
+            dayEquivalentHours: branch.dayEquivalentHours,
+          } : null,
           })
 
           const breakdownItems = moveItems.map(it => ({
@@ -3802,12 +3853,22 @@ const calculateBill = async (req, res, next) => {
         // Resolve room types từ Room collection
         let oldRoomType = ''
         let newRoomType = booking.roomType || ''
+        let newRoomTypeId = null   // ⭐ NEW: để query hourly policy
         try {
           const oldRoomDoc = await Room.findOne({
             number: oldRoomNum, branchId: booking.branchId,
           }).populate('typeId')
           if (oldRoomDoc) {
             oldRoomType = oldRoomDoc.typeId?.name || oldRoomDoc.typeName || ''
+          }
+        } catch (_) {}
+        try {
+          const newRoomDoc = await Room.findOne({
+            number: newRoomNum, branchId: booking.branchId,
+          }).populate('typeId')
+          if (newRoomDoc) {
+            newRoomType   = newRoomDoc.typeId?.name || newRoomDoc.typeName || newRoomType
+            newRoomTypeId = newRoomDoc.typeId?._id || newRoomDoc.typeId || null
           }
         } catch (_) {}
 
@@ -3822,6 +3883,13 @@ const calculateBill = async (req, res, next) => {
             }
           })
         }
+
+        // ⭐ NEW 20/05/2026: Lấy bảng giá GIỜ từ policy hourEnabled của roomType phòng MỚI
+        //   ("Giá Nghỉ Giờ") — KHÔNG dùng hourSlots của policy giá ngày booking đang dùng.
+        const newHourlyPolicy = await resolveHourlyPolicy(newRoomTypeId, booking.branchId)
+        const newRoomHourSlots = newHourlyPolicy
+          ? hourSlotsOf(newHourlyPolicy)
+          : hourSlotsOf(newPolicy)
 
         const items = computeMoveRoomBreakdown({
           actualCheckIn:   effectiveCheckIn,
@@ -3848,7 +3916,7 @@ const calculateBill = async (req, res, next) => {
             type:   newRoomType,
             policy: {
               dayPrice:  newPolicy?.dayPrice || 0,
-              hourSlots: hourSlotsOf(newPolicy),
+              hourSlots: newRoomHourSlots,
             },
           },
           // ⭐ FIX: Truyền fee từ transferHistory để module sinh dòng phụ thu
@@ -3856,7 +3924,13 @@ const calculateBill = async (req, res, next) => {
           transferFee: Number(lastTransfer.fee) || 0,
           changeRate:  oldRoomType !== newRoomType,
           isFreeRoom:  !!booking.isFreeRoom,
-          branchConfig: branch ? { checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime } : null,
+          branchConfig: branch ? {
+            checkInTime: branch.checkInTime,
+            checkOutTime: branch.checkOutTime,
+            earlyCheckinUntil: branch.earlyCheckinUntil,
+            toleranceMinutes: branch.toleranceMinutes,
+            dayEquivalentHours: branch.dayEquivalentHours,
+          } : null,
         })
 
         // ⭐ FIX: KHÔNG filter fee item nữa — để nó hiển thị trong breakdown

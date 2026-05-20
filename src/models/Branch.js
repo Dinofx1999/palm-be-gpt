@@ -17,11 +17,6 @@ const branchSchema = new mongoose.Schema({
   // Ví dụ: tolerance 15 phút trước/sau giờ chuẩn → không tính phụ thu
   toleranceMinutes:    { type: Number, default: 15 },
 
-  // Ngưỡng (giờ) để tự chuyển giữa giá Giờ ↔ giá Ngày
-  // Nếu user chọn giá Ngày mà ở < ngưỡng này → auto chuyển sang giá Giờ
-  // Nếu user chọn giá Giờ mà ở >= ngưỡng này (cùng ngày) → đề xuất giá Ngày
-  hourToDayThreshold:  { type: Number, default: 3 },
-
   // Khi auto-convert sang giá Ngày, chú thích "đã tính tròn 1 ngày"
   // Vd: dayEquivalentHours = 23 → khách trả phòng vượt 23:00 sẽ tự cộng thêm 1 đêm
   dayEquivalentHours:  { type: Number, default: 23 },

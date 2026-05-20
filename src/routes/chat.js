@@ -27,6 +27,7 @@ const PricePolicy = require('../models/PricePolicy');
 const User          = require('../models/User');
 const Amenity       = require('../models/Amenity');
 const PaymentMethod = require('../models/PaymentMethod');
+const Procedure = require('../models/Procedure');
 
 // ⭐ Dùng cùng calculator như booking thật → giá khớp 100%
 const { calculatePrice } = require('../utils/priceCalculator');
@@ -246,7 +247,64 @@ async function computeRoomRealStatus(branchId = null) {
 // ============================================================
 const tools = [{
   functionDeclarations: [
-    
+    {
+  name: 'prepare_procedure',
+  description: 'BƯỚC 1 khi TẠO QUY TRÌNH/SOP/CHECKLIST mới — soạn bản XEM TRƯỚC (KHÔNG ghi vào hệ thống) để Admin duyệt. CHỈ ADMIN. Dùng khi admin nói "thêm quy trình X", "tạo SOP Y", "tạo checklist Z". ⚠️ BẮT BUỘC phải biết positions (quy trình áp dụng cho vị trí nào: Admin/Manager/Receptionist/Staff) TRƯỚC KHI gọi tool — nếu admin chưa nói rõ, PHẢI HỎI trước. AI tự soạn nội dung các bước nếu admin yêu cầu "cho ví dụ", rồi gọi tool này để hiện preview cho admin duyệt.',
+  parameters: {
+    type: 'object',
+    properties: {
+      title:       { type: 'string', description: 'Tên quy trình (vd "Quy trình xử lý mất đồ")' },
+      positions:   {
+        type: 'array',
+        description: 'BẮT BUỘC — danh sách vị trí áp dụng. CHỈ chấp nhận: "Admin", "Manager", "Receptionist", "Staff". Nếu admin nói "lễ tân" → map thành "Receptionist"; "buồng phòng/nhân viên" → "Staff"; "quản lý" → "Manager". PHẢI hỏi admin nếu chưa rõ.',
+        items: { type: 'string' },
+      },
+      category:    { type: 'string', description: '"sop" (quy trình chuẩn) hoặc "checklist" (danh sách kiểm tra). Mặc định "sop".' },
+      description: { type: 'string', description: 'Mô tả ngắn quy trình (tuỳ chọn)' },
+      steps: {
+        type: 'array',
+        description: 'Danh sách các bước, theo thứ tự. Mỗi bước có title (tiêu đề bước) + content (nội dung chi tiết).',
+        items: {
+          type: 'object',
+          properties: {
+            title:   { type: 'string', description: 'Tiêu đề bước (vd "Tiếp nhận thông tin từ khách")' },
+            content: { type: 'string', description: 'Nội dung chi tiết của bước' },
+          },
+          required: ['title'],
+        },
+      },
+      branchName:  { type: 'string', description: 'Tên chi nhánh áp dụng. Admin bỏ trống = dùng chi nhánh hiện tại của admin (hoặc chi nhánh đầu tiên).' },
+    },
+    required: ['title', 'positions', 'steps'],
+  },
+},
+{
+  name: 'confirm_create_procedure',
+  description: 'BƯỚC 2 — TẠO QUY TRÌNH THẬT vào hệ thống. CHỈ ADMIN. CHỈ gọi sau khi: (1) đã gọi prepare_procedure, (2) admin đã DUYỆT rõ ràng ("ok", "duyệt", "tạo đi", "đồng ý"). confirmed=true là BẮT BUỘC. Truyền lại ĐẦY ĐỦ thông tin y như đã preview.',
+  parameters: {
+    type: 'object',
+    properties: {
+      title:       { type: 'string' },
+      positions:   { type: 'array', items: { type: 'string' }, description: 'Y như preview. Chỉ Admin/Manager/Receptionist/Staff.' },
+      category:    { type: 'string', description: '"sop" hoặc "checklist"' },
+      description: { type: 'string' },
+      steps: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            title:   { type: 'string' },
+            content: { type: 'string' },
+          },
+          required: ['title'],
+        },
+      },
+      branchName:  { type: 'string' },
+      confirmed:   { type: 'boolean', description: 'BẮT BUỘC = true. Flag bảo vệ chắc chắn admin đã duyệt.' },
+    },
+    required: ['title', 'positions', 'steps', 'confirmed'],
+  },
+},
     {
       name: 'get_rooms_overview',
       description: 'Tổng quan trạng thái phòng (tổng số, đang ở, trống, đặt trước, dọn dẹp, bảo trì). Dùng khi user hỏi: "có bao nhiêu phòng trống", "tình hình phòng", "phòng nào đang ở".',
@@ -4105,6 +4163,191 @@ PHẢI HỎI: "Anh xác nhận hủy booking này không? Vui lòng cho em biế
     };
   },
 
+  async prepare_procedure({ title, positions, category, description, steps, branchName } = {}) {
+  // ⭐ CHỈ ADMIN
+  if (ctx.role !== 'Admin') {
+    return { error: 'forbidden', message: 'Chỉ Admin mới được tạo quy trình mới qua chat ạ.' };
+  }
+ 
+  const VALID = ['Admin', 'Manager', 'Receptionist', 'Staff'];
+ 
+  // ─── Validate title ───
+  if (!title || !String(title).trim()) {
+    return { error: 'missing_title', message: 'Thiếu tên quy trình. Hãy hỏi admin tên quy trình.' };
+  }
+ 
+  // ─── Validate positions (BẮT BUỘC) ───
+  const posArr = Array.isArray(positions)
+    ? positions.map(p => String(p).trim()).filter(Boolean)
+    : (positions ? [String(positions).trim()] : []);
+  if (posArr.length === 0) {
+    return {
+      error: 'missing_positions',
+      message: 'Chưa biết quy trình áp dụng cho vị trí nào. PHẢI HỎI admin: quy trình này dành cho vị trí nào (Lễ tân/Receptionist, Buồng phòng/Staff, Manager, Admin)? — rồi mới gọi lại tool.',
+    };
+  }
+  const invalid = posArr.filter(p => !VALID.includes(p));
+  if (invalid.length > 0) {
+    return {
+      error: 'invalid_positions',
+      message: `Vị trí không hợp lệ: ${invalid.join(', ')}. Chỉ chấp nhận: ${VALID.join(', ')}. (Lễ tân→Receptionist, Buồng phòng/Nhân viên→Staff, Quản lý→Manager). Hãy map lại rồi gọi lại tool.`,
+    };
+  }
+ 
+  // ─── Normalize steps ───
+  const stepsArr = Array.isArray(steps)
+    ? steps.map((s, i) => ({
+        order: i + 1,
+        title: String(s?.title || '').trim().slice(0, 200),
+        content: String(s?.content || '').trim().slice(0, 5000),
+      })).filter(s => s.title.length > 0)
+    : [];
+ 
+  // ─── Resolve branch ───
+  let branchId = ctx.userBranchId;
+  if (branchName) {
+    const bId = await resolveBranchId(ctx, branchName);
+    if (bId) branchId = bId;
+  }
+  if (!branchId) {
+    const firstBranch = await Branch.findOne().select('_id name').lean();
+    branchId = firstBranch?._id;
+  }
+  if (!branchId) {
+    return { error: 'no_branch', message: 'Không xác định được chi nhánh để tạo quy trình.' };
+  }
+  const branchDoc = await Branch.findById(branchId).select('name').lean();
+ 
+  const cat = ['checklist', 'sop'].includes(category) ? category : 'sop';
+ 
+  return {
+    _previewOnly: true,
+    summary: {
+      title: String(title).trim(),
+      positions: posArr,
+      category: cat,
+      categoryLabel: cat === 'checklist' ? 'Danh sách kiểm tra' : 'Quy trình chuẩn (SOP)',
+      description: String(description || '').trim() || null,
+      branch: branchDoc?.name || null,
+      stepCount: stepsArr.length,
+      steps: stepsArr.map(s => ({ step: s.order, title: s.title, content: s.content || null })),
+    },
+    _hint: 'ĐÂY LÀ PREVIEW — CHƯA tạo. Hiển thị đầy đủ cho admin duyệt: tên, vị trí áp dụng, loại, các bước. SAU ĐÓ hỏi rõ "Anh duyệt tạo quy trình này chứ ạ?". CHỈ gọi confirm_create_procedure (confirmed=true) khi admin trả lời "ok/duyệt/tạo đi/đồng ý". Truyền lại y nguyên thông tin đã preview.',
+  };
+},
+ 
+async confirm_create_procedure({ title, positions, category, description, steps, branchName, confirmed = false } = {}) {
+  // ⭐ CHỈ ADMIN
+  if (ctx.role !== 'Admin') {
+    return { error: 'forbidden', message: 'Chỉ Admin mới được tạo quy trình mới ạ.' };
+  }
+  // ⭐ Bắt buộc confirmed
+  if (!confirmed) {
+    return {
+      error: 'not_confirmed',
+      message: 'Cần admin duyệt rõ ràng. Hãy gọi prepare_procedure trước, để admin duyệt, rồi mới gọi confirm_create_procedure với confirmed=true.',
+    };
+  }
+ 
+  const VALID = ['Admin', 'Manager', 'Receptionist', 'Staff'];
+ 
+  // ─── Validate (lặp lại để bảo vệ — không tin tưởng AI truyền đúng) ───
+  if (!title || !String(title).trim()) {
+    return { error: 'missing_title', message: 'Thiếu tên quy trình.' };
+  }
+  const posArr = Array.isArray(positions)
+    ? positions.map(p => String(p).trim()).filter(Boolean)
+    : (positions ? [String(positions).trim()] : []);
+  if (posArr.length === 0) {
+    return { error: 'missing_positions', message: 'Thiếu vị trí áp dụng (positions).' };
+  }
+  const invalid = posArr.filter(p => !VALID.includes(p));
+  if (invalid.length > 0) {
+    return { error: 'invalid_positions', message: `Vị trí không hợp lệ: ${invalid.join(', ')}.` };
+  }
+ 
+  const stepsArr = Array.isArray(steps)
+    ? steps.map((s, i) => ({
+        order: i + 1,
+        title: String(s?.title || '').trim().slice(0, 200),
+        content: String(s?.content || '').trim().slice(0, 5000),
+        imageUrl: '',
+      })).filter(s => s.title.length > 0)
+    : [];
+ 
+  // ─── Resolve branch ───
+  let branchId = ctx.userBranchId;
+  if (branchName) {
+    const bId = await resolveBranchId(ctx, branchName);
+    if (bId) branchId = bId;
+  }
+  if (!branchId) {
+    const firstBranch = await Branch.findOne().select('_id').lean();
+    branchId = firstBranch?._id;
+  }
+  if (!branchId) {
+    return { error: 'no_branch', message: 'Không xác định được chi nhánh.' };
+  }
+ 
+  const cat = ['checklist', 'sop'].includes(category) ? category : 'sop';
+ 
+  // ─── Tạo thật ───
+  let procedure;
+  try {
+    procedure = await Procedure.create({
+      branchId,
+      title: String(title).trim(),
+      positions: posArr,
+      category: cat,
+      description: String(description || '').trim(),
+      steps: stepsArr,
+      status: 'active',
+      createdBy: ctx.userId || null,
+      updatedBy: ctx.userId || null,
+    });
+  } catch (e) {
+    console.error('[confirm_create_procedure] error:', e);
+    return { error: 'db_error', message: 'Không tạo được quy trình: ' + e.message };
+  }
+ 
+  // ─── Audit log (non-fatal) ───
+  try {
+    await logAction({
+      entityType: 'Procedure',
+      entityId: procedure._id,
+      action: 'create',
+      description: `[AI Chat] Tạo quy trình "${procedure.title}"`,
+      user: { id: ctx.userId, role: ctx.role, _id: ctx.userId },
+      branchId,
+      metadata: {
+        source: 'AI Chat',
+        title: procedure.title,
+        positions: posArr,
+        category: cat,
+        stepCount: stepsArr.length,
+        createdByAI: true,
+      },
+    });
+  } catch (e) {
+    console.warn('[confirm_create_procedure] audit log failed (non-fatal):', e.message);
+  }
+ 
+  const branchDoc = await Branch.findById(branchId).select('name').lean();
+ 
+  return {
+    success: true,
+    procedureId: String(procedure._id),
+    title: procedure.title,
+    positions: posArr,
+    category: cat,
+    categoryLabel: cat === 'checklist' ? 'Danh sách kiểm tra' : 'Quy trình chuẩn (SOP)',
+    stepCount: stepsArr.length,
+    branch: branchDoc?.name || null,
+    _hint: 'TẠO QUY TRÌNH THÀNH CÔNG. Báo admin với tone vui mừng: đã thêm quy trình vào hệ thống, áp dụng cho các vị trí nào, gồm mấy bước. Kết thúc "Anh cần em hỗ trợ thêm gì không ạ?".',
+  };
+},
+ 
+
   // ── USER / STAFF (2 handlers) ─────────────────────────────────
   async find_users({ query, role, branchName, isActive, limit = 20 }) {
     // ⭐ Chỉ Admin/Manager xem được nhân viên khác
@@ -4960,23 +5203,40 @@ router.post('/message', async (req, res) => {
       // ⭐ NEW 14/05/2026: Báo cho FE biết tool nào đã chạy thành công
       //   để FE trigger reload các trang liên quan (sơ đồ phòng, dashboard...)
       dataChanged: (() => {
-        const changedTools = allToolCalls.filter(t =>
-          !t.error && [
-            'create_booking',           // Đặt phòng mới
-            'check_in_booking',         // Check-in
-            'check_out_booking',        // Check-out
-            'cancel_booking',           // Hủy phòng
-            'update_booking',           // Sửa thông tin booking
-            'mark_room_cleaned',        // Đánh dấu đã dọn
-          ].includes(t.name)
-        );
+        // Map tên tool thật → loại action cho FE (RoomMapPage đọc field `types`)
+        const TOOL_ACTION_MAP = {
+          create_booking:        'create_booking',
+          confirm_checkin:       'check_in_booking',
+          confirm_cancellation:  'cancel_booking',
+        };
+ 
+        // Chỉ lấy tool đã chạy THÀNH CÔNG (không error + result.success !== false)
+        const changedTools = allToolCalls.filter(t => {
+          if (t.error) return false;
+          if (!TOOL_ACTION_MAP[t.name]) return false;
+          // prepare_* trả _previewOnly; các confirm/create trả success:true
+          //   create_booking & confirm_* khi lỗi nghiệp vụ trả { error: '...' } (đã loại ở trên),
+          //   khi thành công trả { success: true }. Chặn thêm trường hợp result.error.
+          if (t.result?.error) return false;
+          if (t.result?.success === false) return false;
+          return true;
+        });
+ 
         if (changedTools.length === 0) return null;
+ 
+        // Tìm booking code từ tool vừa chạy (create / checkin / cancel đều trả bookingCode)
+        const pickCode = (toolName) =>
+          changedTools.find(t => t.name === toolName)?.result?.bookingCode ?? null;
+ 
         return {
-          types: [...new Set(changedTools.map(t => t.name))],
-          // Đính kèm bookingCode mới nếu vừa create
-          createdBookingCode: changedTools
-            .find(t => t.name === 'create_booking')
-            ?.result?.bookingCode ?? null,
+          // FE đọc `types` để hiện toast tương ứng (đã map sang tên FE quen thuộc)
+          types: [...new Set(changedTools.map(t => TOOL_ACTION_MAP[t.name]))],
+          // createdBookingCode → chỉ set khi vừa ĐẶT PHÒNG MỚI (FE hiện toast "✨ AI vừa đặt phòng")
+          createdBookingCode: pickCode('create_booking'),
+          // bookingCode chung (cho check-in / hủy) — FE có thể dùng nếu cần
+          bookingCode: pickCode('create_booking')
+            || pickCode('confirm_checkin')
+            || pickCode('confirm_cancellation'),
         };
       })(),
     });

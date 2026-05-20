@@ -32,7 +32,7 @@ const update = async (req, res, next) => {
     const allowed = [
       'name', 'address', 'city', 'phone', 'email',
       'checkInTime', 'checkOutTime',
-      'toleranceMinutes', 'hourToDayThreshold',
+      'toleranceMinutes',
       'dayEquivalentHours', 'earlyCheckinUntil',
       'autoConvertPriceType',
       'quotePolicy','hourBookingCutoffEnabled','hourBookingCutoffStart','hourBookingCutoffEnd',
