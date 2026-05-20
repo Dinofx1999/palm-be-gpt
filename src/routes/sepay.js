@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Invoice = require('../models/Invoice');
+const Booking = require('../models/Booking'); 
 const SepayTransaction = require('../models/SepayTransaction');
 
 // Middleware xác thực API Key
@@ -80,5 +81,74 @@ router.post('/sepay/webhook', verifySepay, async (req, res) => {
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
-
+// / Chuẩn hoá mã: bỏ ký tự đặc biệt + viết hoa. "BK_YCDMHF" -> "BKYCDMHF"
+function normalizeCode(s) {
+  return String(s || '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+}
+ 
+router.get('/sepay/status', async (req, res) => {
+  try {
+    const { bookingCode, invoiceId } = req.query;
+ 
+    let invoice = null;
+ 
+    // Cách 1: tra thẳng theo invoiceId nếu FE gửi lên
+    if (invoiceId) {
+      invoice = await Invoice.findById(invoiceId);
+    }
+ 
+    // Cách 2: tra theo bookingCode (FE QRPaymentModal đang dùng cách này)
+    if (!invoice && bookingCode) {
+      const normalized = normalizeCode(bookingCode);
+ 
+      // ── TÌM INVOICE THEO MÃ BOOKING ──
+      // ⚠ ĐOẠN NÀY PHẢI KHỚP SCHEMA THẬT CỦA BẠN. Có 3 kiểu phổ biến,
+      //   chọn (bỏ comment) đúng 1 kiểu theo model Invoice/Booking của bạn:
+ 
+      // KIỂU A — Invoice có sẵn field paymentCode (đã chuẩn hoá):
+      // invoice = await Invoice.findOne({ paymentCode: normalized });
+ 
+      // KIỂU B — Invoice liên kết Booking qua bookingId, Booking có bookingCode:
+      const booking = await Booking.findOne({
+        // so khớp linh hoạt: BK_YCDMHF hoặc BKYCDMHF đều ra
+        $expr: {
+          $eq: [
+            { $toUpper: { $replaceAll: { input: { $ifNull: ['$bookingCode', ''] }, find: '_', replacement: '' } } },
+            normalized,
+          ],
+        },
+      });
+      if (booking) {
+        invoice = await Invoice.findOne({ bookingId: booking._id });
+      }
+ 
+      // KIỂU C — Invoice có field invoiceCode/code trùng mã booking:
+      // invoice = await Invoice.findOne({ invoiceCode: bookingCode });
+    }
+ 
+    if (!invoice) {
+      return res.json({ success: true, data: { found: false, paid: false } });
+    }
+ 
+    const totalAmount = Number(invoice.totalAmount ?? 0);
+    const paidAmount  = Number(invoice.paidAmount ?? 0);
+    const remaining   = Math.max(0, totalAmount - paidAmount);
+ 
+    return res.json({
+      success: true,
+      data: {
+        found: true,
+        invoiceId:       invoice._id,
+        totalAmount,
+        paidAmount,
+        remainingAmount: remaining,
+        status:          invoice.status,
+        paid:            paidAmount > 0,   // có tiền vào là true
+      },
+    });
+  } catch (err) {
+    console.error('SePay status error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
 module.exports = router;
