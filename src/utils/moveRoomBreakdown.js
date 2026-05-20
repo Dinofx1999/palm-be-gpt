@@ -623,20 +623,25 @@ function computeMoveRoomBreakdown(input) {
       : 0;
 
     // ⭐ Ngưỡng giờ→ngày theo GIỜ ĐỒNG HỒ (dayEquivalentHours, mặc định 23):
-    //   Nếu checkout/now vượt mốc 23:00 cùng ngày → đoạn mới tính giá NGÀY (cộng 1 đêm).
-    //   Vd: transfer 13:37, now 23:01 → 23:01 ≥ 23:00 → tính NGÀY (700k), không giờ.
-    //       transfer 13:37, now 22:59 → < 23:00 → tính GIỜ.
-    //   Lưu ý: chỉ áp dụng khi co và transferAt CÙNG NGÀY (chưa qua đêm calendar).
+    //   Đoạn phòng mới CHỈ tính theo GIỜ khi: co vẫn TRONG CÙNG NGÀY calendar với
+    //   transfer VÀ chưa tới mốc 23:00. Ngược lại → tính giá NGÀY.
+    //   Vd: transfer 13:37 → now 22:59 (cùng ngày, <23:00) → GIỜ.
+    //       transfer 13:37 → now 23:01 (cùng ngày, ≥23:00) → NGÀY.
+    //       transfer 13:37 → now 01:38 hôm sau (ĐÃ QUA ĐÊM) → NGÀY (FIX bug 21/05).
     const coClockHour = co.getHours() + co.getMinutes() / 60;
     const sameDayAsTransfer = co.getFullYear() === tAt.getFullYear()
       && co.getMonth() === tAt.getMonth()
       && co.getDate() === tAt.getDate();
-    const coExceedsDayEquiv = sameDayAsTransfer && coClockHour >= dayEquivalentHours;
+    // ⭐ FIX: vượt mốc ngày khi (cùng ngày & qua 23:00) HOẶC (đã sang ngày calendar khác).
+    //   Trước đây chỉ chặn case cùng ngày → bỏ sót case qua đêm (13:37→01:38 hôm sau)
+    //   khiến nó tính 12h giá giờ thay vì 1 đêm.
+    const coExceedsDayEquiv = !sameDayAsTransfer
+      || coClockHour >= dayEquivalentHours;
 
     const canHourly = newRoomHourSlots.length > 0
       && roundedHours > 0
       && roundedHours <= maxSlotHours
-      && !coExceedsDayEquiv;   // ⭐ vượt 23:00 đồng hồ → KHÔNG giờ, fallback ngày
+      && !coExceedsDayEquiv;   // ⭐ vượt 23:00 đồng ngày HOẶC qua đêm → tính NGÀY
 
     if (canHourly) {
       const slot = pickSlotHourly(newRoomHourSlots, roundedHours);

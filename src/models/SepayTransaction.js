@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');   // ← thêm dòng này
 
 const sepayTxSchema = new mongoose.Schema({
-  sepayId:        { type: Number, required: true, unique: true },
+  // sepayId:        { type: Number, required: true, unique: true },
   gateway:        String,
   transactionDate:Date,
   accountNumber:  String,
