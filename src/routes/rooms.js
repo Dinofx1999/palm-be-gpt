@@ -5,9 +5,13 @@ const {
   create, update, updateStatus, remove,
 } = require('../controllers/roomController');
 
-router.get('/available',     authenticate, getAvailable);
-router.get('/',              authenticate, getAll);
-router.get('/:id',           authenticate, getOne);
+router.get('/available',     getAvailable);
+router.get('/',              getAll);
+router.get('/:id',           getOne);
+
+// router.get('/available',     authenticate, getAvailable);
+// router.get('/',              authenticate, getAll);
+// router.get('/:id',           authenticate, getOne);
 router.post('/',             authenticate, authorize('Admin', 'Manager'), create);
 router.put('/:id',           authenticate, update);
 router.patch('/:id/status',  authenticate, updateStatus);

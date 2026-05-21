@@ -93,6 +93,7 @@ app.use('/api/public/careers',    require('./routes/publicCareersRoutes'));
 
 // ⭐ NEW 13/05/2026: Module Quy trình Nhân viên
 app.use('/api/procedures',        require('./routes/procedureRoutes'));
+app.use('/api/public', require('./routes/public')); 
 
 // ─────────────────────────────────────────────────────
 // ⭐ NEW 14/05/2026: Module Tài chính (Thu/Chi + Bàn giao ca + Đối soát)
