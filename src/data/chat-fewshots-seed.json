@@ -1,5 +1,25 @@
 [
   {
+    "category": "general",
+    "title": "Khách hỏi loại phòng - tư vấn đầy đủ, nồng hậu (external)",
+    "pattern": "có loại phòng nào, các loại phòng, phòng gì, tư vấn loại phòng, khách sạn có phòng gì",
+    "priority": 13,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Khách sạn có những loại phòng nào?",
+    "assistantOutput": "Dạ khách sạn mình hiện có các loại phòng sau cho anh/chị lựa chọn ạ 😊\n\n**Standard (Phòng Cơ Bản)**\nPhòng tiêu chuẩn ấm cúng, đầy đủ tiện nghi cơ bản — wifi tốc độ cao, máy lạnh, TV, nước nóng. Phù hợp cho cặp đôi hoặc khách công tác.\nSức chứa: 2 người · Giá chỉ từ **350.000đ/đêm**\n\n**Deluxe (Phòng 2 Giường)**\nRộng rãi và thoáng đãng hơn với 2 giường, không gian thoải mái — rất hợp cho nhóm bạn hoặc gia đình nhỏ muốn nghỉ ngơi trọn vẹn.\nSức chứa: 2 người · Giá chỉ từ **450.000đ/đêm**\n\nAnh/chị muốn em gửi vài tấm ảnh để xem qua không ạ? Hoặc cho em biết ngày mình định ở, em báo giá chính xác kèm phòng trống luôn nhé! 😊"
+  },
+  {
+    "category": "general",
+    "title": "Khách hỏi giá loại phòng - báo giá thật + mời đặt",
+    "pattern": "giá phòng, bảng giá, phòng bao nhiêu, giá bao nhiêu một đêm",
+    "priority": 12,
+    "isActive": true,
+    "branchId": null,
+    "userInput": "Bảng giá phòng thế nào?",
+    "assistantOutput": "Dạ em gửi bảng giá phòng cho anh/chị tham khảo nhé ạ:\n\n**Standard (Phòng Cơ Bản)** — từ **350.000đ/đêm**\nTiện nghi đầy đủ, ấm cúng, sức chứa 2 người.\n\n**Deluxe (Phòng 2 Giường)** — từ **450.000đ/đêm**\nRộng rãi, 2 giường, thoáng đãng, sức chứa 2 người.\n\nGiá có thể thay đổi nhẹ tuỳ ngày và số khách ạ. Anh/chị cho em biết ngày nhận - trả phòng và số người, em báo giá chính xác nhất + kiểm tra phòng trống ngay nhé! Mình cũng có thể đặt phòng và thanh toán bằng mã QR ngay trên web luôn ạ 😊"
+  },
+  {
     "category": "booking",
     "title": "Đoàn đông - dùng nhiều phòng cùng loại",
     "pattern": "đoàn đông, nhiều người",

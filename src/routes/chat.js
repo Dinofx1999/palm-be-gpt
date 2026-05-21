@@ -866,6 +866,18 @@ const tools = [{
       },
     },
 
+    // ── BRANCH POLICIES (1 tool) — quy định chi nhánh ────────────
+    {
+      name: 'get_branch_policies',
+      description: 'Lấy QUY ĐỊNH & CHÍNH SÁCH của chi nhánh khách sạn: có cho mang THÚ CƯNG không, NỘI QUY (hút thuốc, giờ giới nghiêm, khách ghé thăm...), CHÍNH SÁCH HUỶ phòng, GIẤY TỜ cần mang khi nhận phòng, GIỜ nhận/trả phòng chuẩn, và DỊCH VỤ đi kèm (bữa sáng, đưa đón, đỗ xe...). DÙNG TOOL NÀY cho MỌI câu hỏi về quy định/được phép/không được phép: "có cho mang chó mèo không", "được hút thuốc trong phòng không", "huỷ phòng có mất tiền không", "cần mang CMND/CCCD không", "mấy giờ nhận phòng", "có bữa sáng không", "nội quy khách sạn", "chính sách của khách sạn". Cả khách (external) lẫn nhân viên đều dùng được.',
+      parameters: {
+        type: 'object',
+        properties: {
+          branchName: { type: 'string', description: 'Tên/mã chi nhánh (CHỈ truyền nếu user nói rõ; bình thường để trống = chi nhánh hiện tại)' },
+        },
+      },
+    },
+
     // ── AMENITY (1 tool) ──────────────────────────────────────────
     {
       name: 'list_amenities',
@@ -966,6 +978,57 @@ const endOfToday = () => {
 
 const makeHandlers = (ctx) => ({
 
+
+  async get_branch_policies({ branchName } = {}) {
+    // Cho phép CẢ external (khách trên landing) — đây là thông tin công khai
+    let branchId = await resolveBranchId(ctx, branchName);
+ 
+    // External hoặc chưa xác định branch → lấy branch của ctx, hoặc branch active đầu tiên
+    if (!branchId) branchId = ctx.userBranchId || null;
+    const branch = branchId
+      ? await Branch.findById(branchId).lean()
+      : await Branch.findOne({ status: { $ne: 'inactive' } }).lean();
+ 
+    if (!branch) {
+      return { error: 'no_branch', message: 'Chưa xác định được chi nhánh để tra quy định.' };
+    }
+ 
+    const qp = branch.quotePolicy || {};
+    const services = Array.isArray(qp.includedServices)
+      ? qp.includedServices.filter(s => s && s.name).map(s => ({
+          name: s.name,
+          icon: s.icon || '✓',
+          description: s.description || null,
+          isFree: s.isFree !== false,
+          price: s.isFree === false ? s.price : 0,
+          priceFormatted: (s.isFree === false && s.price) ? fmt(s.price) : 'Miễn phí',
+        }))
+      : [];
+ 
+    // Gom các text quy định, bỏ field rỗng
+    const policies = {};
+    if (qp.hotelRules && qp.hotelRules.trim())          policies.hotelRules = qp.hotelRules.trim();
+    if (qp.cancellationPolicy && qp.cancellationPolicy.trim()) policies.cancellationPolicy = qp.cancellationPolicy.trim();
+    if (qp.requiredDocuments && qp.requiredDocuments.trim())   policies.requiredDocuments = qp.requiredDocuments.trim();
+ 
+    const hasAnyPolicy = Object.keys(policies).length > 0 || services.length > 0;
+ 
+    return {
+      branch: branch.name,
+      checkInTime:  branch.checkInTime  || '14:00',
+      checkOutTime: branch.checkOutTime || '12:00',
+      toleranceMinutes: branch.toleranceMinutes ?? 15,
+      // Các quy định dạng text (chỉ có khi đã nhập)
+      hotelRules:         policies.hotelRules || null,
+      cancellationPolicy: policies.cancellationPolicy || null,
+      requiredDocuments:  policies.requiredDocuments || null,
+      includedServices:   services,
+      hasPolicies: hasAnyPolicy,
+      _hint: hasAnyPolicy
+        ? 'Trả lời TRỰC TIẾP, ẤM ÁP, tự nhiên như lễ tân thật — KHÔNG cụt lủn. DỰA TRÊN dữ liệu ở trên: thú cưng/hút thuốc/giới nghiêm → hotelRules; huỷ phòng → cancellationPolicy; giấy tờ → requiredDocuments; giờ → checkInTime/checkOutTime (kèm mời thêm: nhận sớm/trả muộn có thể linh hoạt, hỏi em nhé); bữa sáng/đưa đón/đỗ xe → includedServices. Khi báo giờ, đừng chỉ nói "14:00/12:00" cụt — thêm chút thân thiện, vd "Dạ khách sạn mình nhận phòng từ 14:00 và trả phòng trước 12:00 hôm sau ạ. Nếu anh/chị cần nhận sớm hay trả muộn thì báo em, em xem giúp mình nhé! 😊". TUYỆT ĐỐI không bịa. Nếu khách hỏi điều KHÔNG có trong dữ liệu → "Dạ phần này em chưa có thông tin chính thức, để chắc chắn anh/chị nhắn lễ tân giúp em nhé ạ".'
+        : 'Chi nhánh CHƯA cấu hình quy định chi tiết. Vẫn báo giờ nhận/trả chuẩn ở trên một cách ấm áp. Với câu hỏi khác chưa có dữ liệu → "Dạ phần này em chưa có thông tin chi tiết, anh/chị nhắn lễ tân giúp em để được tư vấn chính xác nhé ạ".',
+    };
+  },
   // ── 1. Tổng quan phòng ──
   async get_rooms_overview({ branchName, status }) {
     // ⭐ External: chỉ thấy "còn phòng hay không", không có chi tiết
@@ -3764,6 +3827,19 @@ PHẢI HỎI: "Anh xác nhận hủy booking này không? Vui lòng cho em biế
 
   // ── 14. ⭐ Ảnh phòng ──
   async get_room_images({ roomTypeName, roomNumber, branchName, maxImages = 6 }) {
+    // ⭐ EXTERNAL: chỉ cho xem ảnh theo LOẠI PHÒNG, KHÔNG theo phòng cụ thể.
+    //   Khách không được biết số phòng → bỏ qua roomNumber, ép dùng roomTypeName.
+    if (!ctx.isInternal) {
+      if (roomNumber && !roomTypeName) {
+        return {
+          error: 'external_room_number_not_allowed',
+          message: 'Dạ em gửi ảnh theo loại phòng cho mình nhé (vd Standard, Deluxe, Suite). Anh/chị muốn xem ảnh loại phòng nào ạ?',
+        };
+      }
+      // Nếu lỡ truyền cả 2 → bỏ roomNumber, chỉ dùng loại phòng
+      roomNumber = undefined;
+    }
+
     const branchId = await resolveBranchId(ctx, branchName);
     const limit = Math.min(maxImages || 6, 12);
 

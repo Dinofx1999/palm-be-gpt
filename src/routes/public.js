@@ -29,9 +29,37 @@ const Customer      = require('../models/Customer');
 const PricePolicy   = require('../models/PricePolicy');
 const PaymentMethod = require('../models/PaymentMethod');
 const Invoice       = require('../models/Invoice');
+const User          = require('../models/User');
+
+// Cache user hệ thống (Admin/Manager) để gán issuedBy cho invoice web.
+//   Lý do: Transaction.recordedBy là required. SePay ghi tiền với userId=null,
+//   nên recorder lấy từ invoice.issuedBy. Booking web không có user đăng nhập →
+//   cần gán 1 user hệ thống, nếu không syncInvoicePayment fail (không tạo Transaction).
+let _systemUserCache = { id: null, at: 0 };
+async function resolveSystemUserId(branchId) {
+  // Cache 5 phút
+  if (_systemUserCache.id && Date.now() - _systemUserCache.at < 300000) {
+    return _systemUserCache.id;
+  }
+  try {
+    // Ưu tiên Admin/Manager cùng chi nhánh, fallback bất kỳ Admin
+    let u = await User.findOne({
+      role: { $in: ['Admin', 'Manager'] },
+      branchId,
+    }).select('_id').lean();
+    if (!u) u = await User.findOne({ role: 'Admin' }).select('_id').lean();
+    if (!u) u = await User.findOne({}).select('_id').lean();   // cùng đường mới có
+    const id = u?._id ?? null;
+    _systemUserCache = { id, at: Date.now() };
+    return id;
+  } catch (e) {
+    console.warn('[public] resolveSystemUserId failed:', e.message);
+    return null;
+  }
+}
 
 // ─── Thời gian giữ chỗ trước khi tự huỷ (phút) ───
-const HOLD_MINUTES = 10;
+const HOLD_MINUTES = 3;
 
 // ─── Map tên ngân hàng → BIN (cho VietQR) khi paymentMethod thiếu bankBin ───
 const BANK_BIN_MAP = {
@@ -210,6 +238,60 @@ async function findAvailableRooms({ branchId, roomTypeId, ci, co, adults, childr
 }
 
 // ════════════════════════════════════════════════════════════════════
+// HELPER: tính giá + breakdown cho 1 phòng (dùng chung cho /quote và /bookings)
+//   Trả { roomAmount, priceBreakdown:[{label,amount,type,meta}], finalPriceType, policy }
+// ════════════════════════════════════════════════════════════════════
+async function computeQuote({ room, branch, ci, co, adults, children }) {
+  const roomType = room.typeId;   // đã populate
+  const nights = Math.max(1, Math.ceil((co - ci) / 86400000));
+
+  let policy = null;
+  try {
+    policy = await PricePolicy.findOne({
+      roomTypeId: room.typeId?._id ?? room.typeId,
+      branchId: branch._id,
+      isActive: true,
+    }).sort({ displayOrder: 1 });
+  } catch (_) { /* ignore */ }
+
+  let roomAmount = 0;
+  let priceBreakdown = [];
+  let finalPriceType = 'day';
+  try {
+    if (calculatePrice && policy) {
+      const maxAdults    = roomType?.maxAdults   ?? 2;
+      const maxChildren  = roomType?.maxChildren ?? 0;
+      const maxOccupancy = roomType?.maxOccupancy ?? (maxAdults + maxChildren);
+      const r = calculatePrice({
+        checkIn: ci, checkOut: co, priceType: 'day',
+        policy, branch,
+        adults: Number(adults) || 0, children: Number(children) || 0,
+        maxAdults, maxChildren, maxOccupancy,
+      });
+      if (!r.error) {
+        roomAmount = r.roomAmount || 0;
+        priceBreakdown = (r.breakdown || []).map((b) => ({
+          label: b.label, amount: b.amount,
+          type: b.type === 'surcharge' ? 'surcharge' : 'base',
+          meta: b.meta || {},
+        }));
+        finalPriceType = r.finalPriceType || 'day';
+      }
+    }
+    if (roomAmount === 0) {
+      roomAmount = (policy?.dayPrice || 0) * nights;
+      if (priceBreakdown.length === 0 && roomAmount > 0) {
+        priceBreakdown = [{ label: `Giá ngày × ${nights} đêm`, amount: roomAmount, type: 'base', meta: {} }];
+      }
+    }
+  } catch (e) {
+    console.warn('[public] computeQuote fail:', e.message);
+    roomAmount = (policy?.dayPrice || 0) * nights;
+  }
+  return { roomAmount, priceBreakdown, finalPriceType, policy, nights };
+}
+
+// ════════════════════════════════════════════════════════════════════
 // POST /api/public/availability
 //   body: { branchId, checkIn, checkOut, adults, children, roomTypeId? }
 // ════════════════════════════════════════════════════════════════════
@@ -280,7 +362,10 @@ router.post('/bookings', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Ngày không hợp lệ' });
     if (co <= ci)
       return res.status(400).json({ success: false, message: 'Ngày trả phải sau ngày nhận' });
-    if (ci.getTime() < Date.now() - 60_000)
+    // Chỉ chặn nếu NGÀY nhận đã là quá khứ (hôm qua trở về trước).
+    //   Không chặn theo giờ: khách đặt cho hôm nay là hợp lệ kể cả khi giờ chuẩn (14:00) đã trôi qua.
+    const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+    if (ci.getTime() < startOfToday.getTime())
       return res.status(400).json({ success: false, message: 'Ngày nhận phòng đã qua' });
 
     // Tự tìm phòng trống
@@ -294,51 +379,8 @@ router.post('/bookings', async (req, res, next) => {
       });
 
     const room = available[0];
-    const roomType = room.typeId; // đã populate
-    const nights = Math.max(1, Math.ceil((co - ci) / 86400000));
-
-    // Resolve policy giá ngày của loại phòng tại chi nhánh
-    let policy = null;
-    try {
-      policy = await PricePolicy.findOne({
-        roomTypeId: room.typeId?._id ?? room.typeId,
-        branchId: branch._id,
-        isActive: true,
-      }).sort({ displayOrder: 1 });
-    } catch (_) { /* ignore */ }
-
-    // Tính giá: calculatePrice nếu có, fallback dayPrice × nights
-    let roomAmount = 0;
-    let priceBreakdown = [];
-    let finalPriceType = 'day';
-    try {
-      if (calculatePrice && policy) {
-        const maxAdults    = roomType?.maxAdults   ?? 2;
-        const maxChildren  = roomType?.maxChildren ?? 0;
-        const maxOccupancy = roomType?.maxOccupancy ?? (maxAdults + maxChildren);
-        const r = calculatePrice({
-          checkIn: ci, checkOut: co, priceType: 'day',
-          policy, branch,
-          adults: Number(adults) || 0, children: Number(children) || 0,
-          maxAdults, maxChildren, maxOccupancy,
-        });
-        if (!r.error) {
-          roomAmount = r.roomAmount || 0;
-          priceBreakdown = (r.breakdown || []).map((b) => ({
-            label: b.label, amount: b.amount,
-            type: b.type === 'surcharge' ? 'surcharge' : 'base',
-            meta: b.meta || {},
-          }));
-          finalPriceType = r.finalPriceType || 'day';
-        }
-      }
-      if (roomAmount === 0) {
-        roomAmount = (policy?.dayPrice || 0) * nights;
-      }
-    } catch (e) {
-      console.warn('[public/bookings] price calc fail:', e.message);
-      roomAmount = (policy?.dayPrice || 0) * nights;
-    }
+    const { roomAmount, priceBreakdown, finalPriceType, policy, nights } =
+      await computeQuote({ room, branch, ci, co, adults, children });
 
     // Tạo / tìm customer theo phone
     const phoneClean = String(customerPhone).trim();
@@ -395,7 +437,11 @@ router.post('/bookings', async (req, res, next) => {
 
     // ⭐ Tạo Invoice ngay (để SePay /sepay/match có chỗ ghi tiền khi khách CK).
     //   Booking website không qua flow drawer nên cần tạo invoice chủ động ở đây.
+    //   ⚠ PHẢI set issuedBy = 1 user hệ thống: vì Transaction.recordedBy là required,
+    //     mà SePay ghi tiền với userId=null → recorder lấy từ invoice.issuedBy.
+    //     Thiếu issuedBy → syncInvoicePayment fail → KHÔNG tạo giao dịch Thu/Chi.
     try {
+      const systemUserId = await resolveSystemUserId(branch._id);
       await Invoice.create({
         bookingId: booking._id,
         customerId: customer._id,
@@ -409,6 +455,7 @@ router.post('/bookings', async (req, res, next) => {
         remainingAmount: roomAmount,
         paymentStatus: 'unpaid',
         branchId: branch._id,
+        issuedBy: systemUserId,           // ⭐ để Transaction.recordedBy có giá trị
         items: [{
           description: `Tiền phòng ${room.number} (${room.typeName})`,
           quantity: 1,
@@ -455,6 +502,60 @@ router.post('/bookings', async (req, res, next) => {
       bookingPart,                        // mã booking đã chuẩn hoá (dùng poll)
       transferContent,                    // nội dung CK đầy đủ "<bookingPart> <payCode>"
       message: `Đặt phòng thành công! Vui lòng thanh toán trong ${HOLD_MINUTES} phút để giữ phòng.`,
+    });
+  } catch (err) { next(err); }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// POST /api/public/quote
+//   body: { branchId, checkIn, checkOut, adults, children, roomTypeId? }
+//   → trả giá + chi tiết phụ thu cho loại phòng (tự chọn phòng trống đầu tiên)
+// ════════════════════════════════════════════════════════════════════
+router.post('/quote', async (req, res, next) => {
+  try {
+    const { branchId, checkIn, checkOut, adults = 2, children = 0, roomTypeId } = req.body || {};
+    if (!checkIn || !checkOut)
+      return res.status(400).json({ success: false, message: 'Thiếu ngày nhận/trả phòng' });
+
+    const branch = branchId
+      ? await Branch.findById(branchId).lean()
+      : await Branch.findOne({ status: 'active' }).lean();
+    if (!branch)
+      return res.status(400).json({ success: false, message: 'Không xác định được chi nhánh' });
+
+    const ciStr = branch.checkInTime || '14:00';
+    const coStr = branch.checkOutTime || '12:00';
+    const ci = isOnlyDate(checkIn) ? setTime(checkIn + 'T00:00:00', ciStr) : new Date(checkIn);
+    const co = isOnlyDate(checkOut) ? setTime(checkOut + 'T00:00:00', coStr) : new Date(checkOut);
+    if (isNaN(ci) || isNaN(co) || co <= ci)
+      return res.status(400).json({ success: false, message: 'Ngày/giờ không hợp lệ' });
+
+    const available = await findAvailableRooms({
+      branchId: String(branch._id), roomTypeId, ci, co, adults, children,
+    });
+    if (available.length === 0)
+      return res.status(409).json({ success: false, message: 'Đã hết phòng cho khoảng thời gian này', soldOut: true });
+
+    const room = available[0];
+    const { roomAmount, priceBreakdown, finalPriceType, nights } =
+      await computeQuote({ room, branch, ci, co, adults, children });
+
+    // Tách base vs phụ thu để FE hiển thị rõ
+    const surcharges = priceBreakdown.filter((b) => b.type === 'surcharge' && (b.amount || 0) !== 0);
+    const baseItems  = priceBreakdown.filter((b) => b.type !== 'surcharge');
+
+    res.json({
+      success: true,
+      roomType: room.typeName,
+      roomNumber: room.number,
+      nights,
+      priceType: finalPriceType,
+      roomAmount,
+      roomAmountFormatted: fmt(roomAmount),
+      breakdown: priceBreakdown,    // đầy đủ [{label, amount, type}]
+      baseItems,                    // các dòng giá nền
+      surcharges,                   // chỉ phụ thu (có thể rỗng)
+      totalAvailable: available.length,
     });
   } catch (err) { next(err); }
 });
