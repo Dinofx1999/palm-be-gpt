@@ -170,6 +170,30 @@ router.get('/sepay/match', async (req, res) => {
       console.error('[sepay/match] syncInvoicePayment failed (non-fatal):', syncErr.message);
     }
 
+    // ⭐ Ghi AUDIT cho thanh toán tự động qua SePay (→ kéo theo gửi Telegram).
+    //   Bọc try/catch riêng — lỗi audit KHÔNG ảnh hưởng việc đã ghi tiền.
+    try {
+      const { logAction } = require('../utils/auditLogger');
+      await logAction({
+        entityType: 'Invoice',
+        entityId:   invoice._id,
+        action:     'payment',
+        description: `Thanh toán QR tự động (SePay) ${new Intl.NumberFormat('vi-VN').format(addedTotal)}đ`
+          + (addedCount > 1 ? ` — ${addedCount} giao dịch` : ''),
+        user:       { fullName: 'SePay (tự động)' },
+        branchId:   booking.branchId || null,
+        metadata: {
+          bookingCode:   booking.bookingCode,
+          roomNumber:    booking.roomNumber,
+          amount:        addedTotal,
+          paymentStatus: invoice.paymentStatus,
+          source:        'sepay',
+        },
+      });
+    } catch (auditErr) {
+      console.error('[sepay/match] audit failed (non-fatal):', auditErr.message);
+    }
+
     return res.json({
       success: true,
       data: {

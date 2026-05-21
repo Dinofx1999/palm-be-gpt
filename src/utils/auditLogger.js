@@ -41,6 +41,19 @@ async function logAction(params) {
       after,
       branchId,
     })
+
+    // ⭐ Gửi thông báo về Telegram (non-blocking, qua queue).
+    //   Bọc try/catch riêng để lỗi Telegram KHÔNG ảnh hưởng việc ghi audit.
+    try {
+      const { notifyAudit } = require('../controllers/telegramController')
+      notifyAudit({
+        entityType, entityId, action, description,
+        userName: user?.fullName ?? user?.username ?? '',
+        metadata,
+      })
+    } catch (tgErr) {
+      console.error('[AuditLog] telegram notify failed (non-fatal):', tgErr.message)
+    }
   } catch (err) {
     // Audit log không nên crash flow chính
     console.error('[AuditLog] failed to log:', err.message)
