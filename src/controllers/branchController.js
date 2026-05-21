@@ -36,10 +36,19 @@ const update = async (req, res, next) => {
       'dayEquivalentHours', 'earlyCheckinUntil',
       'autoConvertPriceType',
       'quotePolicy','hourBookingCutoffEnabled','hourBookingCutoffStart','hourBookingCutoffEnd',
-      'latitude', 'longitude', 'geofenceRadius'                              // ⭐ THÊM dòng này
+      'latitude', 'longitude', 'geofenceRadius',                              // ⭐ THÊM dòng này
+      'images', 'coverImage',                                                 // ⭐ NEW: ảnh chi nhánh
     ]
     const payload = {}
     allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })
+
+    // ⭐ Nếu cập nhật images mà coverImage trống → lấy ảnh đầu làm mặc định
+    //   (findByIdAndUpdate không chạy pre-save hook nên xử lý ở đây)
+    if (Array.isArray(payload.images) && payload.images.length > 0
+        && (payload.coverImage === undefined || !String(payload.coverImage).trim())) {
+      const cur = await Branch.findById(req.params.id).select('coverImage').lean();
+      if (!cur?.coverImage) payload.coverImage = payload.images[0];
+    }
 
     const branch = await Branch.findByIdAndUpdate(
       req.params.id, payload, { new: true, runValidators: true }

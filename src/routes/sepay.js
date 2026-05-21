@@ -6,16 +6,11 @@
 //   - Trạng thái: paymentStatus ('unpaid' | 'partial' | 'paid')
 //   - Lịch sử thanh toán: mảng con payments[]
 //
-// 2 endpoint:
-//   1) POST /sepay/webhook  — SePay đẩy giao dịch vào, lưu SepayTransaction
-//                             (chỉ LƯU, không ghi invoice ở đây)
-//   2) GET  /sepay/match    — FE (QRPaymentModal) polling: tìm SepayTransaction
-//                             khớp <bookingCode> + <payCode> (số tiền: ghi đúng thực tế).
-//                             Khớp → ghi payment vào invoice → trả paid=true.
-//
-// Ý tưởng (theo yêu cầu): nội dung CK = "BKYCDMHF 166563"
-//   - BKYCDMHF: xác định booking
-//   - 166563:   mã giao dịch ngẫu nhiên, xác định ĐÚNG giao dịch hiện tại
+// Endpoint:
+//   1) POST /sepay/webhook            — SePay đẩy giao dịch vào, lưu SepayTransaction
+//   2) GET  /sepay/match              — FE polling: khớp <bookingCode> + <payCode>
+//   3) GET  /sepay/transactions       — [NEW] liệt kê/tra cứu giao dịch (cho PMS)
+//   4) GET  /sepay/transactions/stats — [NEW] thống kê nhanh
 // ════════════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -23,6 +18,7 @@ const router = express.Router();
 const Invoice = require('../models/Invoice');
 const Booking = require('../models/Booking');
 const SepayTransaction = require('../models/SepayTransaction');
+const { authenticate } = require('../middleware/auth');
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -51,7 +47,6 @@ function verifySepay(req, res, next) {
 
 // ════════════════════════════════════════════════════════════════════
 // 1) WEBHOOK — SePay đẩy giao dịch vào. Chỉ LƯU SepayTransaction.
-//    Việc khớp + ghi invoice để cho /sepay/match xử lý (theo payCode).
 // ════════════════════════════════════════════════════════════════════
 router.post('/sepay/webhook', verifySepay, async (req, res) => {
   const data = req.body;
@@ -63,7 +58,6 @@ router.post('/sepay/webhook', verifySepay, async (req, res) => {
   }
 
   try {
-    // Lưu giao dịch. Unique index trên sepayId chống trùng khi SePay retry.
     await SepayTransaction.create({
       sepayId:         data.id,
       gateway:         data.gateway,
@@ -80,7 +74,6 @@ router.post('/sepay/webhook', verifySepay, async (req, res) => {
     return res.json({ success: true, message: 'Saved' });
   } catch (err) {
     if (err.code === 11000) {
-      // Đã lưu rồi (retry) → vẫn trả 200 để SePay dừng gửi lại
       return res.json({ success: true, message: 'Already saved' });
     }
     console.error('SePay webhook error:', err);
@@ -89,9 +82,7 @@ router.post('/sepay/webhook', verifySepay, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-// 2) MATCH — FE polling: GET /sepay/match?bookingCode=BKYCDMHF&payCode=166563
-//    Tìm SepayTransaction khớp cả 3 điều kiện, chưa khớp invoice nào →
-//    ghi payment vào invoice của booking, đánh dấu giao dịch đã khớp.
+// 2) MATCH — FE polling khớp giao dịch theo bookingCode + payCode.
 // ════════════════════════════════════════════════════════════════════
 router.get('/sepay/match', async (req, res) => {
   try {
@@ -100,23 +91,15 @@ router.get('/sepay/match', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Thiếu bookingCode' });
     }
 
-    const wantBooking = normalize(bookingCode);          // "BKD9CMKA"
+    const wantBooking = normalize(bookingCode);
 
-    // Tìm các giao dịch tiền vào CHƯA khớp invoice nào.
-    //   ⭐ KHÔNG lọc theo số tiền — khách chuyển bao nhiêu ghi bấy nhiêu.
     const candidates = await SepayTransaction.find({
       transferType: 'in',
       matchedInvoice: null,
     })
-      .sort({ createdAt: 1 })   // cũ trước → ghi tiền theo đúng thứ tự khách chuyển
+      .sort({ createdAt: 1 })
       .limit(50);
 
-    // ⭐ Khớp: content chứa mã booking. payCode CHỈ siết thêm NẾU giao dịch có chứa
-    //   (để không bỏ sót giao dịch khách quên/sai payCode). matchedInvoice đã chống
-    //   ghi trùng, nên cứ tiền nào của booking này chưa ghi thì ghi → bền cho nhiều lần TT.
-    // ⭐ Lọc TẤT CẢ giao dịch của booking này (content chứa mã booking).
-    //   matchedInvoice đã chống ghi trùng, nên cứ tiền nào của booking chưa ghi thì ghi.
-    //   Ghi nhiều giao dịch một lần → khách trả dồn 2-3 lần vẫn vào đủ.
     const matchedList = candidates.filter(tx => {
       const c = normalize(tx.content);
       return c.includes(wantBooking);
@@ -126,7 +109,6 @@ router.get('/sepay/match', async (req, res) => {
       return res.json({ success: true, data: { paid: false } });
     }
 
-    // Tìm booking → invoice (Invoice nối Booking qua bookingId)
     const booking = await Booking.findOne({
       $expr: {
         $eq: [
@@ -146,7 +128,6 @@ router.get('/sepay/match', async (req, res) => {
       return res.json({ success: true, data: { paid: false, reason: 'invoice_not_found' } });
     }
 
-    // ⭐ Ghi TỪNG giao dịch khớp vào payments[], cộng dồn paidAmount
     let addedTotal = 0;
     const addedCount = matchedList.length;
     for (const tx of matchedList) {
@@ -159,18 +140,12 @@ router.get('/sepay/match', async (req, res) => {
       });
       invoice.paidAmount = (invoice.paidAmount || 0) + tx.transferAmount;
       addedTotal += tx.transferAmount;
-      // đánh dấu đã khớp ngay để lần polling sau không ghi lại
       tx.matchedInvoice = invoice._id;
     }
     recomputeInvoice(invoice);
     await invoice.save();
-    // lưu trạng thái đã khớp cho tất cả giao dịch
     await Promise.all(matchedList.map(tx => tx.save()));
 
-    // ⭐ Tạo phiếu Thu/Chi (Transaction) cho từng payment vừa ghi.
-    //   Lấy đúng N payment CUỐI mảng (vừa push ở trên) — lúc này đã có _id sau save.
-    //   Không có user đăng nhập (chạy nền) → userId: null.
-    //   Bọc try/catch: lỗi sync KHÔNG chặn việc ghi tiền (non-fatal).
     try {
       const { syncInvoicePayment } = require('../utils/invoiceTransactionHelper');
       const Transaction = require('../models/Transaction');
@@ -181,9 +156,6 @@ router.get('/sepay/match', async (req, res) => {
         await syncInvoicePayment(invoice, p, { userId: null });
       }
 
-      // ⭐ ĐỐI SOÁT TỰ ĐỘNG: giao dịch do SePay khớp = tiền đã thực vào + đúng hoá đơn
-      //   → đánh dấu Transaction tương ứng isReconciled = true ngay,
-      //     nhân viên không cần đối soát tay nữa.
       await Transaction.updateMany(
         { relatedType: 'invoice_payment', relatedId: { $in: newPaymentIds } },
         {
@@ -203,8 +175,8 @@ router.get('/sepay/match', async (req, res) => {
       data: {
         paid: true,
         invoiceId:       invoice._id,
-        amount:          addedTotal,            // tổng tiền vừa ghi lần này
-        count:           addedCount,            // số giao dịch vừa khớp
+        amount:          addedTotal,
+        count:           addedCount,
         paidAmount:      invoice.paidAmount,
         remainingAmount: invoice.remainingAmount,
         paymentStatus:   invoice.paymentStatus,
@@ -212,6 +184,156 @@ router.get('/sepay/match', async (req, res) => {
     });
   } catch (err) {
     console.error('SePay match error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 3) [NEW] LIST/TRA CỨU GIAO DỊCH — cho trang quản lý giao dịch ngân hàng (PMS)
+//    GET /sepay/transactions
+//    Query:
+//      - q:        tìm trong content / referenceCode / gateway (không phân biệt hoa thường)
+//      - status:   'matched' | 'unmatched' (đã/chưa khớp hóa đơn)
+//      - from,to:  lọc theo transactionDate (ISO yyyy-mm-dd)
+//      - gateway:  lọc theo ngân hàng
+//      - page,limit: phân trang (mặc định 1 / 20, tối đa 100)
+// ════════════════════════════════════════════════════════════════════
+router.get('/sepay/transactions', authenticate, async (req, res) => {
+  try {
+    const { q, status, from, to, gateway } = req.query;
+    const page  = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+
+    const filter = { transferType: 'in' };
+
+    if (status === 'matched')   filter.matchedInvoice = { $ne: null };
+    if (status === 'unmatched') filter.matchedInvoice = null;
+    if (gateway) filter.gateway = gateway;
+
+    if (from || to) {
+      filter.transactionDate = {};
+      if (from) filter.transactionDate.$gte = new Date(from);
+      if (to) {
+        const end = new Date(to);
+        // Nếu 'to' chỉ là ngày (không có giờ — vd "2026-05-21") → tính tới hết ngày.
+        // Nếu có giờ (ISO chứa 'T' với phần time) → dùng nguyên giờ đó.
+        const hasTime = /T\d{2}:\d{2}/.test(String(to));
+        if (!hasTime) end.setHours(23, 59, 59, 999);
+        filter.transactionDate.$lte = end;
+      }
+    }
+
+    if (q && q.trim()) {
+      const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [{ content: rx }, { referenceCode: rx }, { gateway: rx }];
+    }
+
+    const total = await SepayTransaction.countDocuments(filter);
+    const items = await SepayTransaction.find(filter)
+      .sort({ transactionDate: -1, createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate({ path: 'matchedInvoice', select: 'invoiceNumber bookingId totalAmount paidAmount paymentStatus' })
+      .lean();
+
+    // Gắn thêm bookingCode cho giao dịch đã khớp (tiện hiển thị)
+    const invoiceBookingIds = items
+      .map(t => t.matchedInvoice?.bookingId)
+      .filter(Boolean);
+    let bookingMap = {};
+    if (invoiceBookingIds.length) {
+      const bookings = await Booking.find({ _id: { $in: invoiceBookingIds } })
+        .select('bookingCode customerName').lean();
+      bookingMap = Object.fromEntries(bookings.map(b => [String(b._id), b]));
+    }
+
+    const data = items.map(t => ({
+      _id:             t._id,
+      sepayId:         t.sepayId,
+      gateway:         t.gateway,
+      transactionDate: t.transactionDate,
+      accountNumber:   t.accountNumber,
+      content:         t.content,
+      transferAmount:  t.transferAmount,
+      accumulated:     t.accumulated,
+      referenceCode:   t.referenceCode,
+      isMatched:       !!t.matchedInvoice,
+      matchedInvoice:  t.matchedInvoice ? {
+        invoiceNumber:  t.matchedInvoice.invoiceNumber,
+        totalAmount:    t.matchedInvoice.totalAmount,
+        paidAmount:     t.matchedInvoice.paidAmount,
+        paymentStatus:  t.matchedInvoice.paymentStatus,
+        bookingCode:    bookingMap[String(t.matchedInvoice.bookingId)]?.bookingCode || null,
+        customerName:   bookingMap[String(t.matchedInvoice.bookingId)]?.customerName || null,
+      } : null,
+      createdAt:       t.createdAt,
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        data,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (err) {
+    console.error('SePay transactions list error:', err);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 4) [NEW] THỐNG KÊ NHANH — tổng quan giao dịch
+//    GET /sepay/transactions/stats?from=&to=&q=&status=&gateway=
+// ════════════════════════════════════════════════════════════════════
+router.get('/sepay/transactions/stats', authenticate, async (req, res) => {
+  try {
+    const { from, to, q, gateway } = req.query;
+    const match = { transferType: 'in' };
+
+    // Lưu ý: KHÔNG lọc theo 'status' ở stats — để 3 thẻ luôn phản ánh đủ
+    //   (tổng / đã khớp / chưa khớp) trong phạm vi tìm kiếm. Lọc status chỉ
+    //   áp dụng cho bảng danh sách, không áp cho thống kê.
+    if (gateway) match.gateway = gateway;
+
+    if (q && q.trim()) {
+      const rx = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      match.$or = [{ content: rx }, { referenceCode: rx }, { gateway: rx }];
+    }
+
+    if (from || to) {
+      match.transactionDate = {};
+      if (from) match.transactionDate.$gte = new Date(from);
+      if (to) { const end = new Date(to); if (!/T\d{2}:\d{2}/.test(String(to))) end.setHours(23, 59, 59, 999); match.transactionDate.$lte = end; }
+    }
+
+    const rows = await SepayTransaction.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: null,
+          totalCount:     { $sum: 1 },
+          totalAmount:    { $sum: '$transferAmount' },
+          matchedCount:   { $sum: { $cond: [{ $ne: ['$matchedInvoice', null] }, 1, 0] } },
+          matchedAmount:  { $sum: { $cond: [{ $ne: ['$matchedInvoice', null] }, '$transferAmount', 0] } },
+          unmatchedCount: { $sum: { $cond: [{ $eq: ['$matchedInvoice', null] }, 1, 0] } },
+          unmatchedAmount:{ $sum: { $cond: [{ $eq: ['$matchedInvoice', null] }, '$transferAmount', 0] } },
+        },
+      },
+    ]);
+
+    const s = rows[0] || {
+      totalCount: 0, totalAmount: 0, matchedCount: 0, matchedAmount: 0,
+      unmatchedCount: 0, unmatchedAmount: 0,
+    };
+    delete s._id;
+
+    return res.json({ success: true, data: s });
+  } catch (err) {
+    console.error('SePay stats error:', err);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });

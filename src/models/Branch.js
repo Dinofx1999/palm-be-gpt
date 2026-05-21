@@ -17,6 +17,11 @@ const branchSchema = new mongoose.Schema({
   // Ví dụ: tolerance 15 phút trước/sau giờ chuẩn → không tính phụ thu
   toleranceMinutes:    { type: Number, default: 15 },
 
+  // Ngưỡng (giờ) để tự chuyển giữa giá Giờ ↔ giá Ngày
+  // Nếu user chọn giá Ngày mà ở < ngưỡng này → auto chuyển sang giá Giờ
+  // Nếu user chọn giá Giờ mà ở >= ngưỡng này (cùng ngày) → đề xuất giá Ngày
+  hourToDayThreshold:  { type: Number, default: 3 },
+
   // Khi auto-convert sang giá Ngày, chú thích "đã tính tròn 1 ngày"
   // Vd: dayEquivalentHours = 23 → khách trả phòng vượt 23:00 sẽ tự cộng thêm 1 đêm
   dayEquivalentHours:  { type: Number, default: 23 },
@@ -46,6 +51,14 @@ const branchSchema = new mongoose.Schema({
   latitude: { type: Number, default: null },         // ⭐ THÊM
   longitude: { type: Number, default: null },        // ⭐ THÊM
   geofenceRadius: { type: Number, default: 100 },    // ⭐ THÊM (mét)
+
+  // ⭐ NEW: Hình ảnh chi nhánh
+  //   images:     danh sách URL ảnh (mặt tiền, sảnh, không gian...)
+  //   coverImage: ảnh đại diện mặc định (hiển thị trên card chọn chi nhánh, hero...).
+  //               Nếu rỗng, FE tự fallback về images[0].
+  images:     { type: [String], default: [] },
+  coverImage: { type: String, default: '' },
+
   quotePolicy: {
     cancellationPolicy: { type: String, default: '' },
     requiredDocuments:  { type: String, default: '' },
@@ -72,5 +85,14 @@ const branchSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 branchSchema.index({ status: 1 });
+
+// ⭐ Tự đồng bộ coverImage: nếu chưa set mà đã có images → lấy ảnh đầu tiên.
+//   Đảm bảo luôn có 1 ảnh mặc định để hiển thị.
+branchSchema.pre('save', function (next) {
+  if ((!this.coverImage || !this.coverImage.trim()) && Array.isArray(this.images) && this.images.length > 0) {
+    this.coverImage = this.images[0];
+  }
+  next();
+});
 
 module.exports = mongoose.model('Branch', branchSchema);

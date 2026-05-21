@@ -10,6 +10,32 @@ const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 const { computeMoveRoomBreakdown } = require('../utils/moveRoomBreakdown');
 
+// ⭐ FIX 21/05/2026: Làm tròn giờ checkout khi tính "đến hiện tại" (mode 'now')
+//   theo mốc dayEquivalentHours của branch (vd 20:00).
+//   Quy tắc: khi đang xem live và giờ hiện tại đã VƯỢT mốc (vd 23:29 > 20:00),
+//   thì tính tròn thêm 1 đêm → checkout nhảy tới giờ checkout chuẩn của NGÀY HÔM SAU.
+//   Dùng cho nhánh chuyển phòng (computeMoveRoomBreakdown không tự xử lý dayEquiv).
+//   - Chỉ áp dụng mode 'now'. Mode 'checkout' giữ nguyên booking.checkOut.
+//   - Không vượt quá booking.checkOut (overstay đã có block "trả phòng muộn" lo).
+function roundUpCheckoutForNow(effectiveCheckOut, branch, mode, bookingCheckOut) {
+  if (mode !== 'now') return effectiveCheckOut;
+  const dayEquivHours = branch?.dayEquivalentHours ?? 23;
+  const co = new Date(effectiveCheckOut);
+  const hourMin = co.getHours() * 60 + co.getMinutes();
+  if (hourMin < dayEquivHours * 60) return effectiveCheckOut;   // chưa vượt mốc → giữ nguyên
+
+  // Vượt mốc → nhảy tới giờ checkout chuẩn của ngày HÔM SAU
+  const [coH, coM] = String(branch?.checkOutTime || '12:00').split(':').map(Number);
+  const rounded = new Date(co);
+  rounded.setDate(rounded.getDate() + 1);
+  rounded.setHours(coH || 12, coM || 0, 0, 0);
+
+  // Không vượt quá checkout dự kiến của booking
+  const planned = new Date(bookingCheckOut);
+  return rounded > planned ? planned : rounded;
+}
+
+
 // ⭐ NEW 20/05/2026: Tìm policy hourEnabled=true của roomType để lấy bảng giá GIỜ chuẩn.
 //   Dùng khi tính giá giờ cho đoạn chuyển phòng — phải lấy "Giá Nghỉ Giờ" (hourEnabled)
 //   chứ KHÔNG phải policy giá ngày booking đang dùng (vd "Giá Ngày 1" có hourSlots khác).
@@ -3899,8 +3925,12 @@ const calculateBill = async (req, res, next) => {
           //   - effectiveCheckOut < booking.checkOut (trả sớm / past-checkout): dùng
           //     effectiveCheckOut, module tính đến đúng giờ trả sớm, KHÔNG tính dư.
           //   Phiên bản cũ luôn dùng booking.checkOut → tính dư khi past-checkout < planned CO.
-          plannedCheckOut: effectiveCheckOut < new Date(booking.checkOut)
-            ? effectiveCheckOut
+          // ⭐ FIX 21/05/2026: mode 'now' — nếu giờ hiện tại đã VƯỢT mốc dayEquivalentHours
+          //   (vd 20:00) thì làm tròn LÊN giờ checkout chuẩn ngày hôm sau (tính thêm 1 đêm),
+          //   khớp với logic priceCalculator (nhánh thường). computeMoveRoomBreakdown KHÔNG tự
+          //   xử lý dayEquiv nên phải làm tròn ở đây, riêng nhánh chuyển phòng.
+          plannedCheckOut: roundUpCheckoutForNow(effectiveCheckOut, branch, mode, booking.checkOut) < new Date(booking.checkOut)
+            ? roundUpCheckoutForNow(effectiveCheckOut, branch, mode, booking.checkOut)
             : new Date(booking.checkOut),
           transferAt:      new Date(lastTransfer.transferAt),
           oldRoom: {
