@@ -65,40 +65,40 @@ function esc(s) {
 // ── Map action → nhãn tiếng Việt + icon ───────────────────────────────
 const ACTION_LABELS = {
   // Tạo
-  create:            '🟢 Tạo mới',
-  create_group:      '🟢 Tạo nhóm đặt phòng',
-  create_and_checkin:'🟢 Tạo & nhận phòng',
+  create:            'Tạo mới',
+  create_group:      'Tạo nhóm đặt phòng',
+  create_and_checkin:'Tạo & nhận phòng',
   // Nhận / trả phòng
-  checkin:           '🛎️ Nhận phòng',
-  check_in:          '🛎️ Nhận phòng',
-  checkin_room:      '🛎️ Nhận phòng',
-  checkout:          '🧳 Trả phòng',
-  checkout_room:     '🧳 Trả phòng',
+  checkin:           'Nhận phòng',
+  check_in:          'Nhận phòng',
+  checkin_room:      'Nhận phòng',
+  checkout:          'Trả phòng',
+  checkout_room:     'Trả phòng',
   // Sửa
-  update:            '✏️ Cập nhật',
-  change_dates:      '📅 Đổi ngày',
-  change_policy:     '📋 Đổi chính sách giá',
-  update_service_qty:'🔢 Đổi số lượng dịch vụ',
+  update:            'Cập nhật',
+  change_dates:      'Đổi ngày',
+  change_policy:     'Đổi chính sách giá',
+  update_service_qty:'Đổi số lượng dịch vụ',
   // Phòng
-  move_room:         '🔄 Chuyển phòng',
-  transfer:          '🔄 Chuyển phòng',
-  split_room:        '🔀 Tách phòng',
-  merge_group:       '🔗 Gộp nhóm',
-  copy_to_branch:    '📑 Sao chép sang chi nhánh',
+  move_room:         'Chuyển phòng',
+  transfer:          'Chuyển phòng',
+  split_room:        'Tách phòng',
+  merge_group:       'Gộp nhóm',
+  copy_to_branch:    'Sao chép sang chi nhánh',
   // Dịch vụ
-  add_service:       '➕ Thêm dịch vụ',
-  remove_service:    '➖ Bỏ dịch vụ',
+  add_service:       'Thêm dịch vụ',
+  remove_service:    'Bỏ dịch vụ',
   // Tiền
-  payment:           '💰 Thanh toán',
-  edit_payment:      '💳 Sửa thanh toán',
-  cancel_payment:    '🚫 Huỷ thanh toán',
-  refund:            '↩️ Hoàn tiền',
-  apply_discount:    '🏷️ Giảm giá',
+  payment:           'Thanh toán',
+  edit_payment:      'Sửa thanh toán',
+  cancel_payment:    'Huỷ thanh toán',
+  refund:            'Hoàn tiền',
+  apply_discount:    'Giảm giá',
   // Khác
-  cancel:            '❌ Huỷ',
-  delete:            '🗑️ Xoá',
-  undo:              '⏪ Hoàn tác',
-  login:             '🔓 Đăng nhập',
+  cancel:            'Huỷ',
+  delete:            'Xoá',
+  undo:              'Hoàn tác',
+  login:             'Đăng nhập',
 };
 
 // Action → nhãn tiếng Việt khi KHÔNG có trong map (fallback gọn, không icon máy móc)
@@ -116,6 +116,104 @@ const ENTITY_LABELS = {
 };
 
 // ── Format 1 audit log thành tin nhắn Telegram (HTML) ─────────────────
+// ── Nhãn tiếng Việt cho từng field metadata (hiển thị mỗi dòng 1 nhãn) ──
+//   Thứ tự khai báo = thứ tự ưu tiên hiển thị. Field không có trong map sẽ bị bỏ
+//   (tránh hiển thị field kỹ thuật khó hiểu như subRoomId, customBreakdownLen...).
+const FIELD_LABELS = {
+  bookingCode:        'Mã đặt phòng',
+  customerName:       'Khách hàng',
+  roomNumber:         'Phòng',
+  roomNumbers:        'Các phòng',
+  roomCount:          'Số phòng',
+  totalRooms:         'Số phòng',
+  groupName:          'Tên nhóm',
+  // chuyển phòng
+  oldRoomNumber:      'Từ phòng',
+  newRoomNumber:      'Sang phòng',
+  fee:                'Phí',
+  policyChanged:      'Đổi giá',
+  reason:             'Lý do',
+  // ngày giờ
+  oldCheckIn:         'Nhận phòng (cũ)',
+  oldCheckOut:        'Trả phòng (cũ)',
+  checkIn:            'Nhận phòng',
+  checkOut:           'Trả phòng',
+  newCheckIn:         'Nhận phòng mới',
+  newCheckOut:        'Trả phòng mới',
+  actualCheckOut:     'Giờ trả thực tế',
+  nights:             'Số đêm',
+  // chính sách / giá
+  policyName:         'Chính sách giá',
+  // tiền
+  amount:             'Số tiền',
+  method:             'Hình thức',
+  totalAmount:        'Tổng tiền',
+  roomAmount:         'Tiền phòng',
+  newRoomAmount:      'Tiền phòng mới',
+  newTotal:           'Tổng mới',
+  paymentStatus:      'Trạng thái TT',
+  // giảm giá
+  discountPercent:    'Giảm (%)',
+  discountAmount:     'Giảm (số tiền)',
+  totalDiscount:      'Tổng giảm',
+  discountReason:     'Lý do giảm',
+  discountChargedToName: 'Trừ vào',
+  isFreeRoom:         'Miễn phí phòng',
+  // huỷ / hoàn tác
+  prevStatus:         'Trạng thái trước',
+  status:             'Trạng thái',
+  note:               'Ghi chú',
+};
+
+// Field là TIỀN (định dạng x.xxx đ)
+const MONEY_FIELDS = new Set([
+  'fee', 'amount', 'totalAmount', 'roomAmount', 'newRoomAmount', 'newTotal',
+  'totalDiscount', 'discountAmount',
+]);
+// Field là NGÀY GIỜ
+const DATE_FIELDS = new Set([
+  'checkIn', 'checkOut', 'newCheckIn', 'newCheckOut', 'actualCheckOut',
+  'oldCheckIn', 'oldCheckOut',
+]);
+// Field BOOLEAN → Có/Không
+const BOOL_FIELDS = new Set(['policyChanged', 'isFreeRoom']);
+// Map trạng thái → tiếng Việt
+const STATUS_LABELS = {
+  unpaid: 'Chưa thanh toán', partial: 'Một phần', paid: 'Đã thanh toán',
+  pending: 'Chờ', confirmed: 'Đã xác nhận', checked_in: 'Đã nhận phòng',
+  checked_out: 'Đã trả phòng', cancelled: 'Đã huỷ', no_show: 'Không đến',
+};
+
+const fmtMoney = (v) => `${new Intl.NumberFormat('vi-VN').format(Number(v) || 0)}đ`;
+const fmtDate = (v) => {
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return esc(String(v));
+  return d.toLocaleString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric',
+  });
+};
+
+// Format 1 giá trị metadata theo loại field
+function fmtFieldValue(key, val) {
+  if (val === null || val === undefined || val === '') return null;
+  if (MONEY_FIELDS.has(key)) {
+    if (!Number(val)) return null;   // bỏ tiền = 0
+    return fmtMoney(val);
+  }
+  if (DATE_FIELDS.has(key)) return fmtDate(val);
+  if (BOOL_FIELDS.has(key)) return val ? 'Có' : 'Không';
+  if (key === 'paymentStatus' || key === 'status' || key === 'prevStatus') {
+    return STATUS_LABELS[val] || esc(String(val));
+  }
+  if (Array.isArray(val)) {
+    if (val.length === 0) return null;
+    return esc(val.join(', '));
+  }
+  if (key === 'discountPercent') return Number(val) ? `${val}%` : null;
+  return esc(String(val));
+}
+
 function formatAuditMessage(audit) {
   const actionLabel = ACTION_LABELS[audit.action] || actionFallbackLabel(audit.action);
   const entityLabel = ENTITY_LABELS[audit.entityType] || esc(audit.entityType);
@@ -127,43 +225,46 @@ function formatAuditMessage(audit) {
   const m = audit.metadata || {};
   const branchName = audit.branchName ? esc(audit.branchName) : null;
 
-  // ════════════════════════════════════════════════════════════════════
-  // Format CHI TIẾT riêng cho CHUYỂN PHÒNG (mỗi thông tin 1 dòng, dễ nhìn)
-  // ════════════════════════════════════════════════════════════════════
-  if (audit.action === 'move_room') {
-    const lines = [];
-    if (branchName) lines.push(`🏨 <b>Chi nhánh:</b> ${branchName}`);
-    lines.push(`🔄 <b>Chuyển phòng</b>`);
-    if (m.oldRoomNumber && m.newRoomNumber) {
-      lines.push(`🚪 <b>Phòng:</b> ${esc(m.oldRoomNumber)} → ${esc(m.newRoomNumber)}`);
+  const lines = [];
+
+  // Dòng 1: Chi nhánh (nếu có)
+  if (branchName) lines.push(`<b>Chi nhánh:</b> ${branchName}`);
+
+  // Dòng 2: Tiêu đề hành động (in hoa, đậm) + đường kẻ ngăn cách
+  lines.push(`<b>${actionLabel.toUpperCase()}</b>`);
+  lines.push(`=======================`);
+
+  // (Bỏ dòng mô tả description — trùng lặp với các field chi tiết bên dưới)
+
+  // ⭐ Gộp đổi phòng thành 1 dòng "Thay Đổi: cũ → mới" (thay vì 2 dòng riêng).
+  const skipKeys = new Set();
+  if (m.oldRoomNumber && m.newRoomNumber) {
+    if (m.bookingCode) {
+      lines.push(`<b>Mã đặt phòng:</b> <code>${esc(m.bookingCode)}</code>`);
     }
-    if (m.bookingCode) lines.push(`📋 <b>Mã đặt phòng:</b> <code>${esc(m.bookingCode)}</code>`);
-    if (m.fee && m.fee > 0) lines.push(`💵 <b>Phí:</b> ${new Intl.NumberFormat('vi-VN').format(m.fee)}đ`);
-    lines.push(`💲 <b>Đổi giá:</b> ${m.policyChanged ? 'Có' : 'Không'}`);
-    if (m.reason) lines.push(`📝 <b>Lý do:</b> ${esc(m.reason)}`);
-    lines.push(`👤 <b>Người thực hiện:</b> ${who}`);
-    lines.push(`🕐 <b>Thời gian:</b> ${when}`);
-    return lines.join('\n');
+    lines.push(`<b>Thay Đổi:</b> ${esc(m.oldRoomNumber)} → ${esc(m.newRoomNumber)}`);
+    skipKeys.add('oldRoomNumber');
+    skipKeys.add('newRoomNumber');
+    skipKeys.add('bookingCode');   // đã in ở trên
   }
 
-  // ── Format mặc định (các action khác) ──
-  const lines = [];
-  if (branchName) lines.push(`🏨 ${branchName}`);
-  // Dòng tiêu đề: hành động + đối tượng
-  lines.push(`<b>${actionLabel}</b>  ·  ${entityLabel}`);
+  // ── Các dòng metadata: mỗi field 1 dòng có nhãn, theo thứ tự FIELD_LABELS ──
+  for (const key of Object.keys(FIELD_LABELS)) {
+    if (!(key in m)) continue;
+    if (skipKeys.has(key)) continue;
+    const valStr = fmtFieldValue(key, m[key]);
+    if (valStr === null) continue;
+    // bookingCode dùng <code> cho dễ copy
+    if (key === 'bookingCode') {
+      lines.push(`<b>${FIELD_LABELS[key]}:</b> <code>${valStr}</code>`);
+    } else {
+      lines.push(`<b>${FIELD_LABELS[key]}:</b> ${valStr}`);
+    }
+  }
 
-  // Mô tả (nếu có) — dòng nội dung chính
-  if (audit.description) lines.push(esc(audit.description));
-
-  // Metadata hữu ích — gom 1 dòng "chi tiết" cho gọn
-  const details = [];
-  if (m.bookingCode) details.push(`Mã <code>${esc(m.bookingCode)}</code>`);
-  if (m.roomNumber)  details.push(`Phòng ${esc(m.roomNumber)}`);
-  if (m.amount)      details.push(`${new Intl.NumberFormat('vi-VN').format(m.amount)}đ`);
-  if (details.length) lines.push(details.join('  •  '));
-
-  // Dòng cuối: ai + khi nào (gộp 1 dòng, chữ nhỏ kiểu phụ chú)
-  lines.push(`<i>${who} · ${when}</i>`);
+  // Dòng cuối: người thực hiện + thời gian
+  lines.push(`<b>Người thực hiện:</b> ${who}`);
+  lines.push(`<b>Thời gian:</b> ${when}`);
 
   return lines.join('\n');
 }
@@ -173,7 +274,7 @@ function formatAuditMessage(audit) {
 //   Tra tên chi nhánh từ branchId (nếu có) để hiển thị "Chi nhánh: ...".
 function notifyAudit(audit) {
   if (!AUDIT_ENABLED || !isConfigured()) return;
-  // Tra tên chi nhánh async rồi mới enqueue (không chặn — chạy nền).
+  // Tra tên chi nhánh + tên thật người dùng (async, chạy nền — không chặn).
   (async () => {
     try {
       let branchName = null;
@@ -184,8 +285,41 @@ function notifyAudit(audit) {
           branchName = br?.name || null;
         } catch { /* bỏ qua nếu tra lỗi */ }
       }
+
+      // ⭐ Ưu tiên tên ĐẦY ĐỦ. Nếu userName trống/giống username → tra User lấy fullName.
+      let userName = audit.userName || '';
+      if (audit.userId) {
+        try {
+          const User = require('../models/User');
+          const u = await User.findById(audit.userId).select('fullName username').lean();
+          if (u?.fullName) userName = u.fullName;   // luôn ưu tiên fullName thật
+        } catch { /* bỏ qua nếu tra lỗi */ }
+      }
+
+      // ⭐ Tự động bổ sung bookingCode + customerName nếu là Booking mà metadata chưa có
+      //   (nhiều logAction cũ không truyền bookingCode → tra từ entityId).
+      //   Hỗ trợ cả action trên Invoice (payment...) qua metadata.bookingId.
+      let metadata = audit.metadata || {};
+      const bookingRef = (audit.entityType === 'Booking' && audit.entityId)
+        ? audit.entityId
+        : (metadata.bookingId || null);
+      if (bookingRef && (!metadata.bookingCode || !metadata.customerName)) {
+        try {
+          const Booking = require('../models/Booking');
+          const bk = await Booking.findById(bookingRef).select('bookingCode customerName roomNumber').lean();
+          if (bk) {
+            metadata = {
+              ...metadata,
+              bookingCode: metadata.bookingCode || bk.bookingCode,
+              customerName: metadata.customerName || bk.customerName,
+              roomNumber: metadata.roomNumber || bk.roomNumber,
+            };
+          }
+        } catch { /* bỏ qua nếu tra lỗi */ }
+      }
+
       enqueueTelegram({
-        text: formatAuditMessage({ ...audit, branchName }),
+        text: formatAuditMessage({ ...audit, branchName, userName, metadata }),
         parseMode: 'HTML',
       });
     } catch (err) {

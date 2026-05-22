@@ -49,6 +49,7 @@ async function logAction(params) {
       notifyAudit({
         entityType, entityId, action, description,
         userName: user?.fullName ?? user?.username ?? '',
+        userId:   user?.id ?? user?._id ?? null,
         branchId,
         metadata,
       })
