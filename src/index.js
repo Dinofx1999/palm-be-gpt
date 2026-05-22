@@ -95,6 +95,10 @@ app.use('/api/public/careers',    require('./routes/publicCareersRoutes'));
 app.use('/api/procedures',        require('./routes/procedureRoutes'));
 app.use('/api/public', require('./routes/public')); 
 
+app.use('/api/news',        require('./routes/news'));
+app.use('/api/site-config', require('./routes/siteConfig'));
+app.use('/api/public',      require('./routes/publicContent'));
+
 // ─────────────────────────────────────────────────────
 // ⭐ NEW 14/05/2026: Module Tài chính (Thu/Chi + Bàn giao ca + Đối soát)
 //   - /api/transactions:    Thu/Chi (CRUD, filter, summary)
