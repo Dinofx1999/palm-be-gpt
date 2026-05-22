@@ -199,8 +199,11 @@ function calculatePrice(input) {
   const hourToDayThresh  = branch?.hourToDayThreshold    ?? 3
   const dayEquivHours    = branch?.dayEquivalentHours    ?? 23
   const autoConvert      = branch?.autoConvertPriceType  ?? true
-  const ciStandard       = branch?.checkInTime           ?? '14:00'
-  const coStandard       = branch?.checkOutTime          ?? '12:00'
+  // ⭐ FIX 22/05/2026: Mốc giờ CHUẨN ưu tiên dayCheckInTime/dayCheckOutTime của POLICY,
+  //   chỉ fallback về giờ branch khi policy không khai báo. Vd policy "Giá Ngày" có
+  //   dayCheckInTime=12:00 → đêm sau phải bắt đầu 12:00, không phải 14:00 (giờ branch).
+  const ciStandard       = policy?.dayCheckInTime  ?? branch?.checkInTime  ?? '14:00'
+  const coStandard       = policy?.dayCheckOutTime ?? branch?.checkOutTime ?? '12:00'
 
   // ⭐ Số giờ thực tế đã làm tròn theo tolerance
   const hoursRounded = roundHoursWithTolerance(diffMin, tolerance)
@@ -444,10 +447,20 @@ function calculatePrice(input) {
     //   Nếu là early-checkin night + CO vượt 23:00 → cũng thành 2 đêm (vì đã ở 1 đêm trọn rồi)
     const shouldAddNightForLateSameDay = sameDay && isEarlyCheckinNight && coHourMin >= dayEquivThresholdMin
 
+    // ⭐ FIX 22/05/2026: "Early-checkin night" = CI ≤ earlyCheckinUntil (vd ≤ 05:00).
+    //   Theo chính sách: nhận phòng rạng sáng được tính TRỌN đêm HÔM TRƯỚC → +1 đêm.
+    //   Vd: CI 22/05 01:18 → CO 23/05 12:00. calcNights=1 (chênh 1 ngày lịch),
+    //       nhưng thực tế khách ở đêm 21→22 VÀ 22→23 = 2 đêm.
+    //   Chỉ áp dụng khi !sameDay (đã qua đêm) để không đụng case sameDay+late ở trên.
+    const shouldAddNightForEarlyCI = !sameDay && isEarlyCheckinNight
+
     // Số đêm thực tế tính giá (sau khi áp early/late convert)
     let effectiveNights = nights
     if (shouldAddNightForLate || shouldAddNightForLateSameDay) {
       effectiveNights = nights + 1
+    }
+    if (shouldAddNightForEarlyCI) {
+      effectiveNights += 1   // cộng thêm đêm HÔM TRƯỚC
     }
 
     // ⭐ Tính phụ thu MỖI ĐÊM trước (vì sẽ push xen kẽ với từng giá ngày)
@@ -529,6 +542,16 @@ function calculatePrice(input) {
           const [h, m] = coStandard.split(':').map(Number)
           tmp.setHours(h, m, 0, 0)
           segEnd = tmp
+        } else if (shouldAddNightForEarlyCI) {
+          // ⭐ Early-checkin night (CI ≤ 5h): đêm 1 = ĐÊM HÔM TRƯỚC (tính trọn 1 đêm).
+          //   ⭐ FIX hiển thị 22/05: segStart = GIỜ NHẬN THỰC TẾ (vd 22/05 01:18),
+          //      KHÔNG phải 12:00 hôm trước — để label trung thực với actualCheckIn.
+          //      Tiền KHÔNG đổi (giá ngày tính theo đêm, không theo độ dài đoạn).
+          //   segEnd = coStandard NGÀY CI (vd 22/05 12:00).
+          const [coH, coM] = coStandard.split(':').map(Number)
+          const e = new Date(ci); e.setHours(coH, coM, 0, 0)
+          segStart = ci          // giờ nhận thực tế
+          segEnd   = e
         } else {
           // Bình thường: đêm 1 = ci → coStandard ngày HÔM SAU
           const tmp = new Date(ci); tmp.setDate(tmp.getDate() + 1)
@@ -545,7 +568,10 @@ function calculatePrice(input) {
           tmp.setHours(h, m, 0, 0)
           segStart = tmp
         } else {
-          const tmp = new Date(ci); tmp.setDate(tmp.getDate() + i)
+          // ⭐ Early-CI: đã chèn 1 đêm hôm trước ở i=0 nên offset ngày giảm 1
+          //   (đêm cuối vẫn bắt đầu = ciStandard của ngày CI + (i-1)).
+          const dayOffset = shouldAddNightForEarlyCI ? i - 1 : i
+          const tmp = new Date(ci); tmp.setDate(tmp.getDate() + dayOffset)
           const [h, m] = ciStandard.split(':').map(Number)
           tmp.setHours(h, m, 0, 0)
           segStart = tmp
@@ -574,10 +600,12 @@ function calculatePrice(input) {
         }
       } else {
         // Đêm giữa
-        const a = new Date(ci); a.setDate(a.getDate() + i)
+        // ⭐ Early-CI: đã chèn 1 đêm hôm trước ở i=0 → offset ngày giảm 1.
+        const midOffset = shouldAddNightForEarlyCI ? i - 1 : i
+        const a = new Date(ci); a.setDate(a.getDate() + midOffset)
         const [ah, am] = ciStandard.split(':').map(Number)
         a.setHours(ah, am, 0, 0)
-        const b = new Date(ci); b.setDate(b.getDate() + i + 1)
+        const b = new Date(ci); b.setDate(b.getDate() + midOffset + 1)
         const [bh, bm] = coStandard.split(':').map(Number)
         b.setHours(bh, bm, 0, 0)
         segStart = a; segEnd = b

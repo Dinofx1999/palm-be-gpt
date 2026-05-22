@@ -124,15 +124,38 @@ function formatAuditMessage(audit) {
     timeZone: 'Asia/Ho_Chi_Minh',
     hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric',
   });
+  const m = audit.metadata || {};
+  const branchName = audit.branchName ? esc(audit.branchName) : null;
 
+  // ════════════════════════════════════════════════════════════════════
+  // Format CHI TIẾT riêng cho CHUYỂN PHÒNG (mỗi thông tin 1 dòng, dễ nhìn)
+  // ════════════════════════════════════════════════════════════════════
+  if (audit.action === 'move_room') {
+    const lines = [];
+    if (branchName) lines.push(`🏨 <b>Chi nhánh:</b> ${branchName}`);
+    lines.push(`🔄 <b>Chuyển phòng</b>`);
+    if (m.oldRoomNumber && m.newRoomNumber) {
+      lines.push(`🚪 <b>Phòng:</b> ${esc(m.oldRoomNumber)} → ${esc(m.newRoomNumber)}`);
+    }
+    if (m.bookingCode) lines.push(`📋 <b>Mã đặt phòng:</b> <code>${esc(m.bookingCode)}</code>`);
+    if (m.fee && m.fee > 0) lines.push(`💵 <b>Phí:</b> ${new Intl.NumberFormat('vi-VN').format(m.fee)}đ`);
+    lines.push(`💲 <b>Đổi giá:</b> ${m.policyChanged ? 'Có' : 'Không'}`);
+    if (m.reason) lines.push(`📝 <b>Lý do:</b> ${esc(m.reason)}`);
+    lines.push(`👤 <b>Người thực hiện:</b> ${who}`);
+    lines.push(`🕐 <b>Thời gian:</b> ${when}`);
+    return lines.join('\n');
+  }
+
+  // ── Format mặc định (các action khác) ──
+  const lines = [];
+  if (branchName) lines.push(`🏨 ${branchName}`);
   // Dòng tiêu đề: hành động + đối tượng
-  const lines = [`<b>${actionLabel}</b>  ·  ${entityLabel}`];
+  lines.push(`<b>${actionLabel}</b>  ·  ${entityLabel}`);
 
   // Mô tả (nếu có) — dòng nội dung chính
   if (audit.description) lines.push(esc(audit.description));
 
   // Metadata hữu ích — gom 1 dòng "chi tiết" cho gọn
-  const m = audit.metadata || {};
   const details = [];
   if (m.bookingCode) details.push(`Mã <code>${esc(m.bookingCode)}</code>`);
   if (m.roomNumber)  details.push(`Phòng ${esc(m.roomNumber)}`);
@@ -147,13 +170,28 @@ function formatAuditMessage(audit) {
 
 // ── Hàm public: đẩy 1 audit vào queue gửi Telegram (non-blocking) ─────
 //   Gọi từ auditLogger sau khi ghi log thành công.
+//   Tra tên chi nhánh từ branchId (nếu có) để hiển thị "Chi nhánh: ...".
 function notifyAudit(audit) {
   if (!AUDIT_ENABLED || !isConfigured()) return;
-  try {
-    enqueueTelegram({ text: formatAuditMessage(audit), parseMode: 'HTML' });
-  } catch (err) {
-    console.error('[telegram] notifyAudit error (non-fatal):', err.message);
-  }
+  // Tra tên chi nhánh async rồi mới enqueue (không chặn — chạy nền).
+  (async () => {
+    try {
+      let branchName = null;
+      if (audit.branchId) {
+        try {
+          const Branch = require('../models/Branch');
+          const br = await Branch.findById(audit.branchId).select('name').lean();
+          branchName = br?.name || null;
+        } catch { /* bỏ qua nếu tra lỗi */ }
+      }
+      enqueueTelegram({
+        text: formatAuditMessage({ ...audit, branchName }),
+        parseMode: 'HTML',
+      });
+    } catch (err) {
+      console.error('[telegram] notifyAudit error (non-fatal):', err.message);
+    }
+  })();
 }
 
 // ── Hàm public: gửi tin nhắn tự do (non-blocking) ─────────────────────

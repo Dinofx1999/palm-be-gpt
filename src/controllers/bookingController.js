@@ -1725,6 +1725,7 @@ const moveRoom = async (req, res, next) => {
           newSubRoomAmount, newTotalAmount: booking.totalAmount,
           subRoomId: String(newRoom._id), groupMode: true,
           reason,
+          bookingCode: booking.bookingCode,
         },
       })
 
@@ -1835,6 +1836,7 @@ const moveRoom = async (req, res, next) => {
         fee, policyChanged, newPolicyId, transferAt: usedTransferAt,
         newRoomAmount, newTotalAmount: booking.totalAmount,
         reason,
+        bookingCode: booking.bookingCode,
       },
     })
 
