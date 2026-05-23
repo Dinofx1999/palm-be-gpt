@@ -25,18 +25,17 @@ const isSameDay = (a, b) => {
 }
 
 /**
- * Làm tròn số giờ với tolerance.
+ * Làm tròn số giờ với tolerance (Cách B: trừ tolerance rồi làm tròn LÊN).
  * tolerance = 15 →
- *   - 0h00 - 0h15: chưa tính tiền (0h, "miễn phí giờ ân huệ")
- *   - 0h16 - 1h15: tính 1h
- *   - 1h16 - 2h15: tính 2h
- *   - 3h15: vẫn là 3h, 3h16 mới lên 4h
+ *   - 0 - 15 phút: 0h (miễn phí, trong dung sai)
+ *   - 16 - 75 phút (đến 1h15): 1h   (ceil((16..75 − 15)/60) = 1)
+ *   - 76 - 135 phút (1h16 - 2h15): 2h
+ * Công thức: phút ≤ tolerance → 0; ngược lại ceil((phút − tolerance) / 60).
+ * Ví dụ 91 phút (13:31 so với 12:00): ceil((91 − 15)/60) = ceil(1.27) = 2h.
  */
 const roundHoursWithTolerance = (totalMinutes, toleranceMin) => {
-  const fullHours = Math.floor(totalMinutes / 60)
-  const remainder = totalMinutes - fullHours * 60
-  if (remainder <= toleranceMin) return fullHours   // ← KHÔNG ép min = 1
-  return fullHours + 1
+  if (totalMinutes <= toleranceMin) return 0
+  return Math.ceil((totalMinutes - toleranceMin) / 60)
 }
 
 /**
@@ -665,6 +664,10 @@ function calculatePrice(input) {
     // Trick: gắn flag tạm vào breakdown
     breakdown._effectiveNights = effectiveNights
     breakdown._isEarlyCheckinNight = isEarlyCheckinNight
+    // ⭐ FIX 23/05/2026: Đánh dấu RIÊNG việc cộng đêm DO CHECKOUT MUỘN (late→night convert).
+    //   KHÔNG gộp với early-CI. Late-checkout block bên dưới chỉ bị chặn khi đêm cuối
+    //   thực sự cộng do CO vượt dayEquiv — không phải do early check-in cộng đêm hôm trước.
+    breakdown._lateConvertedNight = (shouldAddNightForLate || shouldAddNightForLateSameDay) === true
   }
 
   // ─── Giá Đêm ───
@@ -733,7 +736,11 @@ function calculatePrice(input) {
   //    + Làm tròn theo tolerance: 1h15p vẫn là 1h, 1h16p mới là 2h
   // ──────────────────────────────────────────────────
   const effectiveNightsTotal = breakdown._effectiveNights ?? nights
-  const wasConvertedToNight  = effectiveNightsTotal > nights
+  // ⭐ FIX 23/05/2026: Chỉ chặn late-checkout khi đêm cuối cộng DO CHECKOUT MUỘN (late→night).
+  //   Trước đây dùng (effectiveNights > nights) → SAI khi early-checkin cộng đêm hôm trước
+  //   (effectiveNights > nights nhưng KHÔNG do checkout muộn) → late-checkout bị skip oan,
+  //   mất phụ thu trả muộn. Đó là lỗi BK_5SR2X7 (CI rạng sáng, quá 12:00 không tính phụ thu).
+  const wasConvertedToNight  = breakdown._lateConvertedNight === true
   // Cho phép tính late checkout TRONG cùng ngày NẾU là early-checkin night (CI 02:00 → CO 14:00)
   const allowLateCheckout = !sameDay || isEarlyCheckinNight
   if ((finalType === 'day' || finalType === 'night')
@@ -761,6 +768,7 @@ function calculatePrice(input) {
   // ⭐ Cleanup: xoá flag tạm trên breakdown trước khi return
   delete breakdown._effectiveNights
   delete breakdown._isEarlyCheckinNight
+  delete breakdown._lateConvertedNight
 
   return {
     roomAmount,

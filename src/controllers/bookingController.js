@@ -2985,7 +2985,22 @@ const checkoutRoom = async (req, res, next) => {
       }
     } else {
       const subTotalAmount     = (sub.roomAmount ?? 0) + (sub.servicesAmount ?? 0) - (sub.discountAmount ?? 0)
-      const subPaidAmount      = sub.paidAmount ?? 0
+      // ⭐ FIX 23/05/2026: Tiền thanh toán đi qua POST /invoices/:id/payment → ghi vào
+      //   invoice.paidAmount (TỔNG đoàn), KHÔNG ghi vào sub.paidAmount. Nếu chỉ đọc
+      //   sub.paidAmount thì luôn = 0 → báo "còn nợ" oan dù khách đã trả đủ tiền phòng này.
+      //   → Tính phần invoice tổng đã trả mà CHƯA bị các phòng khác "chiếm" → phân bổ cho phòng này.
+      //   (Cùng logic với calculateBill single-room mode.)
+      let subPaidAmount = sub.paidAmount ?? 0
+      const invoicePaidTotal = invoicePaid   // đã load ở trên: invoicePre?.paidAmount ?? 0
+      const otherSubPaidSum = booking.rooms
+        .filter(r => r !== sub)
+        .reduce((s, r) => {
+          const rTotal = (r.roomAmount ?? 0) + (r.servicesAmount ?? 0) - (r.discountAmount ?? 0)
+          return s + Math.min(r.paidAmount ?? 0, rTotal)
+        }, 0)
+      const excessInvoicePaid = Math.max(0, invoicePaidTotal - otherSubPaidSum)
+      subPaidAmount = Math.max(subPaidAmount, excessInvoicePaid)
+      subPaidAmount = Math.min(subPaidAmount, subTotalAmount)
       const subRemainingAmount = Math.max(0, subTotalAmount - subPaidAmount)
 
       if (subRemainingAmount > 0 && !skipPayment) {

@@ -131,6 +131,31 @@ const allocatePaymentToRoomsHelper = (booking, amount, targetRoomId = null) => {
   let remaining = amount
   const allocations = []
 
+  // ⭐ FIX 23/05/2026: Khi THANH TOÁN RIÊNG cho 1 phòng (có targetRoomId):
+  //   KHÓA toàn bộ tiền vào đúng phòng đó — KHÔNG tràn sang phòng khác.
+  //   Lý do: sub.roomAmount trong DB có thể LỖI THỜI (thấp hơn giá thực) khi khách
+  //   ở thêm (đêm mới / trả muộn). Giá thật được tính lại realtime lúc trả phòng.
+  //   Nếu giới hạn theo subRemaining (giá DB cũ) → tiền dư tràn sang phòng khác,
+  //   khi trả phòng tính lại giá cao hơn → phòng này thiếu tiền → chặn oan.
+  //   → Tiền thanh toán riêng phải ở yên trong phòng được chỉ định.
+  if (targetRoomId) {
+    const targetIdx = booking.rooms.findIndex(sr =>
+      String(sr.roomId?._id ?? sr.roomId) === String(targetRoomId)
+    )
+    if (targetIdx >= 0 && booking.rooms[targetIdx].status !== 'cancelled') {
+      const sr = booking.rooms[targetIdx]
+      sr.paidAmount = (sr.paidAmount ?? 0) + remaining
+      allocations.push({
+        roomId:     String(sr.roomId?._id ?? sr.roomId),
+        roomNumber: sr.roomNumber,
+        amount:     remaining,
+      })
+      remaining = 0
+      return { allocations, remaining }
+    }
+    // Không tìm thấy phòng target → rơi xuống phân bổ thường (an toàn)
+  }
+
   for (const idx of ordered) {
     if (remaining <= 0) break
     const sr = booking.rooms[idx]
