@@ -487,7 +487,8 @@ const getOrCreateForBooking = safe(async (req, res) => {
 }, 'getOrCreateForBooking')
 
 const addPayment = safe(async (req, res) => {
-  const { amount, method, note = '', type = 'payment', targetRoomId = null } = req.body
+  const { amount, method, note = '', type = 'payment', targetRoomId = null,
+          effectiveTotal = null, effectivePaid = null } = req.body
   if (!amount || amount <= 0)
     return res.status(400).json({ success: false, message: 'Số tiền không hợp lệ' })
   if (!['payment', 'refund'].includes(type))
@@ -593,7 +594,15 @@ const addPayment = safe(async (req, res) => {
       metadata: {
         invoiceCode: invoice.invoiceCode, amount, method, type, note,
         bookingId: invoice.bookingId, roomNumber: booking?.roomNumber,
-        paidAmount: invoice.paidAmount, totalAmount: invoice.totalAmount,
+        // ⭐ FIX 23/05/2026: Ưu tiên tổng/đã-trả REALTIME do FE gửi (billData từ calculate-bill,
+        //   đúng nhất tại thời điểm thu). Fallback invoice.* (DB cache) khi FE không gửi.
+        //   Log chạy TRƯỚC khi invoice.paidAmount được tính lại (dòng ~645) nên cộng amount
+        //   của lần thu/hoàn hiện tại để con số "đã trả" phản ánh ĐÃ gồm giao dịch này.
+        paidAmount: (effectivePaid != null && Number.isFinite(Number(effectivePaid)))
+          ? Number(effectivePaid) + (type === 'refund' ? -Math.abs(amount) : Math.abs(amount))
+          : invoice.paidAmount,
+        totalAmount: (effectiveTotal != null && Number.isFinite(Number(effectiveTotal)))
+          ? Number(effectiveTotal) : invoice.totalAmount,
       },
     })
   } catch (auditErr) {

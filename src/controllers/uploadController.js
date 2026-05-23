@@ -2,6 +2,11 @@ const path = require('path');
 const fs = require('fs');
 const sharp = require('sharp');
 const { uploadDir } = require('../middleware/upload');
+// Thư mục lưu avatar — tạo nếu chưa có
+const avatarDir = path.join(__dirname, '../../uploads/avatars');
+if (!fs.existsSync(avatarDir)) {
+  fs.mkdirSync(avatarDir, { recursive: true });
+}
 
 // ── Upload nhiều ảnh ───────────────────────────
 const uploadRoomImages = async (req, res, next) => {
@@ -52,5 +57,44 @@ const deleteRoomImage = async (req, res, next) => {
     next(err);
   }
 };
+// POST /api/upload/avatar — upload 1 ảnh đại diện
 
-module.exports = { uploadRoomImages, deleteRoomImage };
+ 
+// POST /api/upload/avatar — upload 1 ảnh đại diện (field "file")
+const uploadAvatar = async (req, res, next) => {
+  try {
+    if (!req.file)
+      return res.status(400).json({ success: false, message: 'Không có file được tải lên' });
+ 
+    // Tên file duy nhất
+    const filename = `avatar-${req.user.id}-${Date.now()}.webp`;
+    const filePath = path.join(avatarDir, filename);
+ 
+    // Resize vuông 400x400, nén webp — xử lý từ buffer trong RAM
+    await sharp(req.file.buffer)
+      .resize(400, 400, { fit: 'cover', position: 'center' })
+      .webp({ quality: 85 })
+      .toFile(filePath);
+ 
+    // ⚠️ url phải khớp với cách express phục vụ static.
+    //   Xem controller rooms build url thế nào → làm y hệt phần domain/prefix.
+    const url = `/uploads/avatars/${filename}`;
+ 
+    res.json({ success: true, data: { url } });
+  } catch (err) { next(err); }
+};
+ 
+// DELETE /api/upload/avatar/:filename — (tùy chọn) xoá ảnh cũ
+const deleteAvatar = async (req, res, next) => {
+  try {
+    const filename = path.basename(req.params.filename); // chặn path traversal
+    const filePath = path.join(avatarDir, filename);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.json({ success: true, message: 'Đã xoá ảnh' });
+  } catch (err) { next(err); }
+};
+ 
+// ⭐ Thêm vào module.exports của uploadController.js:
+// module.exports = { uploadRoomImages, deleteRoomImage, uploadAvatar, deleteAvatar };
+
+module.exports = { uploadRoomImages, deleteRoomImage, uploadAvatar, deleteAvatar };

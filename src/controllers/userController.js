@@ -80,4 +80,71 @@ const remove = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-module.exports = { getAll, getOne, create, update, toggle, resetPassword, remove  };
+
+// ─────────────────────────────────────────────────────────────
+// ⭐ NEW: Các hàm cho HỒ SƠ CÁ NHÂN (user thao tác với chính mình)
+//   Thêm vào file controllers/userController.js
+//   Nhớ export thêm 3 hàm ở dưới cùng.
+// ─────────────────────────────────────────────────────────────
+ 
+// GET /api/users/me — lấy hồ sơ của chính mình
+const getMe = async (req, res, next) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
+    res.json({ success: true, data: { user } });
+  } catch (err) { next(err); }
+};
+ 
+// PATCH /api/users/me — user tự cập nhật email / phone / avatar
+//   ⚠️ KHÔNG cho phép tự đổi role / branchId / isActive / username
+const updateMe = async (req, res, next) => {
+  try {
+    const allowed = ['email', 'phone', 'avatar'];
+    const payload = {};
+    allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k]; });
+ 
+    if (Object.keys(payload).length === 0)
+      return res.status(400).json({ success: false, message: 'Không có thông tin nào để cập nhật' });
+ 
+    // Nếu đổi email → check trùng với user khác
+    if (payload.email) {
+      const dup = await User.findOne({ email: payload.email, _id: { $ne: req.user.id } });
+      if (dup) return res.status(400).json({ success: false, message: 'Email đã được sử dụng' });
+    }
+ 
+    const user = await User.findByIdAndUpdate(req.user.id, payload, {
+      new: true,
+      runValidators: true,
+    }).select('-password');
+ 
+    if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
+    res.json({ success: true, message: 'Cập nhật hồ sơ thành công', data: { user } });
+  } catch (err) { next(err); }
+};
+ 
+// POST /api/users/me/change-password — đổi mật khẩu của chính mình
+const changeMyPassword = async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ success: false, message: 'Thiếu mật khẩu hiện tại hoặc mật khẩu mới' });
+    if (newPassword.length < 6)
+      return res.status(400).json({ success: false, message: 'Mật khẩu mới tối thiểu 6 ký tự' });
+ 
+    // Cần lấy cả field password (mặc định select('-password') ở nơi khác, nên ở đây lấy đủ)
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ success: false, message: 'Không tìm thấy người dùng' });
+ 
+    const ok = await user.comparePassword(currentPassword);
+    if (!ok) return res.status(400).json({ success: false, message: 'Mật khẩu hiện tại không đúng' });
+ 
+    // Hook pre('save') sẽ tự hash
+    user.password = newPassword;
+    await user.save();
+ 
+    res.json({ success: true, message: 'Đổi mật khẩu thành công' });
+  } catch (err) { next(err); }
+};
+
+module.exports = { getAll, getOne, create, update, toggle, resetPassword, remove , getMe, updateMe, changeMyPassword };

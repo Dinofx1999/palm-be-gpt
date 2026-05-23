@@ -773,6 +773,11 @@ const changeDates = async (req, res, next) => {
     if (['cancelled', 'checked_out'].includes(booking.status))
       return res.status(400).json({ success: false, message: `Không thể đổi ngày ở trạng thái: ${booking.status}` })
 
+    // ⭐ FIX 23/05/2026: Lưu ngày + tiền CŨ trước khi đổi — cho audit log "cũ → mới".
+    const _oldCheckIn   = booking.actualCheckIn ?? booking.checkIn
+    const _oldCheckOut  = booking.checkOut
+    const _oldRoomAmt   = booking.roomAmount
+
     const newCheckIn  = new Date(checkIn)
     const newCheckOut = new Date(checkOut)
     if (newCheckOut <= newCheckIn)
@@ -1102,10 +1107,11 @@ const changeDates = async (req, res, next) => {
       entityType: 'Booking', entityId: booking._id,
       action: 'change_dates',
       description: updatedActualCheckIn
-        ? `Đổi giờ nhận phòng thực tế: ${new Date(newCheckIn).toLocaleString('vi-VN')} → trả: ${new Date(newCheckOut).toLocaleString('vi-VN')}`
-        : `Đổi ngày ở: ${new Date(newCheckIn).toLocaleString('vi-VN')} → ${new Date(newCheckOut).toLocaleString('vi-VN')}`,
+        ? `Đổi giờ nhận: ${new Date(_oldCheckIn).toLocaleString('vi-VN')} → ${new Date(newCheckIn).toLocaleString('vi-VN')} | trả: ${new Date(_oldCheckOut).toLocaleString('vi-VN')} → ${new Date(newCheckOut).toLocaleString('vi-VN')}`
+        : `Đổi ngày ở: ${new Date(_oldCheckIn).toLocaleString('vi-VN')} → ${new Date(newCheckIn).toLocaleString('vi-VN')} | ${new Date(_oldCheckOut).toLocaleString('vi-VN')} → ${new Date(newCheckOut).toLocaleString('vi-VN')}`,
       user: req.user, branchId: booking.branchId,
       metadata: {
+        oldCheckIn: _oldCheckIn, oldCheckOut: _oldCheckOut, oldRoomAmount: _oldRoomAmt,
         newCheckIn, newCheckOut,
         nights: booking.nights,
         roomAmount: booking.roomAmount,
@@ -1839,6 +1845,7 @@ const moveRoom = async (req, res, next) => {
       user: req.user, branchId: booking.branchId,
       metadata: {
         oldRoomNumber, newRoomNumber: newRoom.number,
+        oldRoomType: oldRoom?.typeName ?? '', newRoomType: newRoom.typeName ?? '',
         fee, policyChanged, newPolicyId, transferAt: usedTransferAt,
         newRoomAmount, newTotalAmount: booking.totalAmount,
         reason,
@@ -1867,6 +1874,11 @@ const changePolicy = async (req, res, next) => {
 
     const booking = await Booking.findById(req.params.id)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+
+    // ⭐ FIX 23/05/2026: Lưu giá/chính sách CŨ TRƯỚC khi đổi — để audit log ghi "cũ → mới".
+    const _oldPolicyName  = booking.policyName
+    const _oldRoomAmount  = booking.roomAmount
+    const _oldPriceType   = booking.priceType
 
     let newRoomAmount     = booking.roomAmount
     let newPriceBreakdown = booking.priceBreakdown
@@ -1999,12 +2011,22 @@ const changePolicy = async (req, res, next) => {
       entityType: 'Booking', entityId: booking._id,
       action: 'change_policy',
       description: customRoomAmount !== null
-        ? `Đổi giá phòng (tự nhập): ${newRoomAmount.toLocaleString('vi-VN')}đ`
+        ? `Đổi giá phòng (tự nhập): ${_oldRoomAmount.toLocaleString('vi-VN')}đ → ${newRoomAmount.toLocaleString('vi-VN')}đ`
         : Array.isArray(customBreakdown) && customBreakdown.length > 0
-          ? `Sửa giá thủ công từng dòng: ${newRoomAmount.toLocaleString('vi-VN')}đ (${customBreakdown.length} dòng)`
-          : `Đổi chính sách giá → "${booking.policyName}" (${newRoomAmount.toLocaleString('vi-VN')}đ)`,
+          ? `Sửa giá thủ công từng dòng: ${_oldRoomAmount.toLocaleString('vi-VN')}đ → ${newRoomAmount.toLocaleString('vi-VN')}đ (${customBreakdown.length} dòng)`
+          : `Đổi giá: "${_oldPolicyName || '—'}" (${_oldRoomAmount.toLocaleString('vi-VN')}đ) → "${booking.policyName}" (${newRoomAmount.toLocaleString('vi-VN')}đ)`,
       user: req.user, branchId: booking.branchId,
-      metadata: { policyId, policyName: booking.policyName, customRoomAmount, customBreakdownLen: customBreakdown?.length ?? 0, newRoomAmount, totalAmount: booking.totalAmount },
+      metadata: {
+        policyId, policyName: booking.policyName, customRoomAmount,
+        customBreakdownLen: customBreakdown?.length ?? 0,
+        newRoomAmount, totalAmount: booking.totalAmount,
+        // ⭐ NEW 23/05/2026: giá/chính sách cũ để hiển thị "cũ → mới"
+        oldPolicyName: _oldPolicyName,
+        oldRoomAmount: _oldRoomAmount,
+        oldPriceType:  _oldPriceType,
+        newPolicyName: booking.policyName,
+        newPriceType:  booking.priceType,
+      },
     })
 
     res.json({ success: true, message: 'Đã đổi giá phòng', data: { booking } })
@@ -3510,6 +3532,20 @@ const calculateBill = async (req, res, next) => {
     if (mode === 'now') {
       const refTime = atTime ? new Date(atTime) : new Date()
       effectiveCheckOut = refTime < effectiveCheckIn ? new Date(effectiveCheckIn.getTime() + 60000) : refTime
+
+      // ⭐ FIX 24/05/2026: Quy tắc "QUÁ HẠN = TRỌN ĐÊM" (áp dụng MỌI loại booking).
+      //   Khi giờ hiện tại đã vượt giờ trả dự kiến (booking.checkOut), khách bị tính
+      //   trọn thêm đêm (KHÔNG dùng slot giờ trả muộn). Ceil refTime lên giờ trả chuẩn
+      //   gần nhất >= refTime. Vd now=24/05 01:58, CO chuẩn 12:00 → 24/05 12:00.
+      //   Lưu ý: chỉ áp dụng khi KHÔNG có atTime tự chọn (atTime = nhân viên chủ động set giờ).
+      if (!atTime && booking.checkOut && effectiveCheckOut > new Date(booking.checkOut)) {
+        const [coH, coM] = String(branch?.dayCheckOutTime || branch?.checkOutTime || '12:00')
+          .split(':').map(Number)
+        const ceil = new Date(effectiveCheckOut)
+        ceil.setHours(coH || 12, coM || 0, 0, 0)
+        if (ceil < effectiveCheckOut) ceil.setDate(ceil.getDate() + 1)
+        effectiveCheckOut = ceil
+      }
     } else {
       effectiveCheckOut = booking.checkOut
     }
@@ -3966,9 +4002,16 @@ const calculateBill = async (req, res, next) => {
           //   (vd 20:00) thì làm tròn LÊN giờ checkout chuẩn ngày hôm sau (tính thêm 1 đêm),
           //   khớp với logic priceCalculator (nhánh thường). computeMoveRoomBreakdown KHÔNG tự
           //   xử lý dayEquiv nên phải làm tròn ở đây, riêng nhánh chuyển phòng.
-          plannedCheckOut: roundUpCheckoutForNow(effectiveCheckOut, branch, mode, booking.checkOut) < new Date(booking.checkOut)
-            ? roundUpCheckoutForNow(effectiveCheckOut, branch, mode, booking.checkOut)
-            : new Date(booking.checkOut),
+          // ⭐ FIX 24/05/2026 v3: effectiveCheckOut ĐÃ được ceil "trọn đêm" ở khối trung tâm
+          //   (khi quá hạn). Ở đây chỉ cần:
+          //   - Quá hạn (eff > booking.checkOut): dùng thẳng eff (đã là giờ trả chuẩn trọn đêm).
+          //   - Chưa quá hạn (trả sớm/đúng hạn): cap ở booking.checkOut (không tính dư).
+          plannedCheckOut: (() => {
+            const planned = new Date(booking.checkOut)
+            const eff = new Date(effectiveCheckOut)
+            if (eff > planned) return eff   // quá hạn → trọn đêm (eff đã ceil sẵn)
+            return eff < planned ? eff : planned   // chưa quá hạn → cap
+          })(),
           transferAt:      new Date(lastTransfer.transferAt),
           oldRoom: {
             number: oldRoomNum,
