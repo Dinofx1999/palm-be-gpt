@@ -3844,12 +3844,19 @@ const calculateBill = async (req, res, next) => {
     const _firstFutureTransfer = _allTransfers.find(
       t => new Date(t.transferAt) > new Date(effectiveCheckOut)
     )
+    // ⭐ FIX: dùng PLAIN OBJECT (không kế thừa prototype Mongoose) để tránh lỗi
+    //   "Cannot read ...mongoose#Document#scope". booking_view chỉ dùng để ĐỌC
+    //   (transferHistory đã lọc, roomNumber, actualCheckIn...), không gọi method Mongoose.
+    const _bookingPlain = (booking && typeof booking.toObject === 'function')
+      ? booking.toObject({ virtuals: true })
+      : booking
     const booking_view = (_occurredTransfers.length !== _allTransfers.length)
-      ? Object.assign(Object.create(Object.getPrototypeOf(booking)), booking.toObject ? booking.toObject() : booking, {
+      ? {
+          ..._bookingPlain,
           transferHistory: _occurredTransfers,
           // phòng đang ở tại mốc xem = phòng nguồn của lần chuyển tương lai gần nhất
           roomNumber: _firstFutureTransfer ? _firstFutureTransfer.fromRoomNumber : booking.roomNumber,
-        })
+        }
       : booking
 
     const hasTransferred = (booking_view.transferHistory ?? []).length > 0
