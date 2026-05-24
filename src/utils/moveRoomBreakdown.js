@@ -275,6 +275,10 @@ function computeMoveRoomBreakdown(input) {
   }
 
   const items = [];
+  // ⭐ FIX 24/05/2026: cờ đánh dấu chặng phòng mới đã tính GIÁ GIỜ (tới giờ trả `co`).
+  //   Khi đã tính giá giờ thì KHÔNG cộng thêm "Trả phòng trễ" (tránh tính trùng):
+  //   giá giờ đã bao trùm tới đúng giờ trả rồi.
+  let newRoomPricedHourly = false;
 
   const pushFee = () => {
     if (transferFee > 0) {
@@ -562,6 +566,7 @@ function computeMoveRoomBreakdown(input) {
     if (canHourly) {
       const slot = pickSlotHourly(newRoomHourSlots, effectiveRoundedHours);
       if (slot) {
+        newRoomPricedHourly = true   // ⭐ đánh dấu: chặng mới đã tính GIÁ GIỜ tới `co`
         items.push({
           label: `[${newRoom.number}] Giá giờ (${fmtDT(newStart)} → ${fmtDT(co)}) — ${effectiveRoundedHours}h`,
           amount: slot.price,
@@ -620,7 +625,10 @@ function computeMoveRoomBreakdown(input) {
   }
 
   const lastNightEnd = nights.length > 0 ? nights[nights.length - 1].endAt : null;
-  pushLateCO(lastNightEnd);
+  // ⭐ FIX 24/05/2026: bỏ "Trả phòng trễ" nếu chặng mới đã tính GIÁ GIỜ (đã gồm tới giờ trả).
+  if (!newRoomPricedHourly) {
+    pushLateCO(lastNightEnd);
+  }
 
   return items;
 }

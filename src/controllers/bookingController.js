@@ -4041,17 +4041,9 @@ const calculateBill = async (req, res, next) => {
             .filter(it => String(it.meta?.roomNumber) === String(newRoomNum))
             .map(it => ({ label: it.label, amount: it.amount, type: it.type === 'surcharge' ? 'surcharge' : 'base', meta: it.meta || {} }))
 
-          // ⭐ FIX 24/05/2026: BỎ "Trả phòng trễ" phòng mới khi xem live cùng ngày đổi phòng.
-          if (mode === 'now') {
-            const _eff = new Date(effectiveCheckOut)
-            const _tAt = new Date(lastT.transferAt)
-            const _sameDay = _eff.getFullYear() === _tAt.getFullYear()
-              && _eff.getMonth() === _tAt.getMonth()
-              && _eff.getDate() === _tAt.getDate()
-            if (_sameDay) {
-              liveOfCurrent = liveOfCurrent.filter(b => !(b.meta && b.meta.lateCheckout === true))
-            }
-          }
+          // ⭐ FIX 24/05/2026: Việc bỏ "Trả phòng trễ" khi chặng mới tính GIÁ GIỜ đã được
+          //   xử lý TRONG computeMoveRoomBreakdown (cờ newRoomPricedHourly). Ở đây KHÔNG lọc
+          //   theo same-day nữa — vì nếu chặng mới ra GIÁ NGÀY thì trả trễ VẪN tính (đúng spec).
 
           const merged = [...frozenItems, ...liveOfCurrent]
           priceResult = {
@@ -4206,16 +4198,9 @@ const calculateBill = async (req, res, next) => {
         //   đổi vào phòng mới trong ngày, chưa thể "trả trễ" — phí trễ chỉ vô nghĩa khi
         //   khách còn ở tiếp trong cùng ngày. Nếu đã sang ngày khác (qua đêm) → GIỮ.
         //   Chỉ áp dụng cho chặng đổi phòng (lateCheckout của phòng mới), không đụng booking thường.
-        if (mode === 'now') {
-          const _eff = new Date(effectiveCheckOut)
-          const _tAt = new Date(lastTransfer.transferAt)
-          const _sameDayAsTransfer = _eff.getFullYear() === _tAt.getFullYear()
-            && _eff.getMonth() === _tAt.getMonth()
-            && _eff.getDate() === _tAt.getDate()
-          if (_sameDayAsTransfer) {
-            breakdownItems = breakdownItems.filter(b => !(b.meta && b.meta.lateCheckout === true))
-          }
-        }
+        // ⭐ FIX 24/05/2026: Việc bỏ "Trả phòng trễ" khi chặng mới tính GIÁ GIỜ đã xử lý
+        //   TRONG computeMoveRoomBreakdown (cờ newRoomPricedHourly). KHÔNG lọc theo same-day
+        //   ở đây — nếu chặng mới ra GIÁ NGÀY thì trả trễ VẪN tính (đúng quy tắc).
 
         // ⭐ FIX 18/05/2026 (v20.1) — Bổ sung phụ thu
         //   moveRoomBreakdown CHỈ trả tiền phòng. Cần thêm:
