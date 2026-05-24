@@ -3929,48 +3929,105 @@ const calculateBill = async (req, res, next) => {
       //   → Ưu tiên đọc từ DB, không recompute.
       const transferCount = (booking.transferHistory ?? []).length
       if (transferCount >= 2) {
-        priceResult = {
-          roomAmount:       booking.roomAmount,
-          nights:           booking.nights,
-          breakdown:        booking.priceBreakdown ?? [],
-          finalPriceType:   booking.priceType,
-          converted:        false,
-          notice:           `Booking đã chuyển phòng ${transferCount} lần — breakdown đọc từ DB`,
-        }
-        // Thêm late checkout surcharge nếu effectiveCheckOut > booking.checkOut
-        if (mode === 'now' && effectiveCheckOut > new Date(booking.checkOut)) {
+        // ⭐ FIX 24/05/2026: ≥2 transfer — HYBRID:
+        //   - Các chặng CŨ (đã ở xong, mọi phòng trừ phòng đang ở): lấy từ rebuild
+        //     (finalized, KHÔNG nuốt chặng giữa như đọc DB stale trước đây).
+        //   - Chặng ĐANG Ở (phòng hiện tại): tính LIVE bằng computeMoveRoomBreakdown
+        //     của lần đổi CUỐI → giữ đúng quy tắc giờ↔ngày theo dayEquivalentHours
+        //     (live trước 23h = giá giờ từ transferAt; sau 23h = giá ngày).
+        try {
+          const hist = (booking.transferHistory ?? [])
+            .filter(t => t?.transferAt && t?.fromRoomNumber && t?.toRoomNumber)
+            .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+          const lastT = hist[hist.length - 1]
+
+          // (1) Rebuild để lấy các chặng CŨ đã finalized (bỏ chặng phòng đang ở).
+          const rebuilt = await rebuildBookingBreakdown(booking, branch, {
+            plannedCheckOut: new Date(lastT.transferAt),   // chỉ tới mốc đổi cuối → chỉ ra chặng cũ
+          })
+          const frozenItems = (rebuilt?.breakdown ?? [])
+            .filter(b => b?.meta?.finalized)
+
+          // (2) Chặng đang ở: replay lần đổi cuối bằng module (giờ/ngày đúng theo 23h).
+          const oldRoomNum = lastT.fromRoomNumber
+          const newRoomNum = lastT.toRoomNumber
+          let oldPolicy = null
+          if (lastT.oldPolicyId) { try { oldPolicy = await PricePolicy.findById(lastT.oldPolicyId) } catch {} }
+          if (!oldPolicy && booking.policySnapshot?.dayPrice) oldPolicy = booking.policySnapshot
+          const newPolicy = policy
+
+          let newRoomTypeId = null, oldRoomType = '', newRoomType = booking.roomType || ''
           try {
-            const lateMs = effectiveCheckOut.getTime() - new Date(booking.checkOut).getTime()
-            const lateH = Math.floor(lateMs / 3600000)
-            const lateM = Math.round((lateMs % 3600000) / 60000)
-            const lateLabel = lateH >= 24
-              ? `Trả phòng muộn (${Math.floor(lateH / 24)}d ${lateH % 24}h)`
-              : `Trả phòng muộn (${lateH}h${lateM > 0 ? lateM + 'm' : ''})`
-            // Tính phí trễ = calculatePrice từ booking.checkOut → now
-            const lateResult = calculatePrice({
-              checkIn:   new Date(booking.checkOut),
-              checkOut:  effectiveCheckOut,
-              priceType: booking.priceType,
-              policy, branch,
-              adults:    booking.adults,
-              children:  booking.children,
-              maxAdults, maxChildren, maxOccupancy,
+            const d = await Room.findOne({ number: oldRoomNum, branchId: booking.branchId }).populate('typeId')
+            if (d) oldRoomType = d.typeId?.name || d.typeName || ''
+          } catch {}
+          try {
+            const d = await Room.findOne({ number: newRoomNum, branchId: booking.branchId }).populate('typeId')
+            if (d) { newRoomType = d.typeId?.name || d.typeName || newRoomType; newRoomTypeId = d.typeId?._id || d.typeId || null }
+          } catch {}
+
+          const hourSlotsOf = (pol) => {
+            if (!pol) return []
+            return (pol.hourSlots || []).map(s => {
+              const time = s.time || s.duration || ''
+              const m = String(time).match(/(\d+)/)
+              return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
             })
-            const lateAmount = lateResult?.roomAmount || 0
-            if (lateAmount > 0) {
-              priceResult.breakdown = [
-                ...priceResult.breakdown,
-                {
-                  label:  `[${booking.roomNumber}] ${lateLabel}`,
-                  amount: lateAmount,
-                  type:   'surcharge',
-                  meta:   { roomNumber: booking.roomNumber, lateCheckout: true },
-                },
-              ]
-              priceResult.roomAmount += lateAmount
-            }
-          } catch (e) {
-            console.warn('[calculateBill multi-transfer] late checkout calc failed:', e.message)
+          }
+          const newHourlyPolicy = await resolveHourlyPolicy(newRoomTypeId, booking.branchId)
+          const newRoomHourSlots = newHourlyPolicy ? hourSlotsOf(newHourlyPolicy) : hourSlotsOf(newPolicy)
+
+          const plannedForLast = (() => {
+            const planned = new Date(booking.checkOut)
+            const eff = new Date(effectiveCheckOut)
+            if (eff > planned) return eff
+            return eff < planned ? eff : planned
+          })()
+
+          const liveItems = computeMoveRoomBreakdown({
+            actualCheckIn:   new Date(booking.actualCheckIn ?? booking.checkIn),  // ⭐ giờ nhận GỐC (để logic giờ/ngày khớp nhánh 1-transfer)
+            plannedCheckOut: plannedForLast,
+            transferAt:      new Date(lastT.transferAt),
+            oldRoom: { number: oldRoomNum, type: oldRoomType, policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) } },
+            newRoom: { number: newRoomNum, type: newRoomType, policy: {
+              dayPrice: newPolicy?.dayPrice || 0, hourSlots: newRoomHourSlots,
+              dayCheckInTime: newPolicy?.dayCheckInTime, dayCheckOutTime: newPolicy?.dayCheckOutTime,
+              dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn, dayLateCheckOut: newPolicy?.dayLateCheckOut,
+              dayAdultSurcharge: newPolicy?.dayAdultSurcharge, dayChildSurcharge: newPolicy?.dayChildSurcharge,
+            } },
+            transferFee: 0,   // fee tách riêng (booking.transferFee)
+            changeRate:  oldRoomType !== newRoomType,
+            isFreeRoom:  !!booking.isFreeRoom,
+            branchConfig: branch ? {
+              checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime,
+              earlyCheckinUntil: branch.earlyCheckinUntil, toleranceMinutes: branch.toleranceMinutes,
+              dayEquivalentHours: branch.dayEquivalentHours,
+            } : null,
+          })
+          // Chỉ giữ các dòng của phòng ĐANG Ở (bỏ dòng phòng cũ trùng + fee)
+          const liveOfCurrent = liveItems
+            .filter(it => !(it.meta && it.meta.transferFee))
+            .filter(it => String(it.meta?.roomNumber) === String(newRoomNum))
+            .map(it => ({ label: it.label, amount: it.amount, type: it.type === 'surcharge' ? 'surcharge' : 'base', meta: it.meta || {} }))
+
+          const merged = [...frozenItems, ...liveOfCurrent]
+          priceResult = {
+            roomAmount:     merged.filter(b => !(b.meta && b.meta.excludeFromTotal)).reduce((s, b) => s + (b.amount || 0), 0),
+            nights:         booking.nights,
+            breakdown:      merged,
+            finalPriceType: booking.priceType,
+            converted:      false,
+            notice:         null,
+          }
+        } catch (e) {
+          console.error('[calculateBill ≥2 transfer] hybrid failed, fallback DB:', e.message)
+          priceResult = {
+            roomAmount:     booking.roomAmount,
+            nights:         booking.nights,
+            breakdown:      booking.priceBreakdown ?? [],
+            finalPriceType: booking.priceType,
+            converted:      false,
+            notice:         null,
           }
         }
       } else {
