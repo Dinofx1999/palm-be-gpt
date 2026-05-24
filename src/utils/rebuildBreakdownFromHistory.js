@@ -45,7 +45,10 @@ function rebuildBreakdownFromHistory({ segments, branch, isFreeRoom = false, mer
   const errors = []
   let roomAmount = 0
 
-  for (const seg of segments) {
+  for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+    const seg = segments[segIdx]
+    const isFirstSeg = segIdx === 0
+    const isLastSeg  = segIdx === segments.length - 1
     if (isFreeRoom) {
       breakdown.push({
         label: `[${seg.roomNumber}] Miễn phí`,
@@ -77,6 +80,14 @@ function rebuildBreakdownFromHistory({ segments, branch, isFreeRoom = false, mer
     const segRows = []
     for (const b of r.breakdown) {
       const lbl = String(b.label || '')
+      // ⭐ FIX 24/05/2026: LIÊN PHÒNG — bỏ phụ thu ở mép đổi phòng (spec mục II):
+      //   - Chặng KHÔNG phải đầu tiên: bỏ "Nhận phòng sớm" (vào phòng giữa do đổi, không phải nhận sớm thật).
+      //   - Chặng KHÔNG phải cuối cùng: bỏ "Trả phòng muộn/trễ" (rời phòng để đổi, không phải trả muộn thật).
+      //   Vd: 201→604 lúc 14:29 thì [201] KHÔNG tính "trả muộn 2h29"; 604 vào không tính "nhận sớm".
+      const isEarlyCI = lbl.includes('Nhận phòng sớm') || lbl.includes('early_checkin')
+      const isLateCO  = lbl.includes('Trả phòng muộn') || lbl.includes('Trả phòng trễ') || lbl.includes('late_checkout')
+      if (!isFirstSeg && isEarlyCI) continue
+      if (!isLastSeg  && isLateCO)  continue
       const hasPrefix = /^\[[^\]]+\]\s/.test(lbl)
       segRows.push({
         label:  hasPrefix ? lbl : `[${seg.roomNumber}] ${lbl}`,

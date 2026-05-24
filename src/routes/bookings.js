@@ -17,6 +17,7 @@ const {
   mergeGroup,          // ⭐ NEW 11/05/2026: Gộp đoàn
   splitRoom,           // ⭐ NEW 11/05/2026: Tách đoàn
   getMergeCandidates,  // ⭐ NEW 11/05/2026: List booking có thể gộp
+  undoMoveRoom,        // ⭐ NEW 11/05/2026: undo việc đổi phòng
 } = require('../controllers/bookingController');
 
 router.get('/available-rooms',     authenticate, getAvailableByDate);
@@ -51,4 +52,5 @@ router.patch('/:id/checkout-room', authenticate, checkoutRoom);     // ⭐ NEW: 
 router.patch('/:id/cancel',        authenticate, cancel);
 router.patch('/:id/undo',          authenticate, authorize('Admin', 'Manager'), undo);
 router.patch('/:id/undo-room',     authenticate, authorize('Admin', 'Manager'), undoRoom);   // ⭐ NEW: undo 1 phòng trong đoàn
+router.post('/:id/undo-move-room', authenticate, authorize('Admin', 'Manager'), undoMoveRoom);
 module.exports = router;

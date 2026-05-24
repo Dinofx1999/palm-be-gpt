@@ -1380,6 +1380,27 @@ const moveRoom = async (req, res, next) => {
     if (['cancelled', 'checked_out'].includes(booking.status))
       return res.status(400).json({ success: false, message: `Không thể chuyển phòng ở trạng thái: ${booking.status}` })
 
+    // ⭐ NEW 25/05/2026: Chặn chuyển phòng khi phòng ĐÃ QUÁ HẠN (checkOut < hiện tại).
+    //   Phải gia hạn (đổi ngày trả phòng) trước, nếu không mốc chặng phòng mới rơi vào
+    //   quá khứ → tính giá sai. So với booking.checkOut (đơn) hoặc sub-room checkOut (đoàn).
+    //   FE cũng chặn + hiện modal; đây là lớp BE đảm bảo an toàn khi gọi API trực tiếp.
+    {
+      const _isGrp = Array.isArray(booking.rooms) && booking.rooms.length > 1
+      let _co = booking.checkOut
+      if (_isGrp) {
+        const _tgt = subRoomId || booking.roomId
+        const _sr = booking.rooms.find(sr => String(sr.roomId) === String(_tgt))
+        if (_sr?.checkOut) _co = _sr.checkOut
+      }
+      if (_co && new Date(_co).getTime() < Date.now()) {
+        return res.status(400).json({
+          success: false,
+          code: 'BOOKING_OVERDUE',
+          message: 'Phòng đã quá hạn trả. Vui lòng gia hạn (đổi ngày trả phòng lớn hơn thời gian hiện tại) trước khi chuyển phòng.',
+        })
+      }
+    }
+
     const isGroup = Array.isArray(booking.rooms) && booking.rooms.length > 1
     const targetSubRoomId = isGroup ? (subRoomId || booking.roomId) : null
 
@@ -2513,14 +2534,12 @@ const checkout = async (req, res, next) => {
 
           const moveItems = computeMoveRoomBreakdown({
             actualCheckIn:   booking.actualCheckIn ?? booking.checkIn,
-            // ⭐ FIX 19/05/2026 v2: plannedCheckOut = min(booking.checkOut, actualCO)
-            //   - actualCO > booking.checkOut (overstay): dùng booking.checkOut, phần trễ
-            //     được calculatePrice push "Trả phòng muộn" surcharge phía dưới.
-            //   - actualCO < booking.checkOut (trả sớm / past-checkout): dùng actualCO,
-            //     module tính đến đúng giờ trả sớm, KHÔNG tính dư.
-            plannedCheckOut: actualCO < new Date(booking.checkOut)
-              ? actualCO
-              : new Date(booking.checkOut),
+            // ⭐ FIX 24/05/2026: Khi TRẢ PHÒNG, LUÔN tính theo GIỜ TRẢ THỰC (actualCO =
+            //   "hiện tại" lúc bấm trả phòng), KHỚP với tab "Đến hiện tại" mà khách đã
+            //   thanh toán. KHÔNG cap về booking.checkOut (giờ trả ĐẶT) — vì cap sẽ làm
+            //   chặng giá giờ bị cắt sớm (vd 18:00 thay vì 18:25) → lệch tiền → báo dư sai.
+            //   Áp dụng cho cả overstay lẫn trả sớm: mốc tính = giờ khách thực sự rời đi.
+            plannedCheckOut: actualCO,
             transferAt:      new Date(lastTransfer.transferAt),
             oldRoom: {
               number: lastTransfer.fromRoomNumber,
@@ -3371,6 +3390,179 @@ const undoRoom = async (req, res, next) => {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ NEW 24/05/2026: HOÀN TÁC ĐỔI PHÒNG (undo lần chuyển phòng CUỐI CÙNG)
+//   Dùng khi đổi phòng NHẦM. Gỡ entry cuối khỏi transferHistory, đưa khách về phòng
+//   trước đó, hoàn lại phí chuyển phòng của lần đó, rebuild lại giá. Như chưa từng đổi.
+//   - Chỉ Admin/Manager (checkUndoPermission).
+//   - Chỉ undo được khi CÒN transferHistory và booking chưa checked_out
+//     (đã trả phòng thì không undo đổi phòng — phải undo checkout trước).
+//   - KHÔNG hỗ trợ booking đoàn ở đây (cần subRoomId — xử lý riêng nếu cần).
+// ════════════════════════════════════════════════════════════════════════════
+const undoMoveRoom = async (req, res, next) => {
+  try {
+    const perm = checkUndoPermission(req.user)
+    if (!perm.ok) {
+      return res.status(perm.status).json({ success: false, code: perm.code, message: perm.message })
+    }
+
+    const { reason } = req.body
+    if (!reason) return res.status(400).json({ success: false, message: 'Cần nhập lý do hoàn tác đổi phòng' })
+
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+
+    if (Array.isArray(booking.rooms) && booking.rooms.length > 0) {
+      return res.status(400).json({ success: false, message: 'Booking đoàn — hoàn tác đổi phòng theo đoàn chưa được hỗ trợ' })
+    }
+    if (booking.status === 'checked_out') {
+      return res.status(400).json({ success: false, message: 'Booking đã trả phòng — hãy hoàn tác trả phòng (undo checkout) trước' })
+    }
+    const hist = Array.isArray(booking.transferHistory) ? booking.transferHistory : []
+    if (hist.length === 0) {
+      return res.status(400).json({ success: false, message: 'Booking chưa từng đổi phòng — không có gì để hoàn tác' })
+    }
+
+    // Lần đổi CUỐI cần undo
+    const last = hist[hist.length - 1]
+    const fromRoomId     = last.fromRoomId
+    const fromRoomNumber = last.fromRoomNumber
+    const curRoomId      = booking.roomId          // phòng hiện tại (phòng đã đổi NHẦM tới)
+    const restoreFee     = last.fee || 0
+
+    // Lấy thông tin phòng cũ (để khôi phục roomType + policy)
+    const fromRoom = await Room.findById(fromRoomId).populate('typeId')
+    if (!fromRoom) {
+      return res.status(404).json({ success: false, message: `Không tìm thấy phòng cũ ${fromRoomNumber} để quay về` })
+    }
+
+    // (1) Gỡ entry cuối khỏi transferHistory
+    booking.transferHistory = hist.slice(0, -1)
+
+    // (2) Khôi phục phòng hiện tại về phòng cũ
+    booking.roomId     = fromRoomId
+    booking.roomNumber = fromRoomNumber
+    booking.roomType   = fromRoom.typeId?.name || fromRoom.typeName || booking.roomType
+
+    // (3) Hoàn lại phí chuyển phòng của lần undo
+    booking.transferFee = Math.max(0, (booking.transferFee || 0) - restoreFee)
+
+    // (4) Khôi phục policy về oldPolicyId của lần đổi (nếu có)
+    if (last.oldPolicyId) {
+      try {
+        const oldPol = await PricePolicy.findById(last.oldPolicyId)
+        if (oldPol) {
+          const cap = fromRoom.typeId?.capacity ?? 2
+          booking.policyId       = oldPol._id
+          booking.policyName     = oldPol.name
+          booking.policySnapshot = buildPolicySnapshot(oldPol, cap)
+        }
+      } catch (_) {}
+    }
+
+    // (5) Rebuild lại priceBreakdown từ transferHistory CÒN LẠI (đã gỡ entry cuối).
+    //     Nếu không còn transfer nào → tính lại như booking thường (1 phòng).
+    try {
+      const _branch = await Branch.findById(booking.branchId)
+      if (booking.transferHistory.length > 0) {
+        const _rebuilt = await rebuildBookingBreakdown(booking, _branch)
+        if (_rebuilt && Array.isArray(_rebuilt.breakdown) && _rebuilt.breakdown.length > 0) {
+          booking.priceBreakdown = _rebuilt.breakdown
+          booking.roomAmount     = _rebuilt.roomAmount
+        }
+      } else {
+        // Không còn transfer → tính lại đơn giản theo phòng cũ
+        const policy = booking.policyId ? await PricePolicy.findById(booking.policyId) : null
+        const maxAdults   = fromRoom.typeId?.maxAdults   ?? fromRoom.typeId?.capacity ?? 2
+        const maxChildren = fromRoom.typeId?.maxChildren ?? 0
+        const maxOccupancy = fromRoom.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
+        if (policy && _branch) {
+          const r = calculatePrice({
+            checkIn:   booking.actualCheckIn ?? booking.checkIn,
+            checkOut:  booking.checkOut,
+            priceType: booking.priceType,
+            policy, branch: _branch,
+            adults: booking.adults, children: booking.children,
+            maxAdults, maxChildren, maxOccupancy,
+          })
+          if (!r.error) {
+            booking.priceBreakdown = r.breakdown
+            booking.roomAmount     = r.roomAmount
+          }
+        }
+      }
+      // Cập nhật discount + totalAmount
+      let _disc = booking.discount ?? 0
+      if (booking.discountPercent > 0 || booking.discountAmount > 0 || booking.isFreeRoom) {
+        const _roomPart = booking.isFreeRoom ? 0 : booking.roomAmount
+        const _sub = _roomPart + (booking.servicesAmount ?? 0)
+        _disc = Math.round(_sub * (booking.discountPercent ?? 0) / 100) + (booking.discountAmount ?? 0)
+      }
+      booking.discount    = _disc
+      booking.totalAmount = Math.max(0,
+        booking.roomAmount + (booking.servicesAmount ?? 0) - _disc + (booking.transferFee ?? 0))
+    } catch (_rebuildErr) {
+      console.error('[undoMoveRoom] rebuild breakdown failed:', _rebuildErr.message)
+    }
+
+    booking.notes = `${booking.notes || ''}\n[Hoàn tác đổi phòng: ${booking.roomNumber} ← (huỷ chuyển tới ${last.toRoomNumber})${reason ? ' • ' + reason : ''}]`.trim()
+    booking.undoReason = reason
+    await booking.save()
+
+    // (6) Cập nhật trạng thái phòng: giải phóng phòng đổi-nhầm, gán lại phòng cũ.
+    //     Chỉ giải phóng phòng nhầm nếu KHÔNG còn chặng nào dùng nó.
+    const stillUses = (booking.transferHistory || []).some(t =>
+      String(t.toRoomId) === String(curRoomId) || String(t.fromRoomId) === String(curRoomId))
+    if (!stillUses && String(curRoomId) !== String(fromRoomId)) {
+      const curUpdate = { currentBookingId: null, currentGuestName: null }
+      if (booking.status === 'checked_in') curUpdate.roomStatus = 'active'  // trả phòng nhầm về available
+      await Room.findByIdAndUpdate(curRoomId, curUpdate)
+    }
+    await Room.findByIdAndUpdate(fromRoomId, {
+      currentBookingId: booking._id,
+      currentGuestName: booking.customerName,
+      ...(booking.status === 'checked_in' ? { roomStatus: 'inactive' } : {}),
+    })
+
+    // (7) Sync invoice
+    try {
+      const invoice = await Invoice.findOne({ bookingId: booking._id })
+      if (invoice) {
+        invoice.roomAmount      = booking.roomAmount
+        invoice.discount        = booking.discount
+        invoice.totalAmount     = booking.totalAmount
+        invoice.remainingAmount = Math.max(0, invoice.totalAmount - (invoice.paidAmount ?? 0))
+        invoice.paymentStatus   = invoice.paidAmount >= invoice.totalAmount ? 'paid' :
+                                  invoice.paidAmount > 0 ? 'partial' : 'unpaid'
+        await invoice.save()
+      }
+    } catch (e) {
+      console.error('[undoMoveRoom] sync invoice failed (non-fatal):', e.message)
+    }
+
+    await logAction({
+      entityType: 'Booking', entityId: booking._id,
+      action: 'undo_move_room',
+      description: `Hoàn tác đổi phòng: huỷ chuyển ${fromRoomNumber} → ${last.toRoomNumber} (${reason})`,
+      user: req.user, branchId: booking.branchId,
+      metadata: {
+        reason, restoredRoom: fromRoomNumber, cancelledToRoom: last.toRoomNumber,
+        refundedFee: restoreFee, remainingTransfers: booking.transferHistory.length,
+        bookingCode: booking.bookingCode, actorRole: req.user.role,
+      },
+    })
+
+    res.json({
+      success: true,
+      message: `Đã hoàn tác đổi phòng — khách quay về phòng ${fromRoomNumber}${restoreFee > 0 ? `, hoàn phí ${restoreFee.toLocaleString('vi-VN')}đ` : ''}`,
+      data: { booking },
+    })
+  } catch (err) {
+    console.error('[undoMoveRoom] error:', err)
+    next(err)
+  }
+}
+
 const getAvailableByDate = async (req, res, next) => {
   try {
     const { checkIn, checkOut, branchId, excludeBookingId } = req.query
@@ -3568,22 +3760,47 @@ const calculateBill = async (req, res, next) => {
     const effectiveCheckIn = booking.actualCheckIn ?? booking.checkIn
 
     let effectiveCheckOut
+    // ⭐ FIX 25/05/2026: Mốc HIỂN THỊ "Tính đến" = giờ THỰC đang xem (không ceil).
+    //   effectiveCheckOut có thể bị ceil tới 12:00 để TÍNH TIỀN giá ngày trọn đêm (đúng),
+    //   nhưng nhãn "Tính đến" phải là giờ hiện tại để khỏi gây nhầm "tính tới tương lai".
+    let viewedAtForDisplay = null
     if (mode === 'now') {
       const refTime = atTime ? new Date(atTime) : new Date()
       effectiveCheckOut = refTime < effectiveCheckIn ? new Date(effectiveCheckIn.getTime() + 60000) : refTime
+      viewedAtForDisplay = new Date(effectiveCheckOut)  // giờ thực TRƯỚC khi ceil
 
-      // ⭐ FIX 24/05/2026: Quy tắc "QUÁ HẠN = TRỌN ĐÊM" (áp dụng MỌI loại booking).
-      //   Khi giờ hiện tại đã vượt giờ trả dự kiến (booking.checkOut), khách bị tính
-      //   trọn thêm đêm (KHÔNG dùng slot giờ trả muộn). Ceil refTime lên giờ trả chuẩn
-      //   gần nhất >= refTime. Vd now=24/05 01:58, CO chuẩn 12:00 → 24/05 12:00.
-      //   Lưu ý: chỉ áp dụng khi KHÔNG có atTime tự chọn (atTime = nhân viên chủ động set giờ).
+      // ⭐ FIX 24/05/2026 (v2): Quy tắc "QUÁ HẠN = TRỌN ĐÊM" — sửa MỐC kích hoạt.
+      //   LỖI CŨ: ceil khi now > booking.checkOut (giờ trả KHÁCH ĐẶT, vd 18:00) → quá 18:00
+      //   15 phút đã bị nhảy "Tính đến" sang 12:00 hôm sau → tính giá ngày sai.
+      //   ĐÚNG (theo spec mục I): chỉ tính trọn đêm khi giờ hiện tại đã QUA MỐC
+      //   dayEquivalentHours (vd 23h) của ngày, HOẶC đã thực sự SANG NGÀY khác so với
+      //   giờ trả chuẩn. Trước mốc đó → tính tới giờ hiện tại (giá giờ/ngày + phụ thu trễ).
+      //   Lưu ý: chỉ áp dụng khi KHÔNG có atTime (atTime = nhân viên chủ động chọn giờ).
       if (!atTime && booking.checkOut && effectiveCheckOut > new Date(booking.checkOut)) {
+        const dayEquivH = Number(branch?.dayEquivalentHours ?? 23)
         const [coH, coM] = String(branch?.dayCheckOutTime || branch?.checkOutTime || '12:00')
           .split(':').map(Number)
-        const ceil = new Date(effectiveCheckOut)
-        ceil.setHours(coH || 12, coM || 0, 0, 0)
-        if (ceil < effectiveCheckOut) ceil.setDate(ceil.getDate() + 1)
-        effectiveCheckOut = ceil
+        // Mốc giờ trả chuẩn của NGÀY check-out dự kiến
+        const stdCheckoutOfPlanned = new Date(booking.checkOut)
+        stdCheckoutOfPlanned.setHours(coH || 12, coM || 0, 0, 0)
+        // Đã sang ngày khác so với ngày trả chuẩn?
+        const isAfterPlannedDay =
+          effectiveCheckOut.getFullYear() > stdCheckoutOfPlanned.getFullYear() ||
+          (effectiveCheckOut.getFullYear() === stdCheckoutOfPlanned.getFullYear() &&
+            effectiveCheckOut.getMonth() > stdCheckoutOfPlanned.getMonth()) ||
+          (effectiveCheckOut.getFullYear() === stdCheckoutOfPlanned.getFullYear() &&
+            effectiveCheckOut.getMonth() === stdCheckoutOfPlanned.getMonth() &&
+            effectiveCheckOut.getDate() > stdCheckoutOfPlanned.getDate())
+        // Đã qua mốc dayEquivalentHours của ngày hiện tại?
+        const pastDayEquiv = effectiveCheckOut.getHours() >= dayEquivH
+        // CHỈ ceil trọn đêm khi: qua mốc 23h cùng ngày, HOẶC đã sang ngày khác.
+        if (pastDayEquiv || isAfterPlannedDay) {
+          const ceil = new Date(effectiveCheckOut)
+          ceil.setHours(coH || 12, coM || 0, 0, 0)
+          if (ceil < effectiveCheckOut) ceil.setDate(ceil.getDate() + 1)
+          effectiveCheckOut = ceil
+        }
+        // Ngược lại (vd 18:15, chưa qua 23h, cùng ngày) → GIỮ giờ hiện tại, không ceil.
       }
     } else {
       effectiveCheckOut = booking.checkOut
@@ -4041,6 +4258,26 @@ const calculateBill = async (req, res, next) => {
             .filter(it => String(it.meta?.roomNumber) === String(newRoomNum))
             .map(it => ({ label: it.label, amount: it.amount, type: it.type === 'surcharge' ? 'surcharge' : 'base', meta: it.meta || {} }))
 
+          // ⭐ FIX 25/05/2026: Khi effectiveCheckOut bị CEIL (tới 12:00) để tính tiền giá
+          //   ngày trọn đêm, label chặng cuối ghi mốc "→ 12:00" gây nhầm. Sửa mốc CUỐI
+          //   trong label về GIỜ THỰC đang xem (viewedAtForDisplay), GIỮ NGUYÊN amount.
+          //   Chỉ áp khi mode='now' + có ceil (viewedAt < effectiveCheckOut).
+          if (mode === 'now' && viewedAtForDisplay
+              && viewedAtForDisplay.getTime() < new Date(effectiveCheckOut).getTime()) {
+            const _pad = n => String(n).padStart(2, '0')
+            const _va = viewedAtForDisplay
+            const realEndStr = `${_pad(_va.getDate())}/${_pad(_va.getMonth() + 1)} ${_pad(_va.getHours())}:${_pad(_va.getMinutes())}`
+            let _lastBaseIdx = -1
+            for (let i = liveOfCurrent.length - 1; i >= 0; i--) {
+              if (liveOfCurrent[i].type === 'base') { _lastBaseIdx = i; break }
+            }
+            if (_lastBaseIdx >= 0) {
+              const it = liveOfCurrent[_lastBaseIdx]
+              const newLabel = it.label.replace(/→\s*\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\)/, `→ ${realEndStr})`)
+              if (newLabel !== it.label) liveOfCurrent[_lastBaseIdx] = { ...it, label: newLabel }
+            }
+          }
+
           // ⭐ FIX 24/05/2026: Việc bỏ "Trả phòng trễ" khi chặng mới tính GIÁ GIỜ đã được
           //   xử lý TRONG computeMoveRoomBreakdown (cờ newRoomPricedHourly). Ở đây KHÔNG lọc
           //   theo same-day nữa — vì nếu chặng mới ra GIÁ NGÀY thì trả trễ VẪN tính (đúng spec).
@@ -4192,6 +4429,24 @@ const calculateBill = async (req, res, next) => {
           type: it.type === 'surcharge' ? 'surcharge' : 'base',
           meta: it.meta || {},
         }))
+
+        // ⭐ FIX 25/05/2026: sửa mốc CUỐI label chặng về GIỜ THỰC khi effectiveCheckOut bị ceil
+        //   (giữ amount giá ngày trọn đêm). Chỉ sửa dòng base CUỐI (chặng đang ở), không đụng chặng cũ.
+        if (mode === 'now' && viewedAtForDisplay
+            && viewedAtForDisplay.getTime() < new Date(effectiveCheckOut).getTime()) {
+          const _pad = n => String(n).padStart(2, '0')
+          const _va = viewedAtForDisplay
+          const realEndStr = `${_pad(_va.getDate())}/${_pad(_va.getMonth() + 1)} ${_pad(_va.getHours())}:${_pad(_va.getMinutes())}`
+          let _lastBaseIdx = -1
+          for (let i = breakdownItems.length - 1; i >= 0; i--) {
+            if (breakdownItems[i].type === 'base') { _lastBaseIdx = i; break }
+          }
+          if (_lastBaseIdx >= 0) {
+            const it = breakdownItems[_lastBaseIdx]
+            const newLabel = it.label.replace(/→\s*\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\)/, `→ ${realEndStr})`)
+            if (newLabel !== it.label) breakdownItems[_lastBaseIdx] = { ...it, label: newLabel }
+          }
+        }
 
         // ⭐ FIX 24/05/2026: BỎ dòng "Trả phòng trễ" của phòng MỚI khi xem live (mode='now')
         //   mà giờ xem CÙNG NGÀY calendar với lúc đổi phòng. Lý do nghiệp vụ: khách vừa
@@ -4450,6 +4705,7 @@ const calculateBill = async (req, res, next) => {
       data: {
         mode,
         effectiveCheckOut,
+        viewedAt:         viewedAtForDisplay,  // ⭐ giờ thực để hiển thị "Tính đến" (mode now)
         nights:           priceResult.nights,
         roomAmount:       priceResult.roomAmount,
         servicesAmount,
@@ -5674,6 +5930,7 @@ module.exports = {
   checkinRoom,
   checkoutRoom,
   undoRoom,
+  undoMoveRoom,
   getCanSetPast,
   // ⭐ NEW 11/05/2026
   mergeGroup,
