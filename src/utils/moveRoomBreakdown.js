@@ -23,6 +23,14 @@
  * ════════════════════════════════════════════════════════════════════════════
  */
 
+// ⭐ FIX 24/05/2026 (LƯỚI AN TOÀN — Lớp 2): module dùng .getHours()/.getDate() theo
+//   TZ process. Server chưa set TZ (UTC) → nhận 09:00 VN (=02:00 UTC) bị tính nhầm
+//   là rạng sáng → mất phụ thu nhận sớm, lệch mốc 12h/23h. Ép TZ về giờ VN.
+//   Chính yếu vẫn set TZ ở entrypoint (DÒNG ĐẦU server.js); dòng dưới là lưới phụ.
+if (process.env.TZ !== 'Asia/Ho_Chi_Minh') {
+  process.env.TZ = 'Asia/Ho_Chi_Minh'
+}
+
 const DEFAULT_CONFIG = Object.freeze({
   CI_HOUR: 14,
   CO_HOUR: 12,

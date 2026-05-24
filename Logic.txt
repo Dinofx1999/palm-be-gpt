@@ -1,0 +1,42 @@
+Quy Tắc Tính Giá Phòng:
+toleranceMinutes:    { type: Number, default: 15 } -> branch models
+earlyCheckinUntil:   { type: Number, default: 5, min: 0, max: 11 } -> branch models
+hourToDayThreshold:  { type: Number, default: 23 } -> branch models
+dayCheckInTime:      { type: String, default: '12:00' }, -> PricePolicy models
+dayCheckOutTime:     { type: String, default: '12:00' }, -> PricePolicy models
+
+I. Phòng Thông Không đổi phòng:
+ - Phòng 201 ở Giá Giờ: Từ Thời Điểm checkin (09:00) checkout trước hourToDayThreshold = 23h cùng ngày thì tính giá giờ, sau 23h chuyển thành gía ngày
+ - Phòng 201 ở Giá Ngày: nếu nhận phòng trước dayCheckInTime = 12h và có thêm toleranceMinutes = 15 , 
+   vd 11:45 15/05 (15p toleranceMinutes) , thì miễn tính phụ thu nhận phòng sớm.
+      11:44 là tính Slot 1h (slot thấp nhất trong PricePolicy giá giờ)
+      Trả phòng trước 12h15 (có thêm toleranceMinutes = 15) -> Miễn Phí Phụ thu trả phòng trể.
+      sau 12:15 -> tính Slot 1h (slot thấp nhất trong PricePolicy giá giờ).
+      + Phụ Thu thêm người (nếu có).
+II. Phòng đổi phòng giữ chặng:
+ - Phòng 201 (500k) ở từ 09:00 15/05 -> 12:00 20/05
+   nhưng đến 10:00 17/05 đổi qua phòng 301 (600k), Trường hợp này sẽ chia ra 2 TH:
+    TH1: -Đổi Phòng trước 12h00 xong trả phòng trong ngày luôn, nhưng trước hourToDayThreshold = 23h , như này sẽ tính tiền như sau:
+         [201] 09:00 15/05 -> 10:00 17/05 (2 Đêm ) 1.000.000 vnđ 
+         [301] 10:00 17/05 -> Hiện Tại (14h) -> Giá Giờ Slot 4h Nếu 14:16 Slot 5h 
+         Phụ thu: Chuyển Phòng (nếu có)
+         Total: 1.000.000 + (Giá Giờ Slot 5h (tuỳ giờ)) + Phụ thu
+         - Đổi Phòng sau 12:00 xong trả phòng trong ngày luôn, nhưng trước hourToDayThreshold = 23h , như này sẽ tính tiền như sau:
+        [201] 09:00 15/05 -> 14:00 17/05 (2 Đêm ) 1.000.000 vnđ (Không tính phụ thu trả trể vì liên phòng)
+        [301] 12:00 17/05 -> Hiện Tại (14h) -> Giá Giờ Slot 2h Nếu 14:16 Slot 3h (Trả phòng sẽ tính từ 12:00 - 14h, mặc dù đổi từ 14:00)
+         Phụ thu: Chuyển Phòng (nếu có)
+         Total: 1.000.000 + (Giá Giờ Slot 3h (tuỳ giờ)) + Phụ thu
+
+    TH2: Đổi Phòng xong trả phòng sau thời gian hourToDayThreshold = 23h (mặc dù cùng ngày),
+         [201] 09:00 15/05 -> 10:00 17/05 (2 Đêm ) 1.000.000 vnđ 
+         [301] 12:00 17/05 -> 10:00 20/05 (3 Đêm ) 1.800.000 vnđ
+          Phụ thu: Chuyển Phòng (nếu có)
+          Total: 1.000.000 + 1.800.000 + Phụ thu
+         *nếu trả phòng sau 12:15 phụ thu trả phòng trể theo Giá Phụ Thu Trể của [301]
+
+   *Lưu ý không tính phụ thu cho phòng đổi phòng giữa chặng:
+    - 12h checkout nhưng checkout 14h để đổi phòng khác (12h -> 14h free phụ thu trả phòng trể).
+    - Đổi phòng 12h checkin nhưng đổi phòng lúc 10h (10h->12h free phụ thu nhận phòng sớm)
+
+
+  

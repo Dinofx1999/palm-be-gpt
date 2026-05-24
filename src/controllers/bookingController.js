@@ -3828,8 +3828,32 @@ const calculateBill = async (req, res, next) => {
     const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
     const hasCustomPrice = (booking.priceBreakdown ?? []).some(b => b.meta?.customPrice === true)
 
-    const hasTransferred = (booking.transferHistory ?? []).length > 0
-    const lastTransfer = hasTransferred ? booking.transferHistory[booking.transferHistory.length - 1] : null
+    // ⭐ FIX 24/05/2026: Chỉ tính các lần chuyển ĐÃ XẢY RA tính tới thời điểm xem.
+    //   Khi xem "Đến hiện tại" ở mốc TRƯỚC khi đổi phòng (now/atTime < transferAt),
+    //   sự kiện chuyển chưa diễn ra → bỏ qua, chỉ tính phòng khách thực đang ở tới giờ xem.
+    //   Tránh lỗi: tính phòng cũ quá giờ xem + cộng phụ thu chuyển phòng của sự kiện tương lai.
+    //   (mode='checkout' dùng booking.checkOut nên mọi transfer trong kỳ đều đã xảy ra → giữ đủ.)
+    const _allTransfers = (booking.transferHistory ?? [])
+      .filter(t => t?.transferAt && t?.fromRoomNumber && t?.toRoomNumber)
+      .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+    const _occurredTransfers = _allTransfers.filter(
+      t => new Date(t.transferAt) <= new Date(effectiveCheckOut)
+    )
+    // Booking "view" theo thời điểm xem: nếu có transfer tương lai bị loại, phòng đang ở
+    // phải lùi về phòng GỐC tại mốc xem (fromRoomNumber của transfer kế tiếp chưa xảy ra).
+    const _firstFutureTransfer = _allTransfers.find(
+      t => new Date(t.transferAt) > new Date(effectiveCheckOut)
+    )
+    const booking_view = (_occurredTransfers.length !== _allTransfers.length)
+      ? Object.assign(Object.create(Object.getPrototypeOf(booking)), booking.toObject ? booking.toObject() : booking, {
+          transferHistory: _occurredTransfers,
+          // phòng đang ở tại mốc xem = phòng nguồn của lần chuyển tương lai gần nhất
+          roomNumber: _firstFutureTransfer ? _firstFutureTransfer.fromRoomNumber : booking.roomNumber,
+        })
+      : booking
+
+    const hasTransferred = (booking_view.transferHistory ?? []).length > 0
+    const lastTransfer = hasTransferred ? booking_view.transferHistory[booking_view.transferHistory.length - 1] : null
 
     let priceResult
     if (hasCustomPrice) {
@@ -3927,7 +3951,7 @@ const calculateBill = async (req, res, next) => {
       //   booking.priceBreakdown được build incrementally trong moveRoom handler
       //   (mỗi lần move thêm seg mới). Recompute từ đầu sẽ mất segment trung gian.
       //   → Ưu tiên đọc từ DB, không recompute.
-      const transferCount = (booking.transferHistory ?? []).length
+      const transferCount = (booking_view.transferHistory ?? []).length
       if (transferCount >= 2) {
         // ⭐ FIX 24/05/2026: ≥2 transfer — HYBRID:
         //   - Các chặng CŨ (đã ở xong, mọi phòng trừ phòng đang ở): lấy từ rebuild
@@ -3936,13 +3960,13 @@ const calculateBill = async (req, res, next) => {
         //     của lần đổi CUỐI → giữ đúng quy tắc giờ↔ngày theo dayEquivalentHours
         //     (live trước 23h = giá giờ từ transferAt; sau 23h = giá ngày).
         try {
-          const hist = (booking.transferHistory ?? [])
+          const hist = (booking_view.transferHistory ?? [])
             .filter(t => t?.transferAt && t?.fromRoomNumber && t?.toRoomNumber)
             .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
           const lastT = hist[hist.length - 1]
 
           // (1) Rebuild để lấy các chặng CŨ đã finalized (bỏ chặng phòng đang ở).
-          const rebuilt = await rebuildBookingBreakdown(booking, branch, {
+          const rebuilt = await rebuildBookingBreakdown(booking_view, branch, {
             plannedCheckOut: new Date(lastT.transferAt),   // chỉ tới mốc đổi cuối → chỉ ra chặng cũ
           })
           const frozenItems = (rebuilt?.breakdown ?? [])
@@ -4005,10 +4029,22 @@ const calculateBill = async (req, res, next) => {
             } : null,
           })
           // Chỉ giữ các dòng của phòng ĐANG Ở (bỏ dòng phòng cũ trùng + fee)
-          const liveOfCurrent = liveItems
+          let liveOfCurrent = liveItems
             .filter(it => !(it.meta && it.meta.transferFee))
             .filter(it => String(it.meta?.roomNumber) === String(newRoomNum))
             .map(it => ({ label: it.label, amount: it.amount, type: it.type === 'surcharge' ? 'surcharge' : 'base', meta: it.meta || {} }))
+
+          // ⭐ FIX 24/05/2026: BỎ "Trả phòng trễ" phòng mới khi xem live cùng ngày đổi phòng.
+          if (mode === 'now') {
+            const _eff = new Date(effectiveCheckOut)
+            const _tAt = new Date(lastT.transferAt)
+            const _sameDay = _eff.getFullYear() === _tAt.getFullYear()
+              && _eff.getMonth() === _tAt.getMonth()
+              && _eff.getDate() === _tAt.getDate()
+            if (_sameDay) {
+              liveOfCurrent = liveOfCurrent.filter(b => !(b.meta && b.meta.lateCheckout === true))
+            }
+          }
 
           const merged = [...frozenItems, ...liveOfCurrent]
           priceResult = {
@@ -4151,12 +4187,28 @@ const calculateBill = async (req, res, next) => {
 
         // ⭐ FIX: KHÔNG filter fee item nữa — để nó hiển thị trong breakdown
         //   Nhưng phải cẩn thận: không double count với booking.transferFee đã cộng vào totalAmount
-        const breakdownItems = items.map(it => ({
+        let breakdownItems = items.map(it => ({
           label: it.label,
           amount: it.amount,
           type: it.type === 'surcharge' ? 'surcharge' : 'base',
           meta: it.meta || {},
         }))
+
+        // ⭐ FIX 24/05/2026: BỎ dòng "Trả phòng trễ" của phòng MỚI khi xem live (mode='now')
+        //   mà giờ xem CÙNG NGÀY calendar với lúc đổi phòng. Lý do nghiệp vụ: khách vừa
+        //   đổi vào phòng mới trong ngày, chưa thể "trả trễ" — phí trễ chỉ vô nghĩa khi
+        //   khách còn ở tiếp trong cùng ngày. Nếu đã sang ngày khác (qua đêm) → GIỮ.
+        //   Chỉ áp dụng cho chặng đổi phòng (lateCheckout của phòng mới), không đụng booking thường.
+        if (mode === 'now') {
+          const _eff = new Date(effectiveCheckOut)
+          const _tAt = new Date(lastTransfer.transferAt)
+          const _sameDayAsTransfer = _eff.getFullYear() === _tAt.getFullYear()
+            && _eff.getMonth() === _tAt.getMonth()
+            && _eff.getDate() === _tAt.getDate()
+          if (_sameDayAsTransfer) {
+            breakdownItems = breakdownItems.filter(b => !(b.meta && b.meta.lateCheckout === true))
+          }
+        }
 
         // ⭐ FIX 18/05/2026 (v20.1) — Bổ sung phụ thu
         //   moveRoomBreakdown CHỈ trả tiền phòng. Cần thêm:
@@ -4308,14 +4360,35 @@ const calculateBill = async (req, res, next) => {
       }
       }  // ⭐ end of else { (multi-transfer fallback)
     } else {
+      // ⭐ FIX 24/05/2026: Xem TRƯỚC khi đổi phòng (transfer tương lai đã bị lọc) →
+      //   phòng thực đang ở tại mốc xem là phòng GỐC, không phải phòng hiện tại của booking.
+      //   Dùng policy của phòng gốc đó để tính đúng (không tính nhầm giá phòng mới).
+      let _plainPolicy = policy
+      let _plainMaxAdults = maxAdults, _plainMaxChildren = maxChildren, _plainMaxOccupancy = maxOccupancy
+      if (_firstFutureTransfer && _firstFutureTransfer.fromRoomNumber) {
+        try {
+          if (_firstFutureTransfer.oldPolicyId) {
+            const op = await PricePolicy.findById(_firstFutureTransfer.oldPolicyId)
+            if (op) _plainPolicy = op
+          }
+          const origRoomDoc = await Room.findOne({
+            number: _firstFutureTransfer.fromRoomNumber, branchId: booking.branchId,
+          }).populate('typeId')
+          if (origRoomDoc?.typeId) {
+            _plainMaxAdults    = origRoomDoc.typeId.maxAdults   ?? origRoomDoc.typeId.capacity ?? _plainMaxAdults
+            _plainMaxChildren  = origRoomDoc.typeId.maxChildren ?? _plainMaxChildren
+            _plainMaxOccupancy = origRoomDoc.typeId.maxOccupancy ?? (_plainMaxAdults + _plainMaxChildren)
+          }
+        } catch (_) {}
+      }
       priceResult = calculatePrice({
         checkIn:   effectiveCheckIn,
         checkOut:  effectiveCheckOut,
         priceType: booking.priceType,
-        policy, branch,
+        policy: _plainPolicy, branch,
         adults:    booking.adults,
         children:  booking.children,
-        maxAdults, maxChildren, maxOccupancy,
+        maxAdults: _plainMaxAdults, maxChildren: _plainMaxChildren, maxOccupancy: _plainMaxOccupancy,
       })
     }
 
@@ -4329,7 +4402,7 @@ const calculateBill = async (req, res, next) => {
     //   → Thêm prefix [roomNumber] vào label của mode 'now' để hiển thị nhất quán.
     //   KHÔNG thêm roomType (chỉ là tên loại phòng) để label gọn hơn.
     if (priceResult.breakdown && Array.isArray(priceResult.breakdown)) {
-      const roomNumPrefix = booking.roomNumber || ''
+      const roomNumPrefix = booking_view.roomNumber || booking.roomNumber || ''
       priceResult.breakdown = priceResult.breakdown.map(b => {
         const lbl = String(b.label || '')
         // Đã có prefix [...] rồi → giữ nguyên

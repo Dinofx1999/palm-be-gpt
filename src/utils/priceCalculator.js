@@ -2,7 +2,18 @@
 // utils/priceCalculator.js
 // Logic tính giá tập trung — đảm bảo BE trả ra số tiền giống FE
 // v2.0 — 18/05/2026: Surcharge logic v2 (maxOccupancy roomType) + OVER_CAPACITY block
+// v2.1 — 24/05/2026: TZ guard — module tính giá theo giờ VN (UTC+7).
 // ─────────────────────────────────────────────────────────
+
+// ⭐ FIX 24/05/2026 (LƯỚI AN TOÀN — Lớp 2): module này dùng .getHours()/.getDate()
+//   theo TZ của process. Nếu server CHƯA set TZ (mặc định UTC), khách nhận 09:00 VN
+//   (= 02:00 UTC) sẽ bị tính nhầm là 02:00 → mất phụ thu nhận sớm, lệch mốc 12h/23h.
+//   ⇒ Ép TZ về Asia/Ho_Chi_Minh. LƯU Ý: chính yếu vẫn nên set TZ ở entrypoint app
+//   (process.env.TZ = 'Asia/Ho_Chi_Minh' ở DÒNG ĐẦU server.js) để chắc chắn áp dụng
+//   trước khi V8 cache timezone. Dòng dưới là lưới phụ phòng khi quên.
+if (process.env.TZ !== 'Asia/Ho_Chi_Minh') {
+  process.env.TZ = 'Asia/Ho_Chi_Minh'
+}
 
 /**
  * Parse "HH:mm" → minutes
