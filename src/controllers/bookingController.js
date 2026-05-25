@@ -1541,7 +1541,9 @@ const moveRoom = async (req, res, next) => {
           },
         },
         transferFee: 0,    // fee được handle riêng ở booking.transferFee
-        changeRate:  oldRoomType !== newRoomType,  // chỉ đổi rate khi khác loại
+        // ⭐ FIX 25/05/2026: changeRate theo Ý ĐỊNH nhân viên (so policyId), KHÔNG suy từ loại
+        //   phòng. "Giữ giá cũ" (phòng hỏng) → không đổi policy → changeRate=false → giữ giá gốc.
+        changeRate:  String(sourcePolicyId ?? '') !== String(newPolicyId ?? ''),
         isFreeRoom:  !!booking.isFreeRoom,
       }
 
@@ -2555,7 +2557,8 @@ const checkout = async (req, res, next) => {
                 dayAdultSurcharge: policy?.dayAdultSurcharge, dayChildSurcharge: policy?.dayChildSurcharge },
             },
             transferFee: Number(lastTransfer.fee) || 0,
-            changeRate:  oldRoomType !== newRoomType,
+            // ⭐ FIX 25/05/2026: changeRate theo ý định nhân viên (policyId), không suy từ loại phòng.
+            changeRate:  String(lastTransfer.oldPolicyId ?? '') !== String(lastTransfer.newPolicyId ?? ''),
             isFreeRoom:  !!booking.isFreeRoom,
             branchConfig: branch ? {
             checkInTime: branch.checkInTime,
@@ -4244,7 +4247,8 @@ const calculateBill = async (req, res, next) => {
               dayAdultSurcharge: newPolicy?.dayAdultSurcharge, dayChildSurcharge: newPolicy?.dayChildSurcharge,
             } },
             transferFee: 0,   // fee tách riêng (booking.transferFee)
-            changeRate:  oldRoomType !== newRoomType,
+            // ⭐ FIX 25/05/2026: changeRate theo ý định nhân viên (policyId), không suy từ loại phòng.
+            changeRate:  String(lastT.oldPolicyId ?? '') !== String(lastT.newPolicyId ?? ''),
             isFreeRoom:  !!booking.isFreeRoom,
             branchConfig: branch ? {
               checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime,
@@ -4410,7 +4414,8 @@ const calculateBill = async (req, res, next) => {
           // ⭐ FIX: Truyền fee từ transferHistory để module sinh dòng phụ thu
           //   booking.transferFee là TỔNG dồn các lần chuyển — đây chỉ lấy fee lần cuối
           transferFee: Number(lastTransfer.fee) || 0,
-          changeRate:  oldRoomType !== newRoomType,
+          // ⭐ FIX 25/05/2026: changeRate theo ý định nhân viên (policyId), không suy từ loại phòng.
+          changeRate:  String(lastTransfer.oldPolicyId ?? '') !== String(lastTransfer.newPolicyId ?? ''),
           isFreeRoom:  !!booking.isFreeRoom,
           branchConfig: branch ? {
             checkInTime: branch.checkInTime,

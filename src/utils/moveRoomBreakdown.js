@@ -228,6 +228,24 @@ function computeMoveRoomBreakdown(input) {
     throw new Error('Missing room policies');
   }
 
+  // ⭐ FIX 25/05/2026: GIỮ GIÁ CŨ (changeRate=false — phòng hỏng/lỗi, hotel chịu trách nhiệm).
+  //   Tính TOÀN BỘ thời gian ở theo ĐƠN GIÁ CŨ, gộp 1 dòng duy nhất, nhưng hiển thị SỐ
+  //   PHÒNG MỚI (vd [302]). Coi như khách ở thẳng phòng mới với giá cũ từ đầu → KHÔNG tách
+  //   segment, KHÔNG phát sinh giá giờ / phụ thu chênh lệch. Phí chuyển = 0 (hotel chịu).
+  //   Chỉ THÊM điều kiện này; nhánh đổi-giá (changeRate=true) giữ nguyên logic cũ phía dưới.
+  if (input.changeRate === false) {
+    oldRoom = {
+      number: newRoom.number,   // hiển thị số phòng MỚI
+      type:   newRoom.type,
+      policy: oldRoom.policy,    // nhưng dùng ĐƠN GIÁ CŨ
+    };
+    newRoom = oldRoom;
+    transferFee = 0;            // hotel chịu — không thu phí chuyển
+    // Đặt transferAt = checkout để không có "điểm chuyển" → module tính 1 segment liền.
+    input = { ...input, transferAt: plannedCheckOut };
+    transferAt = plannedCheckOut;
+  }
+
   let ci = new Date(actualCheckIn);
   const co = new Date(plannedCheckOut);
   let tAt = new Date(transferAt);

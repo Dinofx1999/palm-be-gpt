@@ -98,6 +98,7 @@ app.use('/api/public', require('./routes/public'));
 app.use('/api/news',        require('./routes/news'));
 app.use('/api/site-config', require('./routes/siteConfig'));
 app.use('/api/public',      require('./routes/publicContent'));
+app.use('/api/tasks', require('./routes/tasks'));
 
 // ─────────────────────────────────────────────────────
 // ⭐ NEW 14/05/2026: Module Tài chính (Thu/Chi + Bàn giao ca + Đối soát)
