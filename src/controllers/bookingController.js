@@ -1428,6 +1428,26 @@ const moveRoom = async (req, res, next) => {
     if (newRoom.roomStatus !== 'active')
       return res.status(400).json({ success: false, message: 'Phòng đích không khả dụng' })
 
+    // ⭐ FIX 25/05/2026: Chặn chuyển vào phòng ĐÃ thuộc đoàn này (sub-room khác đang active).
+    //   findOverlapForNewBooking exclude booking._id → KHÔNG phát hiện trùng NỘI BỘ đoàn,
+    //   nên 201→202 khi 202 đã nằm trong đoàn vẫn lọt → rooms[] có 2 sub-room cùng roomId
+    //   → calculate-bill tính phòng 2 lần (lỗi BK_EEHRKN: 202 hiện 2 dòng giá ngày + 2 phụ thu).
+    //   Guard cũ (subRoom.roomId === newRoomId) chỉ chặn chuyển-về-chính-nó, không chặn phòng anh-em.
+    if (isGroup) {
+      const dupSubIdx = booking.rooms.findIndex((sr, idx) =>
+        idx !== subRoomIdx &&
+        String(sr.roomId?._id ?? sr.roomId) === String(newRoomId) &&
+        !['cancelled', 'checked_out'].includes(sr.status)
+      )
+      if (dupSubIdx >= 0) {
+        return res.status(400).json({
+          success: false,
+          code: 'ROOM_ALREADY_IN_GROUP',
+          message: `Phòng ${newRoom.number} đã nằm trong đoàn này (đang sử dụng). Vui lòng chọn phòng đích khác.`,
+        })
+      }
+    }
+
     const checkInRange  = (isGroup && subRoom?.checkIn)  ? subRoom.checkIn  : booking.checkIn
     const checkOutRange = (isGroup && subRoom?.checkOut) ? subRoom.checkOut : booking.checkOut
 
@@ -2687,47 +2707,98 @@ const checkout = async (req, res, next) => {
 
           const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
           const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
-          const seg1Items = []
-          let splitFromTime = null
-          for (const b of existingItems) {
-            const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
-            const isSeg1 = item?.meta?.segment === 1 ||
-                           (item?.meta?.roomNumber && String(item.meta.roomNumber) !== String(sub.roomNumber))
-            if (isSeg1) {
-              seg1Items.push(item)
-              if (item?.meta?.endTime) splitFromTime = item.meta.endTime
-            }
-          }
+          // ⭐ FIX 25/05/2026: đồng bộ với calculate-bill — phòng đoàn ĐÃ CHUYỂN phải tính bằng
+          //   computeMoveRoomBreakdown (giống phòng lẻ), KHÔNG dùng seg1/seg2 + calculatePrice cũ
+          //   (vốn dính OVER_CAPACITY khi chuyển sang phòng nhỏ → mất chặng mới → tổng lệch →
+          //   tưởng khách trả dư → chặn trả phòng đòi hoàn tiền oan).
+          const isOldSeg = (meta, srRoomNumber) =>
+            meta?.segment === 1 ||
+            meta?.policy === 'old' ||
+            meta?.segment === 'oldNights' ||
+            (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
+          const hasMoveSegments = existingItems.some(b => isOldSeg(b?.meta, sub.roomNumber))
 
           let subPriceResult
-          if (seg1Items.length > 0) {
-            const splitAt = splitFromTime ? new Date(splitFromTime) : (sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn)
-            const seg2Result = calculatePrice({
-              checkIn:   splitAt,
-              checkOut:  actualCO,
-              priceType: sub.priceType ?? booking.priceType,
-              policy, branch,
-              adults:    sub.adults   ?? booking.adults,
-              children:  sub.children ?? booking.children,
-              maxAdults, maxChildren, maxOccupancy,
-            })
-            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
-              const label = String(b.label || '')
-              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
-            })
-            const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
-            const seg2Amount = filteredSeg2.reduce((s, b) => s + Number(b.amount ?? 0), 0)
+          if (hasMoveSegments) {
+            const hist = (booking.transferHistory || [])
+              .filter(t => t?.transferAt && t?.toRoomNumber)
+              .filter(t => String(t.toRoomNumber) === String(sub.roomNumber) ||
+                           String(t?.toRoomId?._id ?? t?.toRoomId) === String(sub.roomId?._id ?? sub.roomId))
+              .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+            const lastT = hist[hist.length - 1]
 
-            subPriceResult = {
-              roomAmount: seg1Amount + seg2Amount,
-              nights:     seg2Result.nights ?? sub.nights,
-              breakdown:  [
-                ...seg1Items,
-                ...filteredSeg2.map(b => ({
-                  ...b,
-                  meta: { ...(b.meta || {}), segment: 2, roomNumber: sub.roomNumber },
-                })),
-              ],
+            if (!lastT) {
+              subPriceResult = {
+                roomAmount: sub.roomAmount ?? 0,
+                nights:     sub.nights,
+                breakdown:  existingItems.map(b => (b && typeof b.toObject === 'function') ? b.toObject() : b),
+              }
+            } else {
+              const oldRoomNum = lastT.fromRoomNumber
+              const newRoomNum = sub.roomNumber
+              let oldPolicy = null
+              if (lastT.oldPolicyId) { try { oldPolicy = await PricePolicy.findById(lastT.oldPolicyId) } catch {} }
+              if (!oldPolicy && booking.policySnapshot?.dayPrice) oldPolicy = booking.policySnapshot
+              const newPolicy = policy
+
+              let oldRoomType = ''
+              let newRoomType = sub.roomType || room?.typeName || ''
+              const newRoomTypeId = room?.typeId?._id ?? room?.typeId ?? null
+              try {
+                const d = await Room.findOne({ number: oldRoomNum, branchId: booking.branchId }).populate('typeId')
+                if (d) oldRoomType = d.typeId?.name || d.typeName || ''
+              } catch {}
+
+              const hourSlotsOf = (pol) => {
+                if (!pol) return []
+                return (pol.hourSlots || []).map(s => {
+                  const time = s.time || s.duration || ''
+                  const m = String(time).match(/(\d+)/)
+                  return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
+                })
+              }
+              const newHourlyPolicy = await resolveHourlyPolicy(newRoomTypeId, booking.branchId)
+              const newRoomHourSlots = newHourlyPolicy ? hourSlotsOf(newHourlyPolicy) : hourSlotsOf(newPolicy)
+
+              const items = computeMoveRoomBreakdown({
+                actualCheckIn:   new Date(sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn),
+                plannedCheckOut: new Date(actualCO),
+                transferAt:      new Date(lastT.transferAt),
+                oldRoom: {
+                  number: oldRoomNum, type: oldRoomType,
+                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+                },
+                newRoom: {
+                  number: newRoomNum, type: newRoomType,
+                  policy: {
+                    dayPrice: newPolicy?.dayPrice || 0, hourSlots: newRoomHourSlots,
+                    dayCheckInTime: newPolicy?.dayCheckInTime, dayCheckOutTime: newPolicy?.dayCheckOutTime,
+                    dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn, dayLateCheckOut: newPolicy?.dayLateCheckOut,
+                    dayAdultSurcharge: newPolicy?.dayAdultSurcharge, dayChildSurcharge: newPolicy?.dayChildSurcharge,
+                  },
+                },
+                transferFee: 0,   // fee tách riêng (booking.transferFee)
+                changeRate:  String(lastT.oldPolicyId ?? '') !== String(lastT.newPolicyId ?? ''),
+                isFreeRoom:  !!booking.isFreeRoom,
+                branchConfig: branch ? {
+                  checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime,
+                  earlyCheckinUntil: branch.earlyCheckinUntil, toleranceMinutes: branch.toleranceMinutes,
+                  dayEquivalentHours: branch.dayEquivalentHours,
+                } : null,
+              })
+
+              const moveItems = items
+                .filter(it => !(it.meta && it.meta.transferFee))
+                .map(it => ({
+                  label: it.label, amount: it.amount,
+                  type: it.type === 'surcharge' ? 'surcharge' : 'base',
+                  meta: it.meta || {},
+                }))
+              subPriceResult = {
+                roomAmount: moveItems.reduce((s, b) => s + (b.amount || 0), 0),
+                nights:     sub.nights,
+                breakdown:  moveItems,
+              }
             }
           } else {
             subPriceResult = calculatePrice({
@@ -2749,13 +2820,17 @@ const checkout = async (req, res, next) => {
 
           sub.roomAmount     = subPriceResult.roomAmount
           sub.nights         = subPriceResult.nights
+          // ⭐ FIX 25/05/2026: GIỮ prefix [room] gốc (vd [203] của chặng cũ) — KHÔNG ép tất cả
+          //   thành [sub.roomNumber], nếu không dòng phòng cũ [203] bị đổi nhầm thành [604].
           sub.priceBreakdown = (subPriceResult.breakdown ?? []).map(b => {
-            const labelStr = String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, '')
+            const itemRoomNum = b?.meta?.roomNumber ?? sub.roomNumber
+            const labelStr = String(b.label ?? '')
+            const hasPrefix = /^\[[^\]]+\]\s/.test(labelStr)
             return {
-              label:  `[${sub.roomNumber}] ${labelStr}`,
+              label:  hasPrefix ? labelStr : `[${itemRoomNum}] ${labelStr}`,
               amount: Number(b.amount ?? 0),
               type:   b.type === 'surcharge' ? 'surcharge' : 'base',
-              meta:   { ...(b.meta || {}), roomNumber: sub.roomNumber },
+              meta:   { ...(b.meta || {}), roomNumber: itemRoomNum },
             }
           })
 
@@ -2766,7 +2841,9 @@ const checkout = async (req, res, next) => {
         const subtotal = groupRoomTotal + (booking.servicesAmount ?? 0)
         const pctDisc  = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
         booking.discount    = pctDisc + (booking.discountAmount ?? 0)
-        booking.totalAmount = Math.max(0, subtotal - booking.discount)
+        // ⭐ FIX 25/05/2026: CỘNG transferFee vào tổng (trước đây thiếu → tổng thấp hơn
+        //   calculate-bill đúng bằng phí chuyển → tưởng khách trả dư khi trả phòng).
+        booking.totalAmount = Math.max(0, subtotal - booking.discount + (booking.transferFee || 0))
       } catch (groupErr) {
         console.error('[checkout][group] Recalc failed:', groupErr)
       }
@@ -2976,61 +3053,106 @@ const checkoutRoom = async (req, res, next) => {
         const maxChildren = room?.typeId?.maxChildren ?? 0
 
         const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
-        const priceResult = calculatePrice({
-          checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
-          checkOut:  actualCO,
-          priceType: sub.priceType ?? booking.priceType,
-          policy, branch,
-          adults:    sub.adults   ?? booking.adults,
-          children:  sub.children ?? booking.children,
-          maxAdults, maxChildren, maxOccupancy,
-        })
 
-        if (priceResult.error) {
-          console.warn('[checkoutRoom] Recalc skipped due to policy mismatch:', priceResult.error.message)
-        } else {
-          const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
-          const seg1Items = []
-          let splitFromTime = null
-          for (const b of existingItems) {
-            const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
-            const isSeg1 = item?.meta?.segment === 1 ||
-                           (item?.meta?.roomNumber && String(item.meta.roomNumber) !== String(sub.roomNumber))
-            if (isSeg1) {
-              seg1Items.push(item)
-              if (item?.meta?.endTime) splitFromTime = item.meta.endTime
+        // ⭐ FIX 25/05/2026: phòng ĐÃ CHUYỂN → computeMoveRoomBreakdown (đồng bộ checkout/calculate-bill).
+        //   Trước đây gọi calculatePrice thẳng → OVER_CAPACITY → bỏ qua recompute → giữ giá lưu cũ (lệch).
+        const existingItems = Array.isArray(sub.priceBreakdown) ? sub.priceBreakdown : []
+        const isOldSeg = (meta, srRoomNumber) =>
+          meta?.segment === 1 || meta?.policy === 'old' || meta?.segment === 'oldNights' ||
+          (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
+        const hasMoveSegments = existingItems.some(b => isOldSeg(b?.meta, sub.roomNumber))
+
+        if (hasMoveSegments) {
+          const hist = (booking.transferHistory || [])
+            .filter(t => t?.transferAt && t?.toRoomNumber)
+            .filter(t => String(t.toRoomNumber) === String(sub.roomNumber) ||
+                         String(t?.toRoomId?._id ?? t?.toRoomId) === String(sub.roomId?._id ?? sub.roomId))
+            .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+          const lastT = hist[hist.length - 1]
+          if (lastT) {
+            const oldRoomNum = lastT.fromRoomNumber
+            const newRoomNum = sub.roomNumber
+            let oldPolicy = null
+            if (lastT.oldPolicyId) { try { oldPolicy = await PricePolicy.findById(lastT.oldPolicyId) } catch {} }
+            if (!oldPolicy && booking.policySnapshot?.dayPrice) oldPolicy = booking.policySnapshot
+            const newPolicy = policy
+
+            let oldRoomType = ''
+            let newRoomType = sub.roomType || room?.typeName || ''
+            const newRoomTypeId = room?.typeId?._id ?? room?.typeId ?? null
+            try {
+              const d = await Room.findOne({ number: oldRoomNum, branchId: booking.branchId }).populate('typeId')
+              if (d) oldRoomType = d.typeId?.name || d.typeName || ''
+            } catch {}
+
+            const hourSlotsOf = (pol) => {
+              if (!pol) return []
+              return (pol.hourSlots || []).map(s => {
+                const time = s.time || s.duration || ''
+                const m = String(time).match(/(\d+)/)
+                return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
+              })
             }
+            const newHourlyPolicy = await resolveHourlyPolicy(newRoomTypeId, booking.branchId)
+            const newRoomHourSlots = newHourlyPolicy ? hourSlotsOf(newHourlyPolicy) : hourSlotsOf(newPolicy)
+
+            const items = computeMoveRoomBreakdown({
+              actualCheckIn:   new Date(sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn),
+              plannedCheckOut: new Date(actualCO),
+              transferAt:      new Date(lastT.transferAt),
+              oldRoom: {
+                number: oldRoomNum, type: oldRoomType,
+                policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+              },
+              newRoom: {
+                number: newRoomNum, type: newRoomType,
+                policy: {
+                  dayPrice: newPolicy?.dayPrice || 0, hourSlots: newRoomHourSlots,
+                  dayCheckInTime: newPolicy?.dayCheckInTime, dayCheckOutTime: newPolicy?.dayCheckOutTime,
+                  dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn, dayLateCheckOut: newPolicy?.dayLateCheckOut,
+                  dayAdultSurcharge: newPolicy?.dayAdultSurcharge, dayChildSurcharge: newPolicy?.dayChildSurcharge,
+                },
+              },
+              transferFee: 0,
+              changeRate:  String(lastT.oldPolicyId ?? '') !== String(lastT.newPolicyId ?? ''),
+              isFreeRoom:  !!booking.isFreeRoom,
+              branchConfig: branch ? {
+                checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime,
+                earlyCheckinUntil: branch.earlyCheckinUntil, toleranceMinutes: branch.toleranceMinutes,
+                dayEquivalentHours: branch.dayEquivalentHours,
+              } : null,
+            })
+
+            const moveItems = items
+              .filter(it => !(it.meta && it.meta.transferFee))
+              .map(it => {
+                const labelStr = String(it.label ?? '')
+                const hasPrefix = /^\[[^\]]+\]\s/.test(labelStr)
+                const rn = it.meta?.roomNumber ?? sub.roomNumber
+                return {
+                  label:  hasPrefix ? labelStr : `[${rn}] ${labelStr}`,
+                  amount: Number(it.amount ?? 0),
+                  type:   it.type === 'surcharge' ? 'surcharge' : 'base',
+                  meta:   { ...(it.meta || {}), roomNumber: rn },
+                }
+              })
+            sub.roomAmount     = moveItems.reduce((s, b) => s + (b.amount || 0), 0)
+            sub.priceBreakdown = moveItems
           }
+          // lastT không có → giữ nguyên giá lưu (an toàn)
+        } else {
+          const priceResult = calculatePrice({
+            checkIn:   sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn,
+            checkOut:  actualCO,
+            priceType: sub.priceType ?? booking.priceType,
+            policy, branch,
+            adults:    sub.adults   ?? booking.adults,
+            children:  sub.children ?? booking.children,
+            maxAdults, maxChildren, maxOccupancy,
+          })
 
-          if (seg1Items.length > 0) {
-            const splitAt = splitFromTime ? new Date(splitFromTime) : (sub.actualCheckIn ?? sub.checkIn ?? booking.checkIn)
-            const seg2Result = calculatePrice({
-              checkIn:   splitAt,
-              checkOut:  actualCO,
-              priceType: sub.priceType ?? booking.priceType,
-              policy, branch,
-              adults:    sub.adults   ?? booking.adults,
-              children:  sub.children ?? booking.children,
-              maxAdults, maxChildren, maxOccupancy,
-            })
-            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
-              const label = String(b.label || '')
-              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
-            })
-            const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
-            const seg2Amount = filteredSeg2.reduce((s, b) => s + Number(b.amount ?? 0), 0)
-            const seg2Items  = filteredSeg2.map(b => ({
-              label:  String(b.label ?? '').replace(/^\[[^\]]+\]\s*/, ''),
-              amount: Number(b.amount ?? 0),
-              type:   b.type === 'surcharge' ? 'surcharge' : 'base',
-              meta:   { ...(b.meta || {}), segment: 2, roomNumber: sub.roomNumber },
-            })).map(item => ({
-              ...item,
-              label: `[${sub.roomNumber}] ${item.label}`,
-            }))
-
-            sub.roomAmount     = seg1Amount + seg2Amount
-            sub.priceBreakdown = [...seg1Items, ...seg2Items]
+          if (priceResult.error) {
+            console.warn('[checkoutRoom] Recalc skipped due to policy mismatch:', priceResult.error.message)
           } else {
             sub.roomAmount      = priceResult.roomAmount
             sub.priceBreakdown  = (priceResult.breakdown ?? []).map(b => ({
@@ -3146,7 +3268,8 @@ const checkoutRoom = async (req, res, next) => {
     const pctDisc  = Math.round(subtotal * (booking.discountPercent ?? 0) / 100)
     const totalDiscount = pctDisc + (booking.discountAmount ?? 0)
     booking.discount    = totalDiscount
-    booking.totalAmount = Math.max(0, subtotal - totalDiscount)
+    // ⭐ FIX 25/05/2026: cộng transferFee (đồng bộ checkout/calculate-bill — tránh tưởng trả dư).
+    booking.totalAmount = Math.max(0, subtotal - totalDiscount + (booking.transferFee || 0))
 
     const allCheckedOut = booking.rooms.every(r => r.status === 'checked_out' || r.status === 'cancelled')
 
@@ -3836,48 +3959,131 @@ const calculateBill = async (req, res, next) => {
           }
         } else {
           const breakdownItems = Array.isArray(sr.priceBreakdown) ? sr.priceBreakdown : []
-          const hasMoveSegments = breakdownItems.some(b =>
-            b?.meta?.segment === 1 ||
-            (b?.meta?.roomNumber && String(b.meta.roomNumber) !== String(sr.roomNumber))
-          )
+          // ⭐ FIX 25/05/2026: nhận diện chặng "phòng cũ" (seg1) theo SCHEMA META HIỆN TẠI.
+          //   Schema cũ dùng segment===1; schema hiện tại (moveRoomBreakdown / rebuildBreakdownFromHistory)
+          //   dùng segment:'oldNights'|'newNights'|'mergedNights' + roomNumber. Giữ cả 2 cho tương thích.
+          const isOldSeg = (meta, srRoomNumber) =>
+            meta?.segment === 1 ||
+            meta?.policy === 'old' ||
+            meta?.segment === 'oldNights' ||
+            (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
+          const hasMoveSegments = breakdownItems.some(b => isOldSeg(b?.meta, sr.roomNumber))
 
           if (hasMoveSegments && mode === 'now' && sr.status === 'checked_in') {
-            const seg1Items = []
-            let splitFromTime = null
-            for (const b of breakdownItems) {
-              const item = (b && typeof b.toObject === 'function') ? b.toObject() : b
-              const isSeg1 = item?.meta?.segment === 1 ||
-                             (item?.meta?.roomNumber && String(item.meta.roomNumber) !== String(sr.roomNumber))
-              if (isSeg1) {
-                seg1Items.push(item)
-                if (item?.meta?.endTime) splitFromTime = item.meta.endTime
+            // ⭐ FIX 25/05/2026: Sub-room đoàn ĐÃ CHUYỂN — dùng computeMoveRoomBreakdown
+            //   (Y HỆT phòng lẻ ở nhánh hasTransferred) thay cho seg1/seg2 + calculatePrice.
+            //   Lý do: calculatePrice tính chặng phòng MỚI theo NGUYÊN NGÀY → sai spec, và
+            //   dính OVER_CAPACITY (khi chuyển sang phòng nhỏ hơn) làm mất trắng chặng mới.
+            //   Module moveRoomBreakdown xử lý đúng quy tắc giờ/ngày khi đổi cùng ngày:
+            //     • đổi SAU 12:00 (dayCheckOutTime), trước 23h (dayEquiv) → GIÁ GIỜ 12:00 → hiện tại
+            //     • đổi TRƯỚC 12:00 → GIÁ GIỜ từ lúc đổi → hiện tại
+            //     • đổi rạng sáng / qua mốc 23h / sang ngày khác → GIÁ NGÀY
+            //   và KHÔNG enforce sức chứa nên không nuốt mất chặng mới.
+            const hist = (booking.transferHistory || [])
+              .filter(t => t?.transferAt && t?.toRoomNumber)
+              .filter(t => String(t.toRoomNumber) === String(sr.roomNumber) ||
+                           String(t?.toRoomId?._id ?? t?.toRoomId) === String(sr.roomId?._id ?? sr.roomId))
+              .sort((a, b) => new Date(a.transferAt) - new Date(b.transferAt))
+            const lastT = hist[hist.length - 1]
+
+            if (!lastT) {
+              // Không tìm thấy transfer của sub-room này → giữ breakdown đã lưu (an toàn)
+              subPriceResult = {
+                roomAmount: sr.roomAmount ?? 0,
+                breakdown:  breakdownItems.map(b => (b && typeof b.toObject === 'function') ? b.toObject() : b),
               }
-            }
-            const splitAt = splitFromTime ? new Date(splitFromTime) : (sr.actualCheckIn ?? booking.checkIn)
-            const seg1Amount = seg1Items.reduce((s, b) => s + Number(b.amount ?? 0), 0)
+            } else {
+              const oldRoomNum = lastT.fromRoomNumber
+              const newRoomNum = sr.roomNumber
+              let oldPolicy = null
+              if (lastT.oldPolicyId) { try { oldPolicy = await PricePolicy.findById(lastT.oldPolicyId) } catch {} }
+              if (!oldPolicy && booking.policySnapshot?.dayPrice) oldPolicy = booking.policySnapshot
+              const newPolicy = policy
 
-            const seg2Result = calculatePrice({
-              checkIn:   splitAt,
-              checkOut:  effectiveCheckOut,
-              priceType: sr.priceType ?? booking.priceType,
-              policy, branch,
-              adults:    sr.adults   ?? booking.adults,
-              children:  sr.children ?? booking.children,
-              maxAdults, maxChildren, maxOccupancy,
-            })
-            const filteredSeg2 = (seg2Result.breakdown ?? []).filter(b => {
-              const label = String(b.label || '')
-              return !label.includes('Nhận phòng sớm') && !label.includes('early_checkin')
-            })
-            const seg2Amount = filteredSeg2.reduce((s, b) => s + (b.amount ?? 0), 0)
-            const seg2Items = filteredSeg2.map(b => ({
-              ...b,
-              meta: { ...(b.meta || {}), segment: 2, roomNumber: sr.roomNumber },
-            }))
+              let oldRoomType = ''
+              let newRoomType = sr.roomType || room?.typeName || ''
+              const newRoomTypeId = room?.typeId?._id ?? room?.typeId ?? null
+              try {
+                const d = await Room.findOne({ number: oldRoomNum, branchId: booking.branchId }).populate('typeId')
+                if (d) oldRoomType = d.typeId?.name || d.typeName || ''
+              } catch {}
 
-            subPriceResult = {
-              roomAmount: seg1Amount + seg2Amount,
-              breakdown:  [...seg1Items, ...seg2Items],
+              const hourSlotsOf = (pol) => {
+                if (!pol) return []
+                return (pol.hourSlots || []).map(s => {
+                  const time = s.time || s.duration || ''
+                  const m = String(time).match(/(\d+)/)
+                  return { durationHours: m ? parseInt(m[1]) : 2, price: s.price || 0 }
+                })
+              }
+              const newHourlyPolicy = await resolveHourlyPolicy(newRoomTypeId, booking.branchId)
+              const newRoomHourSlots = newHourlyPolicy ? hourSlotsOf(newHourlyPolicy) : hourSlotsOf(newPolicy)
+
+              // plannedCheckOut cho module: cap theo checkOut của SUB-ROOM (không phải booking)
+              const subPlannedCO = sr.checkOut ?? booking.checkOut
+              const plannedForSub = (() => {
+                const planned = new Date(subPlannedCO)
+                const eff = new Date(effectiveCheckOut)
+                if (eff > planned) return eff   // quá hạn → eff (đã ceil trọn đêm ở khối trung tâm)
+                return eff < planned ? eff : planned
+              })()
+
+              const items = computeMoveRoomBreakdown({
+                actualCheckIn:   new Date(sr.actualCheckIn ?? booking.checkIn),
+                plannedCheckOut: plannedForSub,
+                transferAt:      new Date(lastT.transferAt),
+                oldRoom: {
+                  number: oldRoomNum, type: oldRoomType,
+                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+                },
+                newRoom: {
+                  number: newRoomNum, type: newRoomType,
+                  policy: {
+                    dayPrice: newPolicy?.dayPrice || 0, hourSlots: newRoomHourSlots,
+                    dayCheckInTime: newPolicy?.dayCheckInTime, dayCheckOutTime: newPolicy?.dayCheckOutTime,
+                    dayEarlyCheckIn: newPolicy?.dayEarlyCheckIn, dayLateCheckOut: newPolicy?.dayLateCheckOut,
+                    dayAdultSurcharge: newPolicy?.dayAdultSurcharge, dayChildSurcharge: newPolicy?.dayChildSurcharge,
+                  },
+                },
+                transferFee: 0,   // fee tách riêng (booking.transferFee)
+                changeRate:  String(lastT.oldPolicyId ?? '') !== String(lastT.newPolicyId ?? ''),
+                isFreeRoom:  !!booking.isFreeRoom,
+                branchConfig: branch ? {
+                  checkInTime: branch.checkInTime, checkOutTime: branch.checkOutTime,
+                  earlyCheckinUntil: branch.earlyCheckinUntil, toleranceMinutes: branch.toleranceMinutes,
+                  dayEquivalentHours: branch.dayEquivalentHours,
+                } : null,
+              })
+
+              let moveItems = items
+                .filter(it => !(it.meta && it.meta.transferFee))
+                .map(it => ({
+                  label: it.label, amount: it.amount,
+                  type: it.type === 'surcharge' ? 'surcharge' : 'base',
+                  meta: it.meta || {},
+                }))
+
+              // Sửa mốc CUỐI label về giờ thực khi effectiveCheckOut bị ceil (giữ nguyên amount)
+              if (mode === 'now' && viewedAtForDisplay
+                  && viewedAtForDisplay.getTime() < new Date(effectiveCheckOut).getTime()) {
+                const _pad = n => String(n).padStart(2, '0')
+                const _va = viewedAtForDisplay
+                const realEndStr = `${_pad(_va.getDate())}/${_pad(_va.getMonth() + 1)} ${_pad(_va.getHours())}:${_pad(_va.getMinutes())}`
+                let _lastBaseIdx = -1
+                for (let i = moveItems.length - 1; i >= 0; i--) {
+                  if (moveItems[i].type === 'base') { _lastBaseIdx = i; break }
+                }
+                if (_lastBaseIdx >= 0) {
+                  const it = moveItems[_lastBaseIdx]
+                  const newLabel = it.label.replace(/→\s*\d{1,2}\/\d{1,2}\s+\d{1,2}:\d{2}\)/, `→ ${realEndStr})`)
+                  if (newLabel !== it.label) moveItems[_lastBaseIdx] = { ...it, label: newLabel }
+                }
+              }
+
+              subPriceResult = {
+                roomAmount: moveItems.reduce((s, b) => s + (b.amount || 0), 0),
+                breakdown:  moveItems,
+              }
             }
           } else if (hasMoveSegments && mode === 'checkout') {
             const plainItems = breakdownItems.map(b =>
