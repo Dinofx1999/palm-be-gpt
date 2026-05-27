@@ -114,6 +114,18 @@ app.use('/api/reconciliations',  require('./routes/reconciliation'));
 app.use('/api', require('./routes/sepay'));
 app.use('/api/customer-display-config', require('./routes/customerDisplayConfig'));
 
+// ─────────────────────────────────────────────────────
+// ⭐ NEW 27/05/2026: Hòm thư góp ý của khách
+//   - /api/feedback:             admin xem/sửa/xoá góp ý
+//   - /api/feedback-categories:  Admin/Manager CRUD hạng mục đánh giá (Nhân viên/Phòng/Giá cả…)
+//   - /api/feedback-blocks:      chặn/gỡ chặn SĐT spam
+//   - /api/public/feedback:      PUBLIC — khách lấy hạng mục + gửi góp ý (không auth)
+// ─────────────────────────────────────────────────────
+app.use('/api/feedback',            require('./routes/feedback'));
+app.use('/api/feedback-categories', require('./routes/feedbackCategories'));
+app.use('/api/feedback-blocks',     require('./routes/feedbackBlocks'));
+app.use('/api/public/feedback',     require('./routes/publicFeedback'));
+
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');

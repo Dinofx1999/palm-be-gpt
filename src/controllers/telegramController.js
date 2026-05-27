@@ -1,6 +1,6 @@
 // backend/src/controllers/telegramController.js
 // ════════════════════════════════════════════════════════════════════
-// Telegram controller — gửi tin nhắn qua Bot API + format audit log.
+// Telegram controller — gửi tin nhắn / ảnh qua Bot API + format audit log.
 //
 // CẤU HÌNH (.env):
 //   TELEGRAM_BOT_TOKEN=123456:ABC...        ← token bot (lấy từ @BotFather)
@@ -15,17 +15,20 @@
 // Endpoint (gắn route nếu muốn test từ PMS):
 //   POST /api/telegram/test     — gửi tin thử (Admin)
 //   GET  /api/telegram/status   — xem cấu hình + kích thước queue
+//
+// ⚠️ CÀI: npm i form-data    (cần cho gửi ảnh từ disk)
 // ════════════════════════════════════════════════════════════════════
 
+const fs = require('fs');
 const { enqueueTelegram, setSender, queueSize } = require('../utils/telegramQueue');
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const CHAT_ID   = process.env.TELEGRAM_CHAT_ID || '';
+const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN || '';
+const CHAT_ID       = process.env.TELEGRAM_CHAT_ID || '';
 const AUDIT_ENABLED = (process.env.TELEGRAM_AUDIT_ENABLED ?? 'true') !== 'false';
 
 const isConfigured = () => !!(BOT_TOKEN && CHAT_ID);
 
-// ── Sender thực tế (queue gọi hàm này) ────────────────────────────────
+// ── Sender TEXT (sendMessage) ─────────────────────────────────────────
 async function sendToTelegram(job) {
   if (!isConfigured()) throw new Error('Telegram chưa cấu hình (thiếu BOT_TOKEN/CHAT_ID)');
 
@@ -51,8 +54,63 @@ async function sendToTelegram(job) {
   return data;
 }
 
-// Đăng ký sender cho queue (1 lần khi load module)
-setSender(sendToTelegram);
+// ── Sender PHOTO (sendPhoto + caption) ────────────────────────────────
+//   Ưu tiên photoPath (file trên disk — luôn chạy được, không cần URL public).
+//   Fallback photoUrl (URL công khai) nếu file không tồn tại.
+async function sendToTelegramPhoto(job) {
+  if (!isConfigured()) throw new Error('Telegram chưa cấu hình');
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+
+  // Caption tối đa 1024 ký tự — cắt nếu dài
+  const caption = (job.text || '').slice(0, 1024);
+
+  let res;
+  if (job.photoPath && fs.existsSync(job.photoPath)) {
+    // ⭐ FIX 27/05/2026: dùng FormData + Blob NATIVE của Node 18+ (không dùng lib form-data
+    //   vì stream của nó không tương thích với fetch global → Telegram trả 400 body rỗng).
+    const buf = fs.readFileSync(job.photoPath);
+    const filename = job.photoPath.split('/').pop() || 'photo.jpg';
+    const ext = (filename.split('.').pop() || 'jpg').toLowerCase();
+    const mime = ext === 'png' ? 'image/png'
+              : ext === 'webp' ? 'image/webp'
+              : 'image/jpeg';
+    const form = new FormData();   // native (globalThis.FormData)
+    form.append('chat_id',    String(job.chatId || CHAT_ID));
+    form.append('caption',    caption);
+    form.append('parse_mode', job.parseMode || 'HTML');
+    form.append('photo',      new Blob([buf], { type: mime }), filename);
+    res = await fetch(url, { method: 'POST', body: form });
+  } else if (job.photoUrl) {
+    // Gửi qua URL công khai (Telegram tự tải)
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id:    job.chatId || CHAT_ID,
+        caption,
+        parse_mode: job.parseMode || 'HTML',
+        photo:      job.photoUrl,
+      }),
+    });
+  } else {
+    throw new Error('sendPhoto: thiếu photoPath hoặc photoUrl');
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    // ⭐ Log đầy đủ để debug khi 400 (Telegram thường trả "description" giải thích lý do)
+    throw new Error(`Telegram sendPhoto ${res.status} ${res.statusText || ''}: ${body.slice(0, 400) || '(empty body)'}`);
+  }
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram trả lỗi: ${JSON.stringify(data).slice(0, 400)}`);
+  return data;
+}
+
+// ⭐ Đăng ký sender cho queue — phân biệt loại job ('photo' vs text mặc định)
+setSender(async (job) => {
+  if (job && job.kind === 'photo') return sendToTelegramPhoto(job);
+  return sendToTelegram(job);
+});
 
 // ── Escape HTML cho parse_mode=HTML ───────────────────────────────────
 function esc(s) {
@@ -62,7 +120,7 @@ function esc(s) {
     .replace(/>/g, '&gt;');
 }
 
-// ── Map action → nhãn tiếng Việt + icon ───────────────────────────────
+// ── Map action → nhãn tiếng Việt ──────────────────────────────────────
 const ACTION_LABELS = {
   // Tạo
   create:            'Tạo mới',
@@ -99,13 +157,15 @@ const ACTION_LABELS = {
   delete:            'Xoá',
   undo:              'Hoàn tác',
   login:             'Đăng nhập',
+  apply_career:      'Ứng tuyển',
+  new_feedback: 'Góp ý mới',
 };
 
-// Action → nhãn tiếng Việt khi KHÔNG có trong map (fallback gọn, không icon máy móc)
+// Action → nhãn tiếng Việt khi KHÔNG có trong map
 function actionFallbackLabel(action) {
   const text = String(action || '')
-    .replace(/_/g, ' ')                         // create_and_checkin → "create and checkin"
-    .replace(/\b\w/g, (c) => c.toUpperCase());  // → "Create And Checkin"
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
   return `• ${text}`;
 }
 
@@ -113,12 +173,11 @@ const ENTITY_LABELS = {
   Booking: 'Đặt phòng', Invoice: 'Hoá đơn', Service: 'Dịch vụ',
   BookingService: 'Dịch vụ booking', Customer: 'Khách hàng', Room: 'Phòng',
   PricePolicy: 'Chính sách giá', Branch: 'Chi nhánh', User: 'Nhân viên',
+  JobApplication: 'Ứng tuyển', Feedback: 'Góp ý',
 };
 
-// ── Format 1 audit log thành tin nhắn Telegram (HTML) ─────────────────
-// ── Nhãn tiếng Việt cho từng field metadata (hiển thị mỗi dòng 1 nhãn) ──
-//   Thứ tự khai báo = thứ tự ưu tiên hiển thị. Field không có trong map sẽ bị bỏ
-//   (tránh hiển thị field kỹ thuật khó hiểu như subRoomId, customBreakdownLen...).
+// ── Nhãn tiếng Việt cho từng field metadata ───────────────────────────
+//   Thứ tự khai báo = thứ tự ưu tiên hiển thị. Field không có trong map sẽ bị bỏ.
 const FIELD_LABELS = {
   bookingCode:        'Mã đặt phòng',
   customerName:       'Khách hàng',
@@ -163,6 +222,19 @@ const FIELD_LABELS = {
   prevStatus:         'Trạng thái trước',
   status:             'Trạng thái',
   note:               'Ghi chú',
+  // Ứng tuyển
+  jobTitle:           'Vị trí ứng tuyển',
+  fullName:           'Họ và tên',
+  phone:              'Số điện thoại',
+  email:              'Email',
+  currentAddress:     'Địa chỉ hiện tại',
+  birthDate:          'Ngày sinh',
+  notes:              'Ghi chú',
+   // Feedback
+    overallRating:  'Đánh giá tổng',
+    wouldRecommend: 'Sẽ giới thiệu',
+    ratingsText:    'Chi tiết đánh giá',
+    alert:          '⚠️ Cảnh báo',
 };
 
 // Field là TIỀN (định dạng x.xxx đ)
@@ -173,10 +245,10 @@ const MONEY_FIELDS = new Set([
 // Field là NGÀY GIỜ
 const DATE_FIELDS = new Set([
   'checkIn', 'checkOut', 'newCheckIn', 'newCheckOut', 'actualCheckOut',
-  'oldCheckIn', 'oldCheckOut',
+  'oldCheckIn', 'oldCheckOut', 'birthDate',
 ]);
 // Field BOOLEAN → Có/Không
-const BOOL_FIELDS = new Set(['policyChanged', 'isFreeRoom']);
+const BOOL_FIELDS = new Set(['policyChanged', 'isFreeRoom','wouldRecommend']);
 // Map trạng thái → tiếng Việt
 const STATUS_LABELS = {
   unpaid: 'Chưa thanh toán', partial: 'Một phần', paid: 'Đã thanh toán',
@@ -198,7 +270,7 @@ const fmtDate = (v) => {
 function fmtFieldValue(key, val) {
   if (val === null || val === undefined || val === '') return null;
   if (MONEY_FIELDS.has(key)) {
-    if (!Number(val)) return null;   // bỏ tiền = 0
+    if (!Number(val)) return null;
     return fmtMoney(val);
   }
   if (DATE_FIELDS.has(key)) return fmtDate(val);
@@ -216,7 +288,6 @@ function fmtFieldValue(key, val) {
 
 function formatAuditMessage(audit) {
   const actionLabel = ACTION_LABELS[audit.action] || actionFallbackLabel(audit.action);
-  const entityLabel = ENTITY_LABELS[audit.entityType] || esc(audit.entityType);
   const who  = audit.userName ? esc(audit.userName) : 'Hệ thống';
   const when = new Date().toLocaleString('vi-VN', {
     timeZone: 'Asia/Ho_Chi_Minh',
@@ -230,13 +301,11 @@ function formatAuditMessage(audit) {
   // Dòng 1: Chi nhánh (nếu có)
   if (branchName) lines.push(`<b>Chi nhánh:</b> ${branchName}`);
 
-  // Dòng 2: Tiêu đề hành động (in hoa, đậm) + đường kẻ ngăn cách
+  // Dòng 2: Tiêu đề hành động + đường kẻ ngăn cách
   lines.push(`<b>${actionLabel.toUpperCase()}</b>`);
   lines.push(`=======================`);
 
-  // (Bỏ dòng mô tả description — trùng lặp với các field chi tiết bên dưới)
-
-  // ⭐ Gộp đổi phòng thành 1 dòng "Thay Đổi: cũ → mới" (thay vì 2 dòng riêng).
+  // ⭐ Gộp đổi phòng thành 1 dòng "Thay Đổi: cũ → mới"
   const skipKeys = new Set();
   if (m.oldRoomNumber && m.newRoomNumber) {
     if (m.bookingCode) {
@@ -245,16 +314,15 @@ function formatAuditMessage(audit) {
     lines.push(`<b>Thay Đổi:</b> ${esc(m.oldRoomNumber)} → ${esc(m.newRoomNumber)}`);
     skipKeys.add('oldRoomNumber');
     skipKeys.add('newRoomNumber');
-    skipKeys.add('bookingCode');   // đã in ở trên
+    skipKeys.add('bookingCode');
   }
 
-  // ── Các dòng metadata: mỗi field 1 dòng có nhãn, theo thứ tự FIELD_LABELS ──
+  // Các dòng metadata theo thứ tự FIELD_LABELS
   for (const key of Object.keys(FIELD_LABELS)) {
     if (!(key in m)) continue;
     if (skipKeys.has(key)) continue;
     const valStr = fmtFieldValue(key, m[key]);
     if (valStr === null) continue;
-    // bookingCode dùng <code> cho dễ copy
     if (key === 'bookingCode') {
       lines.push(`<b>${FIELD_LABELS[key]}:</b> <code>${valStr}</code>`);
     } else {
@@ -269,57 +337,59 @@ function formatAuditMessage(audit) {
   return lines.join('\n');
 }
 
-// ── Hàm public: đẩy 1 audit vào queue gửi Telegram (non-blocking) ─────
-//   Gọi từ auditLogger sau khi ghi log thành công.
-//   Tra tên chi nhánh từ branchId (nếu có) để hiển thị "Chi nhánh: ...".
+// ── Helper: chuẩn bị payload audit đầy đủ (tra branch/user/booking) ────
+//   Trả về object đã enrich (branchName, userName, metadata) sẵn sàng format.
+async function enrichAudit(audit) {
+  let branchName = null;
+  if (audit.branchId) {
+    try {
+      const Branch = require('../models/Branch');
+      const br = await Branch.findById(audit.branchId).select('name').lean();
+      branchName = br?.name || null;
+    } catch { /* bỏ qua */ }
+  }
+
+  // Ưu tiên fullName thật từ User
+  let userName = audit.userName || '';
+  if (audit.userId) {
+    try {
+      const User = require('../models/User');
+      const u = await User.findById(audit.userId).select('fullName username').lean();
+      if (u?.fullName) userName = u.fullName;
+    } catch { /* bỏ qua */ }
+  }
+
+  // Tự bổ sung bookingCode + customerName + roomNumber cho action Booking/Invoice
+  let metadata = audit.metadata || {};
+  const bookingRef = (audit.entityType === 'Booking' && audit.entityId)
+    ? audit.entityId
+    : (metadata.bookingId || null);
+  if (bookingRef && (!metadata.bookingCode || !metadata.customerName)) {
+    try {
+      const Booking = require('../models/Booking');
+      const bk = await Booking.findById(bookingRef).select('bookingCode customerName roomNumber').lean();
+      if (bk) {
+        metadata = {
+          ...metadata,
+          bookingCode:  metadata.bookingCode  || bk.bookingCode,
+          customerName: metadata.customerName || bk.customerName,
+          roomNumber:   metadata.roomNumber   || bk.roomNumber,
+        };
+      }
+    } catch { /* bỏ qua */ }
+  }
+
+  return { ...audit, branchName, userName, metadata };
+}
+
+// ── Public: gửi audit dạng TEXT (không ảnh) ───────────────────────────
 function notifyAudit(audit) {
   if (!AUDIT_ENABLED || !isConfigured()) return;
-  // Tra tên chi nhánh + tên thật người dùng (async, chạy nền — không chặn).
   (async () => {
     try {
-      let branchName = null;
-      if (audit.branchId) {
-        try {
-          const Branch = require('../models/Branch');
-          const br = await Branch.findById(audit.branchId).select('name').lean();
-          branchName = br?.name || null;
-        } catch { /* bỏ qua nếu tra lỗi */ }
-      }
-
-      // ⭐ Ưu tiên tên ĐẦY ĐỦ. Nếu userName trống/giống username → tra User lấy fullName.
-      let userName = audit.userName || '';
-      if (audit.userId) {
-        try {
-          const User = require('../models/User');
-          const u = await User.findById(audit.userId).select('fullName username').lean();
-          if (u?.fullName) userName = u.fullName;   // luôn ưu tiên fullName thật
-        } catch { /* bỏ qua nếu tra lỗi */ }
-      }
-
-      // ⭐ Tự động bổ sung bookingCode + customerName nếu là Booking mà metadata chưa có
-      //   (nhiều logAction cũ không truyền bookingCode → tra từ entityId).
-      //   Hỗ trợ cả action trên Invoice (payment...) qua metadata.bookingId.
-      let metadata = audit.metadata || {};
-      const bookingRef = (audit.entityType === 'Booking' && audit.entityId)
-        ? audit.entityId
-        : (metadata.bookingId || null);
-      if (bookingRef && (!metadata.bookingCode || !metadata.customerName)) {
-        try {
-          const Booking = require('../models/Booking');
-          const bk = await Booking.findById(bookingRef).select('bookingCode customerName roomNumber').lean();
-          if (bk) {
-            metadata = {
-              ...metadata,
-              bookingCode: metadata.bookingCode || bk.bookingCode,
-              customerName: metadata.customerName || bk.customerName,
-              roomNumber: metadata.roomNumber || bk.roomNumber,
-            };
-          }
-        } catch { /* bỏ qua nếu tra lỗi */ }
-      }
-
+      const enriched = await enrichAudit(audit);
       enqueueTelegram({
-        text: formatAuditMessage({ ...audit, branchName, userName, metadata }),
+        text: formatAuditMessage(enriched),
         parseMode: 'HTML',
       });
     } catch (err) {
@@ -328,7 +398,37 @@ function notifyAudit(audit) {
   })();
 }
 
-// ── Hàm public: gửi tin nhắn tự do (non-blocking) ─────────────────────
+// ── Public: gửi audit KÈM ẢNH ─────────────────────────────────────────
+//   photoPath: đường dẫn file trên disk (ưu tiên).
+//   photoUrl:  URL công khai (fallback nếu không có photoPath).
+//   Nếu cả 2 đều thiếu → tự fallback gửi text thường (không lỗi).
+function notifyAuditWithPhoto(audit, photoPath, photoUrl) {
+  if (!AUDIT_ENABLED || !isConfigured()) return;
+  (async () => {
+    try {
+      const enriched = await enrichAudit(audit);
+      const text = formatAuditMessage(enriched);
+
+      const hasFile = photoPath && fs.existsSync(photoPath);
+      if (hasFile || photoUrl) {
+        enqueueTelegram({
+          kind: 'photo',
+          photoPath: hasFile ? photoPath : undefined,
+          photoUrl:  hasFile ? undefined : photoUrl,
+          text,
+          parseMode: 'HTML',
+        });
+      } else {
+        // Không có ảnh → gửi text thường
+        enqueueTelegram({ text, parseMode: 'HTML' });
+      }
+    } catch (err) {
+      console.error('[telegram] notifyAuditWithPhoto error (non-fatal):', err.message);
+    }
+  })();
+}
+
+// ── Public: gửi tin nhắn tự do (non-blocking) ─────────────────────────
 function sendMessage(text, opts = {}) {
   if (!isConfigured()) return false;
   return enqueueTelegram({ text, parseMode: opts.parseMode || 'HTML', chatId: opts.chatId });
@@ -365,6 +465,7 @@ function status(req, res) {
 
 module.exports = {
   notifyAudit,
+  notifyAuditWithPhoto,
   sendMessage,
   formatAuditMessage,
   isConfigured,

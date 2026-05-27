@@ -5,6 +5,8 @@
 //   Trước đó uploadDir trỏ sai đến `backend/src/uploads/careers/` → file save xong KHÔNG access được
 //   Đã đổi sang `backend/uploads/careers/` để match
 //
+// ⭐ NEW 27/05/2026: Thông báo Telegram khi có ứng viên đăng ký, KÈM ẢNH nếu có.
+//
 // Endpoints public cho ứng viên ngoài:
 // - GET  /api/public/careers/:branchId
 // - GET  /api/public/careers/job/:jobId
@@ -370,6 +372,43 @@ router.post('/apply', (req, res, next) => {
       sourceIp: getClientIp(req),
       userAgent: (req.headers['user-agent'] ?? '').slice(0, 500),
     });
+
+    // ⭐ NEW 27/05/2026: Thông báo Telegram khi có ứng viên đăng ký (non-blocking).
+    //   Có ảnh → gửi sendPhoto + caption đầy đủ thông tin.
+    //   Không ảnh → gửi text thường.
+    try {
+      const tg = require('../controllers/telegramController');
+      const jobInfo = await JobPosting.findById(jobPostingId)
+        .select('title position branchId').lean();
+      const auditPayload = {
+        action:     'apply_career',
+        entityType: 'JobApplication',
+        entityId:   application._id,
+        branchId:   job.branchId,
+        userName:   cleanName,
+        metadata: {
+          jobTitle:       jobInfo?.title || jobInfo?.position || '',
+          fullName:       cleanName,
+          phone:          phone.trim(),
+          email:          email ? email.trim().toLowerCase() : '',
+          currentAddress: sanitizeText(currentAddress, 300),
+          birthDate:      parsedBirthDate,
+          notes:          sanitizeText(notes, 1000),
+        },
+      };
+
+      if (safePhotoUrl) {
+        // safePhotoUrl dạng "/uploads/careers/photo-xxx.jpg"
+        // → ghép với uploadDir (đã khai báo trên cùng file) để có đường dẫn file thật trên disk.
+        const filename  = safePhotoUrl.split('/').pop();
+        const photoPath = path.join(uploadDir, filename);
+        tg.notifyAuditWithPhoto(auditPayload, photoPath);
+      } else {
+        tg.notifyAudit(auditPayload);
+      }
+    } catch (e) {
+      console.error('[publicCareers/apply] Telegram notify failed (non-fatal):', e.message);
+    }
 
     res.status(201).json({
       success: true,
