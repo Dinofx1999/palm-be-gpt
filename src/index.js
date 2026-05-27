@@ -112,6 +112,7 @@ app.use('/api/profit',           require('./routes/profit'));
 app.use('/api/shifts',           require('./routes/shifts'));
 app.use('/api/reconciliations',  require('./routes/reconciliation'));
 app.use('/api', require('./routes/sepay'));
+app.use('/api/customer-display-config', require('./routes/customerDisplayConfig'));
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

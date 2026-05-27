@@ -7,7 +7,8 @@ const avatarDir = path.join(__dirname, '../../uploads/avatars');
 if (!fs.existsSync(avatarDir)) {
   fs.mkdirSync(avatarDir, { recursive: true });
 }
-
+const displayDir = path.join(__dirname, '../../uploads/display');
+if (!fs.existsSync(displayDir)) fs.mkdirSync(displayDir, { recursive: true });
 // ── Upload nhiều ảnh ───────────────────────────
 const uploadRoomImages = async (req, res, next) => {
   try {
@@ -93,8 +94,36 @@ const deleteAvatar = async (req, res, next) => {
     res.json({ success: true, message: 'Đã xoá ảnh' });
   } catch (err) { next(err); }
 };
+
+const uploadDisplayMedia = async (req, res, next) => {
+  try {
+    if (!req.file)
+      return res.status(400).json({ success: false, message: 'Không có file được tải lên' });
+ 
+    const base = `${req.protocol}://${req.get('host')}`;   // URL đầy đủ (màn phụ ở port khác vẫn load được)
+    const isVideo = (req.file.mimetype || '').startsWith('video');
+    const rand = Math.random().toString(36).slice(2, 8);
+ 
+    if (isVideo) {
+      // Video: lưu nguyên buffer, giữ đuôi gốc
+      const ext = (req.file.originalname.split('.').pop() || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const filename = `disp-${Date.now()}-${rand}.${ext || 'mp4'}`;
+      fs.writeFileSync(path.join(displayDir, filename), req.file.buffer);
+      return res.json({ success: true, data: { url: `${base}/uploads/display/${filename}`, type: 'video' } });
+    }
+ 
+    // Ảnh: tự xoay theo EXIF, resize max 1600, convert webp
+    const filename = `disp-${Date.now()}-${rand}.webp`;
+    await sharp(req.file.buffer)
+      .rotate()
+      .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 82 })
+      .toFile(path.join(displayDir, filename));
+    res.json({ success: true, data: { url: `${base}/uploads/display/${filename}`, type: 'image' } });
+  } catch (err) { next(err); }
+};
  
 // ⭐ Thêm vào module.exports của uploadController.js:
 // module.exports = { uploadRoomImages, deleteRoomImage, uploadAvatar, deleteAvatar };
 
-module.exports = { uploadRoomImages, deleteRoomImage, uploadAvatar, deleteAvatar };
+module.exports = { uploadRoomImages, deleteRoomImage, uploadAvatar, deleteAvatar, uploadDisplayMedia };
