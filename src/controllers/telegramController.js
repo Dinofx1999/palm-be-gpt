@@ -158,7 +158,10 @@ const ACTION_LABELS = {
   undo:              'Hoàn tác',
   login:             'Đăng nhập',
   apply_career:      'Ứng tuyển',
-  new_feedback: 'Góp ý mới',
+  new_feedback:       'Góp ý mới',
+  low_stock:          'Sắp hết hàng',
+  stock_in:           'Nhập kho',
+  stock_adjust: 'Kiểm kê kho',
 };
 
 // Action → nhãn tiếng Việt khi KHÔNG có trong map
@@ -235,6 +238,14 @@ const FIELD_LABELS = {
     wouldRecommend: 'Sẽ giới thiệu',
     ratingsText:    'Chi tiết đánh giá',
     alert:          '⚠️ Cảnh báo',
+
+    serviceName:  'Dịch vụ',
+    stock:        'Tồn hiện tại',
+    lowThreshold: 'Ngưỡng cảnh báo',
+    quantity:     'Số lượng',
+    unitCost:     'Giá nhập',
+    supplier:     'Nhà cung cấp',
+    balanceAfter: 'Tồn sau',
 };
 
 // Field là TIỀN (định dạng x.xxx đ)

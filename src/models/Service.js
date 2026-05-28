@@ -22,6 +22,10 @@ const serviceSchema = new mongoose.Schema({
   status:      { type: String, enum: ['active', 'inactive'], default: 'active' },
 
   branchId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Branch', default: null },
+  // ⭐ NEW 29/05/2026: quản lý kho
+    trackInventory:    { type: Boolean, default: false },
+    stock:             { type: Number,  default: 0 },
+    lowStockThreshold: { type: Number,  default: 0 },
 
   // Audit
   createdBy:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

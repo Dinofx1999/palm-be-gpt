@@ -125,6 +125,8 @@ app.use('/api/feedback',            require('./routes/feedback'));
 app.use('/api/feedback-categories', require('./routes/feedbackCategories'));
 app.use('/api/feedback-blocks',     require('./routes/feedbackBlocks'));
 app.use('/api/public/feedback',     require('./routes/publicFeedback'));
+app.use('/api/stock', require('./routes/stock'));
+
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {

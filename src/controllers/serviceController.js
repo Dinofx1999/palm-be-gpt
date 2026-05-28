@@ -3,12 +3,18 @@
 //   - getAll: populate categoryId
 //   - create/update: nhận categoryId → tự lookup name → fill snapshot `category` string
 //   - getAll: filter theo categoryId (thay vì category string)
+// ⭐ UPDATE 29/05/2026:
+//   - create/update: nhận thêm trackInventory / stock / lowStockThreshold
+//   - addToBooking:        nếu service.trackInventory → trừ kho + ghi StockMovement 'out' + cảnh báo
+//   - removeFromBooking:   hoàn kho
+//   - updateBookingService: điều chỉnh kho theo delta số lượng
 
 const Service         = require('../models/Service')
 const ServiceCategory = require('../models/ServiceCategory')
 const BookingService  = require('../models/BookingService')
 const Booking         = require('../models/Booking')
 const { logAction }   = require('../utils/auditLogger')
+const stock           = require('./stockController')   // ⭐ helper trừ/hoàn kho
 
 // ── GET ALL SERVICES ──
 const getAll = async (req, res, next) => {
@@ -59,6 +65,7 @@ const create = async (req, res, next) => {
     const {
       name, categoryId = null, category, price, unit = 'lần',
       description = '', status = 'active', branchId,
+      trackInventory, stock: stockInit, lowStockThreshold,   // ⭐ NEW
     } = req.body
 
     if (!name || !name.trim())
@@ -99,6 +106,10 @@ const create = async (req, res, next) => {
       unit:       unit.trim(),
       description, status,
       branchId:   branchId ?? null,
+      // ⭐ NEW: kho
+      trackInventory:    trackInventory === true,
+      stock:             Number(stockInit) || 0,
+      lowStockThreshold: Number(lowStockThreshold) || 0,
       createdBy:  req.user?.id,
       updatedBy:  req.user?.id,
     })
@@ -120,7 +131,10 @@ const create = async (req, res, next) => {
 // UPDATE
 const update = async (req, res, next) => {
   try {
-    const allowed = ['name', 'categoryId', 'category', 'price', 'unit', 'description', 'status', 'branchId']
+    const allowed = [
+      'name', 'categoryId', 'category', 'price', 'unit', 'description', 'status', 'branchId',
+      'trackInventory', 'lowStockThreshold',   // ⭐ NEW (stock KHÔNG sửa trực tiếp ở đây — dùng /stock/in hoặc /stock/adjust)
+    ]
     const payload = { updatedBy: req.user?.id }
     allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })
 
@@ -134,6 +148,8 @@ const update = async (req, res, next) => {
         return res.status(400).json({ success: false, message: 'Đơn giá không hợp lệ' })
       payload.price = Number(payload.price)
     }
+    if (payload.lowStockThreshold !== undefined) payload.lowStockThreshold = Number(payload.lowStockThreshold) || 0
+    if (payload.trackInventory !== undefined)    payload.trackInventory = payload.trackInventory === true
 
     // ⭐ Nếu đổi categoryId → auto sync `category` string
     if (payload.categoryId !== undefined) {
@@ -191,7 +207,7 @@ const remove = async (req, res, next) => {
 }
 
 // ──────────────────────────────────────────────────────
-// BOOKING SERVICE OPERATIONS — giữ nguyên y như cũ
+// BOOKING SERVICE OPERATIONS
 // ──────────────────────────────────────────────────────
 
 async function syncBookingAfterServiceChange(bookingId) {
@@ -266,6 +282,15 @@ const addToBooking = async (req, res, next) => {
       addedBy:     req.user?.id,
     })
 
+    // ⭐ NEW 29/05/2026: trừ kho nếu dịch vụ có quản lý kho
+    let stockInfo = null
+    if (service.trackInventory) {
+      const r = await stock.deductStock({
+        serviceId: service._id, quantity: qty, bookingId, userId: req.user?.id,
+      })
+      if (r.ok) stockInfo = { stock: r.service.stock, lowStock: r.lowStock }
+    }
+
     await syncBookingAfterServiceChange(bookingId)
 
     const roomLabel = subRoomNumber ? `phòng ${subRoomNumber}` : `phòng ${booking.roomNumber}`
@@ -277,7 +302,7 @@ const addToBooking = async (req, res, next) => {
       metadata: { serviceName: service.name, quantity: qty, totalPrice, bookingServiceId: bs._id, subRoomId, subRoomNumber },
     })
 
-    res.status(201).json({ success: true, message: 'Đã thêm dịch vụ', data: { bookingService: bs } })
+    res.status(201).json({ success: true, message: 'Đã thêm dịch vụ', data: { bookingService: bs, stock: stockInfo } })
   } catch (err) { next(err) }
 }
 
@@ -305,7 +330,16 @@ const removeFromBooking = async (req, res, next) => {
 
     const bookingId = bs.bookingId
     const subRoomNumber = bs.subRoomNumber
+    const removedServiceId = bs.serviceId
+    const removedQty = bs.quantity
     await bs.deleteOne()
+
+    // ⭐ NEW 29/05/2026: hoàn kho nếu dịch vụ có quản lý kho
+    if (removedServiceId) {
+      await stock.restoreStock({
+        serviceId: removedServiceId, quantity: removedQty, bookingId, userId: req.user?.id,
+      })
+    }
 
     const booking = await syncBookingAfterServiceChange(bookingId)
 
@@ -330,12 +364,24 @@ const updateBookingService = async (req, res, next) => {
     const bs = await BookingService.findById(req.params.id)
     if (!bs) return res.status(404).json({ success: false, message: 'Không tìm thấy dịch vụ' })
 
+    const oldQty = bs.quantity   // ⭐ giữ số cũ để tính delta kho
+
     if (quantity !== undefined) {
       bs.quantity = Math.max(1, Number(quantity) || 1)
       bs.totalPrice = bs.unitPrice * bs.quantity
     }
     if (notes !== undefined) bs.notes = notes
     await bs.save()
+
+    // ⭐ NEW 29/05/2026: điều chỉnh kho theo delta số lượng
+    //   newQty > oldQty → bán thêm (trừ kho) ; newQty < oldQty → hoàn lại.
+    //   deltaStock = oldQty - newQty  (dương = hoàn, âm = trừ thêm)
+    if (quantity !== undefined && bs.serviceId && bs.quantity !== oldQty) {
+      const deltaStock = oldQty - bs.quantity
+      await stock.adjustStockByDelta({
+        serviceId: bs.serviceId, delta: deltaStock, bookingId: bs.bookingId, userId: req.user?.id,
+      })
+    }
 
     const booking = await syncBookingAfterServiceChange(bs.bookingId)
 
