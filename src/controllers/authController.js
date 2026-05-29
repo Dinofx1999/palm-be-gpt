@@ -211,6 +211,9 @@ const login = async (req, res, next) => {
     const safeUser = user.toSafeObject();
     safeUser.branchId = branchIdStr;
     safeUser.branchName = branchNameStr;
+    safeUser.avatar = user.avatar || '';      // ⭐ FIX: toSafeObject không có avatar → bổ sung
+    safeUser.email  = user.email  || safeUser.email  || '';
+    safeUser.phone  = user.phone  || safeUser.phone  || '';
 
     console.log('[auth.login]', {
       username: user.username,

@@ -97,6 +97,7 @@ app.use('/api/public', require('./routes/public'));
 
 app.use('/api/news',        require('./routes/news'));
 app.use('/api/site-config', require('./routes/siteConfig'));
+app.use('/api/settings', require('./routes/settings'));
 app.use('/api/public',      require('./routes/publicContent'));
 app.use('/api/tasks', require('./routes/tasks'));
 
@@ -147,6 +148,16 @@ app.use(errorHandler);
   try {
     await connect();
     await seedAdminIfEmpty();
+
+    // ⭐ NEW 29/05/2026: Lên lịch cron gửi báo cáo doanh thu qua email.
+    //   Đọc cấu hình từ DB (SystemSetting.reports). Mỗi lần lưu cấu hình ở trang
+    //   Cài đặt, settingsController sẽ tự gọi lại initReportSchedulers() nạp lịch mới.
+    try {
+      const { initReportSchedulers } = require('./utils/reportScheduler');
+      await initReportSchedulers();
+    } catch (e) {
+      console.warn('⚠️  Không khởi tạo được lịch báo cáo (bỏ qua):', e.message);
+    }
 
     app.listen(PORT, () => {
       console.log(`\n🏨  LuxStay PMS API  →  http://localhost:${PORT}\n`);

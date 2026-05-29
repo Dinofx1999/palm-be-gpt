@@ -2,10 +2,9 @@
 // ════════════════════════════════════════════════════════════════════
 // Telegram controller — gửi tin nhắn / ảnh qua Bot API + format audit log.
 //
-// CẤU HÌNH (.env):
-//   TELEGRAM_BOT_TOKEN=123456:ABC...        ← token bot (lấy từ @BotFather)
-//   TELEGRAM_CHAT_ID=-1001234567890         ← id group/kênh nhận (hoặc id user)
-//   TELEGRAM_AUDIT_ENABLED=true             ← bật/tắt gửi audit (mặc định true nếu có token)
+// ⭐ Bot Token / Chat ID đọc từ DB (trang Cài đặt hệ thống) — settingsController.
+//    DB ưu tiên, fallback .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).
+//    Đổi token/chatId qua UI có hiệu lực sau ≤30s (cache trong settingsController).
 //
 // CÁCH LẤY CHAT_ID:
 //   1. Tạo bot qua @BotFather → lấy token
@@ -19,25 +18,47 @@
 // ⚠️ CÀI: npm i form-data    (cần cho gửi ảnh từ disk)
 // ════════════════════════════════════════════════════════════════════
 
-const fs = require('fs');
+const fs       = require('fs');
+const FormData = require('form-data');
 const { enqueueTelegram, setSender, queueSize } = require('../utils/telegramQueue');
+const { getSettings } = require('./settingsController');
 
-const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN || '';
-const CHAT_ID       = process.env.TELEGRAM_CHAT_ID || '';
 const AUDIT_ENABLED = (process.env.TELEGRAM_AUDIT_ENABLED ?? 'true') !== 'false';
 
-const isConfigured = () => !!(BOT_TOKEN && CHAT_ID);
+// ── Lấy cấu hình Telegram của 1 chi nhánh ────────────────────────────
+//   settingsController.getSettings(branchId) đã có cache 30s + fallback env.
+async function tgConfig(branchId) {
+  try {
+    const { telegram } = await getSettings(branchId);
+    return {
+      botToken: telegram.botToken || '',
+      chatId:   telegram.chatId   || '',
+      enabled:  telegram.enabled,
+    };
+  } catch {
+    return { botToken: '', chatId: '', enabled: false };
+  }
+}
 
-// ── Sender TEXT (sendMessage) ─────────────────────────────────────────
+// Chi nhánh có bật + đủ token/chatId để gửi không (async)
+async function canSend(branchId) {
+  const c = await tgConfig(branchId);
+  return !!(c.enabled && c.botToken && c.chatId);
+}
+
+// ── Sender TEXT (sendMessage) ────────────────────────────────────────
+//   Token/chatId đã được resolve sẵn vào job lúc enqueue (job.botToken/job.chatId).
 async function sendToTelegram(job) {
-  if (!isConfigured()) throw new Error('Telegram chưa cấu hình (thiếu BOT_TOKEN/CHAT_ID)');
+  const botToken = job.botToken;
+  const chatId   = job.chatId;
+  if (!botToken || !chatId) throw new Error('Telegram chưa cấu hình (thiếu BOT_TOKEN/CHAT_ID)');
 
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      chat_id: job.chatId || CHAT_ID,
+      chat_id: chatId,
       text: job.text,
       parse_mode: job.parseMode || 'HTML',
       disable_web_page_preview: true,
@@ -54,39 +75,34 @@ async function sendToTelegram(job) {
   return data;
 }
 
-// ── Sender PHOTO (sendPhoto + caption) ────────────────────────────────
+// ── Sender PHOTO (sendPhoto + caption) ───────────────────────────────
 //   Ưu tiên photoPath (file trên disk — luôn chạy được, không cần URL public).
 //   Fallback photoUrl (URL công khai) nếu file không tồn tại.
 async function sendToTelegramPhoto(job) {
-  if (!isConfigured()) throw new Error('Telegram chưa cấu hình');
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+  const botToken = job.botToken;
+  const chatId   = job.chatId;
+  if (!botToken || !chatId) throw new Error('Telegram chưa cấu hình');
+  const url = `https://api.telegram.org/bot${botToken}/sendPhoto`;
 
   // Caption tối đa 1024 ký tự — cắt nếu dài
   const caption = (job.text || '').slice(0, 1024);
 
   let res;
   if (job.photoPath && fs.existsSync(job.photoPath)) {
-    // ⭐ FIX 27/05/2026: dùng FormData + Blob NATIVE của Node 18+ (không dùng lib form-data
-    //   vì stream của nó không tương thích với fetch global → Telegram trả 400 body rỗng).
-    const buf = fs.readFileSync(job.photoPath);
-    const filename = job.photoPath.split('/').pop() || 'photo.jpg';
-    const ext = (filename.split('.').pop() || 'jpg').toLowerCase();
-    const mime = ext === 'png' ? 'image/png'
-              : ext === 'webp' ? 'image/webp'
-              : 'image/jpeg';
-    const form = new FormData();   // native (globalThis.FormData)
-    form.append('chat_id',    String(job.chatId || CHAT_ID));
+    // Upload trực tiếp từ disk
+    const form = new FormData();
+    form.append('chat_id',    chatId);
     form.append('caption',    caption);
     form.append('parse_mode', job.parseMode || 'HTML');
-    form.append('photo',      new Blob([buf], { type: mime }), filename);
-    res = await fetch(url, { method: 'POST', body: form });
+    form.append('photo',      fs.createReadStream(job.photoPath));
+    res = await fetch(url, { method: 'POST', body: form, headers: form.getHeaders() });
   } else if (job.photoUrl) {
     // Gửi qua URL công khai (Telegram tự tải)
     res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id:    job.chatId || CHAT_ID,
+        chat_id:    chatId,
         caption,
         parse_mode: job.parseMode || 'HTML',
         photo:      job.photoUrl,
@@ -98,11 +114,10 @@ async function sendToTelegramPhoto(job) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    // ⭐ Log đầy đủ để debug khi 400 (Telegram thường trả "description" giải thích lý do)
-    throw new Error(`Telegram sendPhoto ${res.status} ${res.statusText || ''}: ${body.slice(0, 400) || '(empty body)'}`);
+    throw new Error(`Telegram API ${res.status}: ${body.slice(0, 200)}`);
   }
   const data = await res.json();
-  if (!data.ok) throw new Error(`Telegram trả lỗi: ${JSON.stringify(data).slice(0, 400)}`);
+  if (!data.ok) throw new Error(`Telegram trả lỗi: ${JSON.stringify(data).slice(0, 200)}`);
   return data;
 }
 
@@ -112,7 +127,7 @@ setSender(async (job) => {
   return sendToTelegram(job);
 });
 
-// ── Escape HTML cho parse_mode=HTML ───────────────────────────────────
+// ── Escape HTML cho parse_mode=HTML ──────────────────────────────────
 function esc(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
@@ -120,7 +135,7 @@ function esc(s) {
     .replace(/>/g, '&gt;');
 }
 
-// ── Map action → nhãn tiếng Việt ──────────────────────────────────────
+// ── Map action → nhãn tiếng Việt ─────────────────────────────────────
 const ACTION_LABELS = {
   // Tạo
   create:            'Tạo mới',
@@ -152,16 +167,20 @@ const ACTION_LABELS = {
   cancel_payment:    'Huỷ thanh toán',
   refund:            'Hoàn tiền',
   apply_discount:    'Giảm giá',
+  // Kho
+  stock_receipt:        'Phiếu nhập kho',
+  stock_receipt_create: 'Tạo phiếu nhập (nháp)',
+  stock_receipt_approve:'Duyệt phiếu nhập',
+  stock_receipt_reject: 'Từ chối phiếu nhập',
+  stock_receipt_cancel: 'Huỷ duyệt phiếu nhập',
+  low_stock:            'Cảnh báo sắp hết hàng',
   // Khác
   cancel:            'Huỷ',
   delete:            'Xoá',
   undo:              'Hoàn tác',
   login:             'Đăng nhập',
   apply_career:      'Ứng tuyển',
-  new_feedback:       'Góp ý mới',
-  low_stock:          'Sắp hết hàng',
-  stock_in:           'Nhập kho',
-  stock_adjust: 'Kiểm kê kho',
+  new_feedback:      'Góp ý mới',
 };
 
 // Action → nhãn tiếng Việt khi KHÔNG có trong map
@@ -176,10 +195,12 @@ const ENTITY_LABELS = {
   Booking: 'Đặt phòng', Invoice: 'Hoá đơn', Service: 'Dịch vụ',
   BookingService: 'Dịch vụ booking', Customer: 'Khách hàng', Room: 'Phòng',
   PricePolicy: 'Chính sách giá', Branch: 'Chi nhánh', User: 'Nhân viên',
-  JobApplication: 'Ứng tuyển', Feedback: 'Góp ý',
+  JobApplication: 'Ứng tuyển',
+  Feedback: 'Góp ý',
+  StockReceipt: 'Phiếu nhập kho',
 };
 
-// ── Nhãn tiếng Việt cho từng field metadata ───────────────────────────
+// ── Nhãn tiếng Việt cho từng field metadata ──────────────────────────
 //   Thứ tự khai báo = thứ tự ưu tiên hiển thị. Field không có trong map sẽ bị bỏ.
 const FIELD_LABELS = {
   bookingCode:        'Mã đặt phòng',
@@ -225,7 +246,15 @@ const FIELD_LABELS = {
   prevStatus:         'Trạng thái trước',
   status:             'Trạng thái',
   note:               'Ghi chú',
-  // Ứng tuyển
+  // kho
+  receiptCode:        'Mã phiếu',
+  supplier:           'Nhà cung cấp',
+  itemCount:          'Số mặt hàng',
+  totalQuantity:      'Tổng số lượng',
+  serviceName:        'Mặt hàng',
+  stock:              'Tồn còn lại',
+  threshold:          'Ngưỡng cảnh báo',
+  // ứng tuyển
   jobTitle:           'Vị trí ứng tuyển',
   fullName:           'Họ và tên',
   phone:              'Số điện thoại',
@@ -233,19 +262,10 @@ const FIELD_LABELS = {
   currentAddress:     'Địa chỉ hiện tại',
   birthDate:          'Ngày sinh',
   notes:              'Ghi chú',
-   // Feedback
-    overallRating:  'Đánh giá tổng',
-    wouldRecommend: 'Sẽ giới thiệu',
-    ratingsText:    'Chi tiết đánh giá',
-    alert:          '⚠️ Cảnh báo',
-
-    serviceName:  'Dịch vụ',
-    stock:        'Tồn hiện tại',
-    lowThreshold: 'Ngưỡng cảnh báo',
-    quantity:     'Số lượng',
-    unitCost:     'Giá nhập',
-    supplier:     'Nhà cung cấp',
-    balanceAfter: 'Tồn sau',
+  // góp ý
+  overallRating:      'Điểm tổng',
+  avgScore:           'Điểm trung bình',
+  content:            'Nội dung',
 };
 
 // Field là TIỀN (định dạng x.xxx đ)
@@ -259,7 +279,7 @@ const DATE_FIELDS = new Set([
   'oldCheckIn', 'oldCheckOut', 'birthDate',
 ]);
 // Field BOOLEAN → Có/Không
-const BOOL_FIELDS = new Set(['policyChanged', 'isFreeRoom','wouldRecommend']);
+const BOOL_FIELDS = new Set(['policyChanged', 'isFreeRoom']);
 // Map trạng thái → tiếng Việt
 const STATUS_LABELS = {
   unpaid: 'Chưa thanh toán', partial: 'Một phần', paid: 'Đã thanh toán',
@@ -334,7 +354,7 @@ function formatAuditMessage(audit) {
     if (skipKeys.has(key)) continue;
     const valStr = fmtFieldValue(key, m[key]);
     if (valStr === null) continue;
-    if (key === 'bookingCode') {
+    if (key === 'bookingCode' || key === 'receiptCode') {
       lines.push(`<b>${FIELD_LABELS[key]}:</b> <code>${valStr}</code>`);
     } else {
       lines.push(`<b>${FIELD_LABELS[key]}:</b> ${valStr}`);
@@ -348,7 +368,7 @@ function formatAuditMessage(audit) {
   return lines.join('\n');
 }
 
-// ── Helper: chuẩn bị payload audit đầy đủ (tra branch/user/booking) ────
+// ── Helper: chuẩn bị payload audit đầy đủ (tra branch/user/booking) ──
 //   Trả về object đã enrich (branchName, userName, metadata) sẵn sàng format.
 async function enrichAudit(audit) {
   let branchName = null;
@@ -393,15 +413,22 @@ async function enrichAudit(audit) {
   return { ...audit, branchName, userName, metadata };
 }
 
-// ── Public: gửi audit dạng TEXT (không ảnh) ───────────────────────────
+// ── Public: gửi audit dạng TEXT (không ảnh) ──────────────────────────
+//   Dùng cấu hình Telegram của chi nhánh audit.branchId. Không có branchId
+//   hoặc chi nhánh chưa bật → bỏ qua (độc lập hoàn toàn, không global).
 function notifyAudit(audit) {
-  if (!AUDIT_ENABLED || !isConfigured()) return;
+  if (!AUDIT_ENABLED) return;
   (async () => {
     try {
+      const branchId = audit?.branchId || null;
+      const cfg = await tgConfig(branchId);
+      if (!cfg.enabled || !cfg.botToken || !cfg.chatId) return;
       const enriched = await enrichAudit(audit);
       enqueueTelegram({
         text: formatAuditMessage(enriched),
         parseMode: 'HTML',
+        botToken: cfg.botToken,
+        chatId: cfg.chatId,
       });
     } catch (err) {
       console.error('[telegram] notifyAudit error (non-fatal):', err.message);
@@ -409,14 +436,17 @@ function notifyAudit(audit) {
   })();
 }
 
-// ── Public: gửi audit KÈM ẢNH ─────────────────────────────────────────
+// ── Public: gửi audit KÈM ẢNH ────────────────────────────────────────
 //   photoPath: đường dẫn file trên disk (ưu tiên).
 //   photoUrl:  URL công khai (fallback nếu không có photoPath).
 //   Nếu cả 2 đều thiếu → tự fallback gửi text thường (không lỗi).
 function notifyAuditWithPhoto(audit, photoPath, photoUrl) {
-  if (!AUDIT_ENABLED || !isConfigured()) return;
+  if (!AUDIT_ENABLED) return;
   (async () => {
     try {
+      const branchId = audit?.branchId || null;
+      const cfg = await tgConfig(branchId);
+      if (!cfg.enabled || !cfg.botToken || !cfg.chatId) return;
       const enriched = await enrichAudit(audit);
       const text = formatAuditMessage(enriched);
 
@@ -428,10 +458,11 @@ function notifyAuditWithPhoto(audit, photoPath, photoUrl) {
           photoUrl:  hasFile ? undefined : photoUrl,
           text,
           parseMode: 'HTML',
+          botToken: cfg.botToken,
+          chatId: cfg.chatId,
         });
       } else {
-        // Không có ảnh → gửi text thường
-        enqueueTelegram({ text, parseMode: 'HTML' });
+        enqueueTelegram({ text, parseMode: 'HTML', botToken: cfg.botToken, chatId: cfg.chatId });
       }
     } catch (err) {
       console.error('[telegram] notifyAuditWithPhoto error (non-fatal):', err.message);
@@ -439,36 +470,50 @@ function notifyAuditWithPhoto(audit, photoPath, photoUrl) {
   })();
 }
 
-// ── Public: gửi tin nhắn tự do (non-blocking) ─────────────────────────
+// ── Public: gửi tin nhắn tự do tới 1 chi nhánh (non-blocking) ────────
+//   sendMessage(text, { branchId, parseMode })
 function sendMessage(text, opts = {}) {
-  if (!isConfigured()) return false;
-  return enqueueTelegram({ text, parseMode: opts.parseMode || 'HTML', chatId: opts.chatId });
+  (async () => {
+    try {
+      const cfg = await tgConfig(opts.branchId || null);
+      if (!cfg.enabled || !cfg.botToken || !cfg.chatId) return;
+      enqueueTelegram({ text, parseMode: opts.parseMode || 'HTML', botToken: cfg.botToken, chatId: cfg.chatId });
+    } catch (err) {
+      console.error('[telegram] sendMessage error (non-fatal):', err.message);
+    }
+  })();
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════════════
 // EXPRESS HANDLERS (tuỳ chọn — gắn route nếu muốn test/giám sát từ PMS)
 // ════════════════════════════════════════════════════════════════════
 
-// POST /api/telegram/test
+// POST /api/telegram/test?branchId=
 async function testSend(req, res) {
-  if (!isConfigured()) {
-    return res.status(400).json({ success: false, message: 'Chưa cấu hình TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID' });
+  const branchId = req.query.branchId || req.body?.branchId || null;
+  const cfg = await tgConfig(branchId);
+  if (!cfg.botToken || !cfg.chatId) {
+    return res.status(400).json({ success: false, message: 'Chưa cấu hình Bot Token / Chat ID cho chi nhánh' });
   }
   const text = (req.body?.text && String(req.body.text)) ||
     `✅ <b>Test Telegram</b>\nKết nối PMS → Telegram hoạt động.\n🕐 ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`;
-  enqueueTelegram({ text, parseMode: 'HTML' });
+  enqueueTelegram({ text, parseMode: 'HTML', botToken: cfg.botToken, chatId: cfg.chatId });
   return res.json({ success: true, message: 'Đã đưa tin nhắn test vào hàng đợi', data: { queued: queueSize() } });
 }
 
-// GET /api/telegram/status
-function status(req, res) {
+// GET /api/telegram/status?branchId=
+async function status(req, res) {
+  const branchId = req.query.branchId || null;
+  const cfg = await tgConfig(branchId);
   return res.json({
     success: true,
     data: {
-      configured:   isConfigured(),
+      configured:   !!(cfg.enabled && cfg.botToken && cfg.chatId),
+      enabled:      cfg.enabled,
       auditEnabled: AUDIT_ENABLED,
-      hasToken:     !!BOT_TOKEN,
-      hasChatId:    !!CHAT_ID,
+      hasToken:     !!cfg.botToken,
+      hasChatId:    !!cfg.chatId,
       queueSize:    queueSize(),
     },
   });
@@ -479,7 +524,7 @@ module.exports = {
   notifyAuditWithPhoto,
   sendMessage,
   formatAuditMessage,
-  isConfigured,
+  canSend,
   // express handlers
   testSend,
   status,

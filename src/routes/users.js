@@ -11,6 +11,7 @@ const ctrl = require('../controllers/userController');
 router.get('/me',                   authenticate, ctrl.getMe);
 router.patch('/me',                 authenticate, ctrl.updateMe);
 router.post('/me/change-password',  authenticate, ctrl.changeMyPassword);
+router.post('/forgot-password',  ctrl.forgotPassword);   // ⭐ NEW quên mật khẩu
 
 // ── Quản trị (Admin/Manager) ──
 router.get('/',                     authenticate, authorize('Admin', 'Manager'), ctrl.getAll);
@@ -20,5 +21,8 @@ router.put('/:id',                  authenticate, authorize('Admin', 'Manager'),
 router.patch('/:id/toggle',         authenticate, authorize('Admin'),            ctrl.toggle);
 router.patch('/:id/reset-password', authenticate, authorize('Admin'),            ctrl.resetPassword);
 router.delete('/:id',               authenticate, authorize('Admin'),            ctrl.remove);
+router.get('/activation/verify', ctrl.verifyActivation);
+router.post('/activate',         ctrl.activate);
+router.post('/:id/resend-activation', authorize('Admin'), ctrl.resendActivation);  // ⭐ NEW
 
 module.exports = router;
