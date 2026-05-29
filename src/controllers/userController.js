@@ -1,8 +1,34 @@
 const crypto = require('crypto');
 const User = require('../models/User');
 
-// URL frontend để build link kích hoạt (đặt trong .env: FRONTEND_URL=https://palmhotel.com.vn)
+// URL frontend mặc định (khi không xác định được origin từ request)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// Danh sách origin frontend ĐƯỢC PHÉP build link (chống phishing/open-redirect).
+//   Cấu hình .env: FRONTEND_URLS=https://palmhotel.com.vn,https://www.palmhotel.com.vn,http://localhost:5173
+//   Nếu không set → dùng FRONTEND_URL + vài localhost thông dụng.
+const ALLOWED_FRONTEND = (process.env.FRONTEND_URLS || [
+  FRONTEND_URL,
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+].join(','))
+  .split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
+
+// Lấy base URL frontend ĐỘNG theo request (localhost hay domain), có whitelist.
+//   Ưu tiên header Origin; nếu không có/không hợp lệ → thử Referer; cuối cùng → FRONTEND_URL.
+function resolveFrontendUrl(req) {
+  const candidates = [];
+  if (req?.headers?.origin) candidates.push(req.headers.origin);
+  if (req?.headers?.referer) {
+    try { const u = new URL(req.headers.referer); candidates.push(`${u.protocol}//${u.host}`); } catch { /* ignore */ }
+  }
+  for (const c of candidates) {
+    const norm = String(c).replace(/\/$/, '');
+    if (ALLOWED_FRONTEND.includes(norm)) return norm;
+  }
+  return (ALLOWED_FRONTEND[0] || FRONTEND_URL).replace(/\/$/, '');
+}
 
 const getAll = async (req, res, next) => {
   try {
@@ -23,8 +49,9 @@ const getOne = async (req, res, next) => {
 };
 
 // ── Gửi email kích hoạt (dùng cấu hình email + thương hiệu của chi nhánh user) ─
-async function sendActivationEmail(user, rawToken) {
+async function sendActivationEmail(user, rawToken, baseUrl) {
   const { sendMail } = require('../utils/mailer');
+  const base = (baseUrl || FRONTEND_URL).replace(/\/$/, '');
   // Thương hiệu = tên chi nhánh của tài khoản (fallback nếu thiếu)
   let brand = user.branchName || '';
   if (!brand && user.branchId) {
@@ -36,7 +63,7 @@ async function sendActivationEmail(user, rawToken) {
   }
   if (!brand) brand = 'LuxHotel PMS';
 
-  const link = `${FRONTEND_URL.replace(/\/$/, '')}/activate?token=${rawToken}&uid=${user._id}`;
+  const link = `${base}/activate?token=${rawToken}&uid=${user._id}`;
   const html = `
   <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1E293B;">
     <div style="background:linear-gradient(135deg,#0B76EF,#1E40AF);padding:20px 24px;border-radius:12px 12px 0 0;">
@@ -87,7 +114,7 @@ const create = async (req, res, next) => {
     // Gửi email kích hoạt — nếu lỗi (email chi nhánh chưa cấu hình) vẫn tạo, báo để resend
     let emailSent = true, emailError = null;
     try {
-      await sendActivationEmail(user, rawToken);
+      await sendActivationEmail(user, rawToken, resolveFrontendUrl(req));
     } catch (e) {
       emailSent = false;
       emailError = e.message;
@@ -216,6 +243,7 @@ const forgotPassword = async (req, res, next) => {
         const rawToken = user.createActivationToken(48);
         await user.save();
         const { sendMail } = require('../utils/mailer');
+        const base = resolveFrontendUrl(req);
         // Thương hiệu = tên chi nhánh của tài khoản
         let brand = user.branchName || '';
         if (!brand) {
@@ -227,7 +255,7 @@ const forgotPassword = async (req, res, next) => {
         }
         if (!brand) brand = 'LuxHotel PMS';
 
-        const link = `${FRONTEND_URL.replace(/\/$/, '')}/activate?token=${rawToken}&uid=${user._id}&mode=reset`;
+        const link = `${base}/activate?token=${rawToken}&uid=${user._id}&mode=reset`;
         const html = `
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1E293B;">
           <div style="background:linear-gradient(135deg,#0B76EF,#1E40AF);padding:20px 24px;border-radius:12px 12px 0 0;">
@@ -267,7 +295,7 @@ const resendActivation = async (req, res, next) => {
     const rawToken = user.createActivationToken(48);
     await user.save();
     try {
-      await sendActivationEmail(user, rawToken);
+      await sendActivationEmail(user, rawToken, resolveFrontendUrl(req));
     } catch (e) {
       return res.status(500).json({ success: false, message: `Gửi email thất bại: ${e.message}` });
     }

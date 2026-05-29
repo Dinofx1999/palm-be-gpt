@@ -12,8 +12,15 @@ const login = async (req, res, next) => {
     if (!username || !password)
       return res.status(400).json({ success: false, message: 'Thiếu username hoặc password' });
 
-    const user = await User.findOne({ username: username.toLowerCase() })
-      .populate('branchId', 'name address city attendanceSecurity');
+    // ⭐ Cho phép đăng nhập bằng USERNAME hoặc EMAIL (không phân biệt hoa/thường)
+    const identifier = String(username).trim();
+    const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const user = await User.findOne({
+      $or: [
+        { username: identifier.toLowerCase() },
+        { email: { $regex: `^${escapeRegex(identifier)}$`, $options: 'i' } },
+      ],
+    }).populate('branchId', 'name address city attendanceSecurity');
 
     if (!user)
       return res.status(401).json({ success: false, message: 'Sai tên đăng nhập hoặc mật khẩu' });
