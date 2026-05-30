@@ -8,7 +8,7 @@ const bookingServiceSchema = new mongoose.Schema({
   subRoomId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Room', default: null, index: true },
   // ⭐ Lưu thêm roomNumber để hiển thị nhanh không phải populate
   subRoomNumber:{ type: String, default: '' },
-  serviceId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Service', required: true },
+  serviceId: { type: mongoose.Schema.Types.ObjectId, ref: 'Service', default: null },
   serviceName:  { type: String, required: true },
   unit:         { type: String, default: '' },
   unitPrice:    { type: Number, required: true },
@@ -17,6 +17,7 @@ const bookingServiceSchema = new mongoose.Schema({
   notes:        { type: String, default: '' },
   addedBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   addedAt:      { type: Date, default: Date.now },
+  isCustom: { type: Boolean, default: false },
 }, { timestamps: true });
 
 bookingServiceSchema.index({ bookingId: 1, addedAt: 1 });

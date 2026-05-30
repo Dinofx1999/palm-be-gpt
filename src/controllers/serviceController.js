@@ -247,18 +247,42 @@ async function syncBookingAfterServiceChange(bookingId) {
 
 const addToBooking = async (req, res, next) => {
   try {
-    const { bookingId, serviceId, quantity = 1, notes = '', subRoomId = null } = req.body
-    if (!bookingId || !serviceId)
-      return res.status(400).json({ success: false, message: 'Thiếu bookingId hoặc serviceId' })
+    const {
+      bookingId, serviceId, quantity = 1, notes = '', subRoomId = null,
+      // ⭐ NEW: dịch vụ tùy chỉnh (client-only, không có trong DB)
+      isCustom = false, name = '', price, unit,
+    } = req.body
+
+    if (!bookingId)
+      return res.status(400).json({ success: false, message: 'Thiếu bookingId' })
+
+    // ⭐ Phải có serviceId thật HOẶC là dịch vụ tùy chỉnh hợp lệ
+    if (!isCustom && !serviceId)
+      return res.status(400).json({ success: false, message: 'Thiếu serviceId' })
+    if (isCustom && (!name.trim() || isNaN(Number(price)) || Number(price) <= 0))
+      return res.status(400).json({ success: false, message: 'Dịch vụ tùy chỉnh cần tên và đơn giá hợp lệ' })
 
     const booking = await Booking.findById(bookingId)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy booking' })
 
-    const service = await Service.findById(serviceId)
-    if (!service) return res.status(404).json({ success: false, message: 'Không tìm thấy dịch vụ' })
+    // ⭐ Lấy thông tin dịch vụ: từ DB (serviceId) hoặc từ payload (custom)
+    let svc
+    if (isCustom) {
+      svc = {
+        _id:            null,
+        name:           name.trim(),
+        unit:           (unit ?? 'lần').toString().trim() || 'lần',
+        price:          Number(price),
+        trackInventory: false,   // dịch vụ ảo không quản lý kho
+      }
+    } else {
+      const service = await Service.findById(serviceId)
+      if (!service) return res.status(404).json({ success: false, message: 'Không tìm thấy dịch vụ' })
+      svc = service
+    }
 
     const qty = Math.max(1, Number(quantity) || 1)
-    const totalPrice = (service.price ?? 0) * qty
+    const totalPrice = (svc.price ?? 0) * qty
 
     let subRoomNumber = ''
     if (subRoomId) {
@@ -270,23 +294,25 @@ const addToBooking = async (req, res, next) => {
     }
 
     const bs = await BookingService.create({
-      bookingId, serviceId,
+      bookingId,
+      serviceId:   svc._id,        // ⭐ null nếu là dịch vụ tùy chỉnh
+      isCustom:    !!isCustom,     // ⭐ lưu cờ để phân biệt
       subRoomId,
       subRoomNumber,
-      serviceName: service.name,
-      unit:        service.unit ?? '',
-      unitPrice:   service.price ?? 0,
+      serviceName: svc.name,
+      unit:        svc.unit ?? '',
+      unitPrice:   svc.price ?? 0,
       quantity:    qty,
       totalPrice,
       notes,
       addedBy:     req.user?.id,
     })
 
-    // ⭐ NEW 29/05/2026: trừ kho nếu dịch vụ có quản lý kho
+    // ⭐ Trừ kho chỉ áp dụng cho dịch vụ thật có quản lý kho
     let stockInfo = null
-    if (service.trackInventory) {
+    if (!isCustom && svc.trackInventory) {
       const r = await stock.deductStock({
-        serviceId: service._id, quantity: qty, bookingId, userId: req.user?.id,
+        serviceId: svc._id, quantity: qty, bookingId, userId: req.user?.id,
       })
       if (r.ok) stockInfo = { stock: r.service.stock, lowStock: r.lowStock }
     }
@@ -297,9 +323,9 @@ const addToBooking = async (req, res, next) => {
     await logAction({
       entityType: 'Booking', entityId: bookingId,
       action: 'add_service',
-      description: `Thêm dịch vụ "${service.name}" × ${qty} = ${totalPrice.toLocaleString('vi-VN')}đ vào ${roomLabel}`,
+      description: `Thêm dịch vụ "${svc.name}" × ${qty} = ${totalPrice.toLocaleString('vi-VN')}đ vào ${roomLabel}${isCustom ? ' (tùy chỉnh)' : ''}`,
       user: req.user, branchId: booking.branchId,
-      metadata: { serviceName: service.name, quantity: qty, totalPrice, bookingServiceId: bs._id, subRoomId, subRoomNumber },
+      metadata: { serviceName: svc.name, quantity: qty, totalPrice, bookingServiceId: bs._id, subRoomId, subRoomNumber, isCustom: !!isCustom },
     })
 
     res.status(201).json({ success: true, message: 'Đã thêm dịch vụ', data: { bookingService: bs, stock: stockInfo } })
