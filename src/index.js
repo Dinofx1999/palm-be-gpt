@@ -43,7 +43,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '12mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
@@ -128,7 +128,8 @@ app.use('/api/feedback-categories', require('./routes/feedbackCategories'));
 app.use('/api/feedback-blocks',     require('./routes/feedbackBlocks'));
 app.use('/api/public/feedback',     require('./routes/publicFeedback'));
 app.use('/api/stock', require('./routes/stock'));
-app.use('/api/tax-profiles', require('./routes/taxProfiles'))
+app.use('/api/tax-profiles', require('./routes/taxProfiles'));
+app.use('/api/cccd', require('./routes/cccd'));
 
 
 // Static serve folder uploads
