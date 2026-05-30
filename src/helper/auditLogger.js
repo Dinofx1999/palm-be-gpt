@@ -42,9 +42,10 @@ async function logAction(params) {
       branchId,
     })
   } catch (err) {
-    // Audit log không nên crash flow chính
-    console.error('[AuditLog] failed to log:', err.message)
-  }
+  console.error('[AuditLog] failed to log:', err)
+  if (err?.errors) console.error('[AuditLog] details:', JSON.stringify(err.errors, null, 2))
 }
+}
+
 
 module.exports = { logAction };
