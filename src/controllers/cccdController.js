@@ -81,8 +81,9 @@ function jsqrDecodeGray(gray, width, height) {
 
 // ── Tạo các biến thể ảnh GRAYSCALE 1 kênh để thử ─────────────────────
 // Tạo 1 biến thể grayscale theo (width, kiểu). Lười: chỉ chạy khi được gọi.
-async function makeGray(buf, width, kind) {
-  let p = sharp(buf).rotate().resize({ width, withoutEnlargement: false }).grayscale();
+// Tạo biến thể grayscale từ một sharp pipeline gốc đã chuẩn hoá (xoay + cap kích thước).
+async function makeGrayFrom(srcBuf, width, kind) {
+  let p = sharp(srcBuf).resize({ width, withoutEnlargement: false }).grayscale();
   if (kind === 'norm')      p = p.normalize().sharpen();
   else if (kind === 'lin')  p = p.linear(1.4, -30).sharpen();
   else if (kind === 'thr')  p = p.normalize().threshold(128);
@@ -100,17 +101,35 @@ function tryVariant(v) {
 
 async function decodeBuffer(buf) {
   const t0 = Date.now();
-  // ⭐ Thứ tự "dễ trúng trước": kích thước vừa + biến thể normalize hay đọc được nhất.
-  //   Mỗi phần tử [width, kind]. Dừng NGAY khi đọc được (không chạy hết).
+
+  // ⭐ Downscale ảnh GỐC xuống 1 lần (cap ~1800px), xoay theo EXIF, ép JPEG.
+  //   Các tổ hợp sau resize từ bản nhỏ này → nhanh hơn nhiều so với resize ảnh 4000px lặp lại.
+  let src = buf;
+  try {
+    const meta = await sharp(buf).metadata();
+    const longEdge = Math.max(meta.width || 0, meta.height || 0);
+    if (longEdge > 1800) {
+      src = await sharp(buf).rotate().resize({ width: 1800, withoutEnlargement: true })
+        .jpeg({ quality: 90 }).toBuffer();
+    } else {
+      src = await sharp(buf).rotate().jpeg({ quality: 92 }).toBuffer();
+    }
+  } catch (e) {
+    console.warn('[cccd] downscale gốc lỗi:', e.message);
+    src = buf;
+  }
+  console.log(`[cccd] chuẩn hoá ảnh gốc: ${Date.now() - t0}ms`);
+
+  // Thứ tự "dễ trúng trước". Kích thước ≤ 1800 (bản src đã cap), không phóng quá to.
   const combos = [
-    [1100, 'norm'], [1500, 'norm'],          // hay trúng nhất
-    [1100, 'thr'],  [1500, 'lin'],           // ảnh tương phản kém / nhị phân
-    [800,  'norm'], [2000, 'norm'],          // QR rất nhỏ hoặc rất to
-    [2000, 'thr'],
+    [1100, 'norm'], [1500, 'norm'],
+    [1100, 'thr'],  [1500, 'lin'],
+    [800,  'norm'], [1700, 'norm'],
+    [1700, 'thr'],
   ];
   for (const [w, kind] of combos) {
     let v;
-    try { v = await makeGray(buf, w, kind); }
+    try { v = await makeGrayFrom(src, w, kind); }
     catch (e) { console.warn('[cccd] makeGray lỗi', w, kind, e.message); continue; }
     const raw = tryVariant(v);
     if (raw) {
