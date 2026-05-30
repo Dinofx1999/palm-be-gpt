@@ -15,8 +15,7 @@
 const sharp = require('sharp');
 const jsQR = require('jsqr');
 const {
-  MultiFormatReader,
-  BarcodeFormat,
+  QRCodeReader,
   DecodeHintType,
   RGBLuminanceSource,
   BinaryBitmap,
@@ -47,17 +46,10 @@ function parseCccd(raw) {
   };
 }
 
-// ── ZXing: decode từ RGBA raw ─────────────────────────────────────────
-function makeZxingReader() {
-  const reader = new MultiFormatReader();
-  const hints = new Map();
-  hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
-  hints.set(DecodeHintType.TRY_HARDER, true);
-  reader.setHints(hints);
-  return reader;
-}
+// ── ZXing: chỉ đọc QR (QRCodeReader) — không đụng MaxiCode → không log rác ──
+const _zxHints = new Map();
+_zxHints.set(DecodeHintType.TRY_HARDER, true);
 
-// ZXing decode từ mảng grayscale 1 kênh.
 function zxingDecodeGray(gray, width, height) {
   const argb = new Int32Array(width * height);
   for (let i = 0; i < gray.length; i++) {
@@ -67,10 +59,11 @@ function zxingDecodeGray(gray, width, height) {
   try {
     const source = new RGBLuminanceSource(argb, width, height);
     const bitmap = new BinaryBitmap(new HybridBinarizer(source));
-    const reader = makeZxingReader();
-    const result = reader.decode(bitmap);
+    const reader = new QRCodeReader();
+    const result = reader.decode(bitmap, _zxHints);
     return result?.getText?.() ?? null;
   } catch {
+    // NotFound/Checksum/Format — coi như không đọc được, thử biến thể khác.
     return null;
   }
 }
