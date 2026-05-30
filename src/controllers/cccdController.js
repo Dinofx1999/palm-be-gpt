@@ -80,33 +80,45 @@ function jsqrDecodeGray(gray, width, height) {
 }
 
 // ── Tạo các biến thể ảnh GRAYSCALE 1 kênh để thử ─────────────────────
-async function grayVariantsOf(buf, width) {
-  const base = sharp(buf).rotate().resize({ width, withoutEnlargement: false }).grayscale();
-  const out = [];
-  // 1) normalize + sharpen
-  out.push(await base.clone().normalize().sharpen().raw().toBuffer({ resolveWithObject: true }));
-  // 2) tăng tương phản mạnh
-  out.push(await base.clone().linear(1.4, -30).sharpen().raw().toBuffer({ resolveWithObject: true }));
-  // 3) nhị phân hóa đen/trắng
-  out.push(await base.clone().normalize().threshold(128).raw().toBuffer({ resolveWithObject: true }));
-  return out;
+// Tạo 1 biến thể grayscale theo (width, kiểu). Lười: chỉ chạy khi được gọi.
+async function makeGray(buf, width, kind) {
+  let p = sharp(buf).rotate().resize({ width, withoutEnlargement: false }).grayscale();
+  if (kind === 'norm')      p = p.normalize().sharpen();
+  else if (kind === 'lin')  p = p.linear(1.4, -30).sharpen();
+  else if (kind === 'thr')  p = p.normalize().threshold(128);
+  return p.raw().toBuffer({ resolveWithObject: true });
+}
+
+// Thử 1 biến thể: ZXing trước, jsqr sau. Trả raw|null.
+function tryVariant(v) {
+  const { data, info } = v;
+  const zx = zxingDecodeGray(data, info.width, info.height);
+  if (zx) return zx;
+  const jq = jsqrDecodeGray(data, info.width, info.height);
+  return jq || null;
 }
 
 async function decodeBuffer(buf) {
-  const widths = [1000, 1400, 2000, 800, 2600];
-  for (const w of widths) {
-    let variants;
-    try { variants = await grayVariantsOf(buf, w); }
-    catch (e) { console.warn('[cccd] grayVariantsOf lỗi @', w, e.message); continue; }
-
-    for (const v of variants) {
-      const { data, info } = v;   // data = grayscale 1 kênh, length = w*h
-      const zx = zxingDecodeGray(data, info.width, info.height);
-      if (zx) return zx;
-      const jq = jsqrDecodeGray(data, info.width, info.height);
-      if (jq) return jq;
+  const t0 = Date.now();
+  // ⭐ Thứ tự "dễ trúng trước": kích thước vừa + biến thể normalize hay đọc được nhất.
+  //   Mỗi phần tử [width, kind]. Dừng NGAY khi đọc được (không chạy hết).
+  const combos = [
+    [1100, 'norm'], [1500, 'norm'],          // hay trúng nhất
+    [1100, 'thr'],  [1500, 'lin'],           // ảnh tương phản kém / nhị phân
+    [800,  'norm'], [2000, 'norm'],          // QR rất nhỏ hoặc rất to
+    [2000, 'thr'],
+  ];
+  for (const [w, kind] of combos) {
+    let v;
+    try { v = await makeGray(buf, w, kind); }
+    catch (e) { console.warn('[cccd] makeGray lỗi', w, kind, e.message); continue; }
+    const raw = tryVariant(v);
+    if (raw) {
+      console.log(`[cccd] decode OK @ ${w}/${kind} trong ${Date.now() - t0}ms`);
+      return raw;
     }
   }
+  console.log(`[cccd] decode MISS sau ${Date.now() - t0}ms`);
   return null;
 }
 
