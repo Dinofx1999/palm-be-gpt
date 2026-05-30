@@ -14,6 +14,9 @@ const bookingSchema = new mongoose.Schema({
   customerId:      { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', default: null },
   customerName:    { type: String, required: true },
   customerPhone:   { type: String, default: '' },   // ⭐ Không bắt buộc
+  // ⭐ NEW 30/05/2026: Email khách — cache trên booking để gửi xác nhận đặt phòng.
+  //   Không bắt buộc; nếu trống FE sẽ hỏi nhập tay rồi lưu lại vào đây + Customer.
+  customerEmail:   { type: String, default: '' },
   // ⭐ Phòng PRIMARY (giữ tương thích với code cũ — phòng đầu tiên của đoàn)
   roomId:          { type: mongoose.Schema.Types.ObjectId, ref: 'Room', required: true },
   roomNumber:      { type: String, required: true },

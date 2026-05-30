@@ -10,6 +10,7 @@ const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 const { computeMoveRoomBreakdown } = require('../utils/moveRoomBreakdown');
 const { rebuildBreakdownFromHistory, buildSegmentsFromHistory } = require('../utils/rebuildBreakdownFromHistory');
+const { sendMail } = require('../utils/mailer');
 
 // ⭐ FIX 21/05/2026: Làm tròn giờ checkout khi tính "đến hiện tại" (mode 'now')
 //   theo mốc dayEquivalentHours của branch (vd 20:00).
@@ -6127,6 +6128,277 @@ const getCanSetPast = async (req, res, next) => {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ NEW 30/05/2026: Gửi EMAIL XÁC NHẬN ĐẶT PHÒNG cho khách.
+//   POST /bookings/:id/send-confirmation
+//   Body (optional): { email }  — email khách nhập tay trên FE (khi booking
+//     chưa có sẵn email). Nếu có → ưu tiên dùng + lưu lại vào Booking/Customer.
+//
+//   Nguồn email (theo yêu cầu): ưu tiên booking.customerEmail → fallback
+//     Customer.email (qua booking.customerId) → fallback email body request.
+//
+//   Nội dung: mã booking, phòng, ngày nhận/trả, breakdown giá + chính sách,
+//     tổng tiền, hướng dẫn thanh toán (số dư còn lại).
+// ════════════════════════════════════════════════════════════════════════════
+
+const escHtml = (s) =>
+  String(s ?? '').replace(/[<>&"]/g, (c) =>
+    ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]))
+
+const fmtVND = (v) => (Number(v) || 0).toLocaleString('vi-VN')
+
+const fmtDateTimeVN = (d) => {
+  if (!d) return '—'
+  try { return new Date(d).toLocaleString('vi-VN', { dateStyle: 'short', timeStyle: 'short' }) }
+  catch { return '—' }
+}
+
+// Validate email cơ bản
+const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || '').trim())
+
+// Dựng HTML email xác nhận từ booking + branch + invoice.
+//   bill (optional): số liệu hoá đơn FE đang hiển thị (theo tab "Đến hiện tại" /
+//   "Đến khi trả phòng") — { mode, breakdown, totalAmount, paidAmount, remainingAmount }.
+//   Nếu có bill → ƯU TIÊN dùng để email khớp 100% với FE. Nếu không → fallback
+//   booking.priceBreakdown + invoice (số liệu lưu cứng).
+function buildConfirmationHtml({ booking, branch, invoice, bill = null }) {
+  const brandName = branch?.name || 'LuxHotel'
+
+  const rows = (bill && Array.isArray(bill.breakdown))
+    ? bill.breakdown
+    : (Array.isArray(booking.priceBreakdown) ? booking.priceBreakdown : [])
+
+  const breakdownRows = rows.map((b) => `
+    <tr>
+      <td style="padding:6px 10px;border-bottom:1px solid #EEF2F7;color:#334155;font-size:13px">${escHtml(b.label)}</td>
+      <td style="padding:6px 10px;border-bottom:1px solid #EEF2F7;color:#0F172A;font-size:13px;text-align:right;white-space:nowrap">${fmtVND(b.amount)} đ</td>
+    </tr>`).join('')
+
+  const total      = bill ? Number(bill.totalAmount ?? 0)     : Number(booking.totalAmount ?? 0)
+  const paid       = bill ? Number(bill.paidAmount ?? 0)      : Number(invoice?.paidAmount ?? 0)
+  const remaining  = bill ? Number(bill.remainingAmount ?? Math.max(0, total - paid))
+                          : Math.max(0, total - paid)
+
+  // Khối hướng dẫn thanh toán — chỉ hiện khi còn nợ
+  const paymentBlock = remaining > 0 ? `
+    <div style="margin-top:18px;padding:14px 16px;background:#FFF7ED;border:1px solid #FED7AA;border-radius:8px">
+      <div style="font-size:14px;font-weight:700;color:#9A3412;margin-bottom:6px">Hướng dẫn thanh toán</div>
+      <div style="font-size:13px;color:#7C2D12;line-height:1.6">
+        Số tiền còn lại cần thanh toán: <b>${fmtVND(remaining)} đ</b>.<br/>
+        Vui lòng hoàn tất thanh toán khi nhận phòng hoặc theo hướng dẫn của lễ tân.
+        ${branch?.phone || branch?.hotline ? `Mọi thắc mắc xin liên hệ: <b>${escHtml(branch.phone || branch.hotline)}</b>.` : ''}
+      </div>
+    </div>` : `
+    <div style="margin-top:18px;padding:14px 16px;background:#ECFDF5;border:1px solid #A7F3D0;border-radius:8px">
+      <div style="font-size:13px;color:#065F46;line-height:1.6">
+        ✅ Đặt phòng đã được thanh toán đầy đủ. Hẹn gặp quý khách!
+      </div>
+    </div>`
+
+  const policyLine = booking.policyName
+    ? `<div style="font-size:12px;color:#64748B;margin-top:4px">Chính sách giá: <b>${escHtml(booking.policyName)}</b></div>`
+    : ''
+
+  // Nhãn mốc tính tiền — giúp khách hiểu số liệu tương ứng thời điểm nào.
+  let billNote = ''
+  if (bill?.mode === 'now') {
+    const asOf = bill.viewedAt || bill.effectiveCheckOut
+    billNote = `<div style="font-size:12px;color:#64748B;margin-bottom:6px">Tạm tính đến: <b>${fmtDateTimeVN(asOf)}</b></div>`
+  } else if (bill?.mode === 'checkout') {
+    billNote = `<div style="font-size:12px;color:#64748B;margin-bottom:6px">Tính đến giờ trả phòng dự kiến: <b>${fmtDateTimeVN(bill.effectiveCheckOut || booking.checkOut)}</b></div>`
+  }
+
+  return `<!DOCTYPE html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#F1F5F9;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+  <div style="max-width:600px;margin:0 auto;padding:24px 12px">
+    <div style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08)">
+
+      <!-- Header -->
+      <div style="background:linear-gradient(135deg,#0B76EF,#0EA5E9);padding:22px 24px">
+        <div style="color:#fff;font-size:20px;font-weight:800;letter-spacing:.3px">${escHtml(brandName)}</div>
+        <div style="color:#DBEAFE;font-size:13px;margin-top:2px">Xác nhận đặt phòng</div>
+      </div>
+
+      <!-- Body -->
+      <div style="padding:22px 24px">
+        <p style="font-size:14px;color:#0F172A;margin:0 0 14px">
+          Kính gửi <b>${escHtml(booking.customerName || 'Quý khách')}</b>,
+        </p>
+        <p style="font-size:14px;color:#334155;line-height:1.6;margin:0 0 18px">
+          Cảm ơn quý khách đã đặt phòng tại ${escHtml(brandName)}. Dưới đây là thông tin chi tiết đặt phòng của quý khách:
+        </p>
+
+        <!-- Thông tin chính -->
+        <table style="width:100%;border-collapse:collapse;background:#F8FAFC;border-radius:8px;overflow:hidden">
+          ${booking.bookingCode ? `<tr><td style="padding:8px 12px;color:#64748B;font-size:13px;width:42%">Mã đặt phòng</td><td style="padding:8px 12px;color:#0F172A;font-size:13px;font-weight:700">${escHtml(booking.bookingCode)}</td></tr>` : ''}
+          <tr><td style="padding:8px 12px;color:#64748B;font-size:13px">Phòng</td><td style="padding:8px 12px;color:#0F172A;font-size:13px;font-weight:600">${escHtml(booking.roomNumber || '—')}${booking.roomType ? ` — ${escHtml(booking.roomType)}` : ''}</td></tr>
+          <tr><td style="padding:8px 12px;color:#64748B;font-size:13px">Nhận phòng</td><td style="padding:8px 12px;color:#0F172A;font-size:13px">${fmtDateTimeVN(booking.checkIn)}</td></tr>
+          <tr><td style="padding:8px 12px;color:#64748B;font-size:13px">Trả phòng</td><td style="padding:8px 12px;color:#0F172A;font-size:13px">${fmtDateTimeVN(booking.checkOut)}</td></tr>
+          ${booking.customerPhone ? `<tr><td style="padding:8px 12px;color:#64748B;font-size:13px">Số điện thoại</td><td style="padding:8px 12px;color:#0F172A;font-size:13px">${escHtml(booking.customerPhone)}</td></tr>` : ''}
+        </table>
+        ${policyLine}
+
+        <!-- Chi tiết giá -->
+        ${breakdownRows ? `
+        <div style="margin-top:18px">
+          <div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:6px">Chi tiết giá</div>
+          ${billNote}
+          <table style="width:100%;border-collapse:collapse;border:1px solid #EEF2F7;border-radius:8px;overflow:hidden">
+            ${breakdownRows}
+            <tr>
+              <td style="padding:10px;background:#F8FAFC;font-size:14px;font-weight:800;color:#0F172A">Tổng cộng</td>
+              <td style="padding:10px;background:#F8FAFC;font-size:14px;font-weight:800;color:#0B76EF;text-align:right">${fmtVND(total)} đ</td>
+            </tr>
+            ${paid > 0 ? `<tr><td style="padding:8px 10px;font-size:13px;color:#64748B">Đã thanh toán</td><td style="padding:8px 10px;font-size:13px;color:#16A34A;text-align:right">− ${fmtVND(paid)} đ</td></tr>` : ''}
+            ${paid > 0 ? `<tr><td style="padding:8px 10px;font-size:13px;font-weight:700;color:#0F172A">Còn lại</td><td style="padding:8px 10px;font-size:13px;font-weight:700;color:#DC2626;text-align:right">${fmtVND(remaining)} đ</td></tr>` : ''}
+          </table>
+        </div>` : `
+        <div style="margin-top:18px;font-size:14px;color:#0F172A">
+          Tổng cộng: <b style="color:#0B76EF">${fmtVND(total)} đ</b>
+        </div>`}
+
+        ${paymentBlock}
+
+        <p style="font-size:13px;color:#64748B;line-height:1.6;margin:20px 0 0">
+          Nếu có bất kỳ thay đổi nào về lịch trình, vui lòng liên hệ trực tiếp với chúng tôi.<br/>
+          Trân trọng,<br/><b>${escHtml(brandName)}</b>
+        </p>
+      </div>
+
+      <!-- Footer -->
+      <div style="padding:14px 24px;background:#F8FAFC;border-top:1px solid #EEF2F7;text-align:center">
+        <div style="font-size:11px;color:#94A3B8">
+          ${branch?.address ? escHtml(branch.address) + ' · ' : ''}${branch?.phone || branch?.hotline ? escHtml(branch.phone || branch.hotline) : ''}
+        </div>
+        <div style="font-size:11px;color:#CBD5E1;margin-top:4px">Email này được gửi tự động từ hệ thống ${escHtml(brandName)}.</div>
+      </div>
+    </div>
+  </div>
+</body></html>`
+}
+
+const sendConfirmationEmail = async (req, res, next) => {
+  try {
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+    }
+
+    // 1) Resolve email: ưu tiên booking.customerEmail → Customer.email → body
+    const bodyEmail = String(req.body?.email ?? '').trim()
+    let targetEmail = String(booking.customerEmail ?? '').trim()
+    let customer = null
+
+    if (!targetEmail && booking.customerId) {
+      try {
+        customer = await Customer.findById(booking.customerId)
+        if (customer?.email) targetEmail = String(customer.email).trim()
+      } catch (_) {}
+    }
+
+    // Nếu khách nhập tay (FE truyền email) → ưu tiên dùng email đó
+    const usedManualEmail = !!bodyEmail
+    if (usedManualEmail) targetEmail = bodyEmail
+
+    if (!targetEmail) {
+      return res.status(400).json({
+        success: false,
+        code: 'NO_EMAIL',
+        message: 'Đặt phòng chưa có email. Vui lòng nhập email khách hàng.',
+      })
+    }
+    if (!isValidEmail(targetEmail)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_EMAIL',
+        message: 'Email không hợp lệ. Vui lòng kiểm tra lại.',
+      })
+    }
+
+    // 2) Lấy branch (cho tên KS + cấu hình mail) + invoice (đã trả/còn lại)
+    const branch = await Branch.findById(booking.branchId)
+    let invoice = null
+    try { invoice = await Invoice.findOne({ bookingId: booking._id }) } catch (_) {}
+
+    // 2b) Số liệu hoá đơn FE đang hiển thị (theo tab user chọn) — nếu có thì
+    //   email khớp 100% với FE. Sanitize để không nhúng dữ liệu lạ vào template.
+    const sanitizeBill = (raw) => {
+      if (!raw || typeof raw !== 'object') return null
+      const breakdown = Array.isArray(raw.breakdown)
+        ? raw.breakdown
+            .filter((b) => b && (b.label !== undefined))
+            .map((b) => ({ label: String(b.label ?? ''), amount: Number(b.amount) || 0 }))
+        : []
+      const mode = (raw.mode === 'checkout' || raw.mode === 'now') ? raw.mode : undefined
+      return {
+        mode,
+        breakdown,
+        totalAmount:     Number(raw.totalAmount ?? 0),
+        paidAmount:      Number(raw.paidAmount ?? 0),
+        remainingAmount: raw.remainingAmount !== undefined ? Number(raw.remainingAmount) : undefined,
+        effectiveCheckOut: raw.effectiveCheckOut ?? null,
+        viewedAt:          raw.viewedAt ?? null,
+      }
+    }
+    const bill = sanitizeBill(req.body?.bill)
+
+    // 3) Dựng nội dung
+    const brandName = branch?.name || 'LuxHotel'
+    const subject = `[${brandName}] Xác nhận đặt phòng${booking.bookingCode ? ` #${booking.bookingCode}` : ''} — Phòng ${booking.roomNumber ?? ''}`.trim()
+    const html = buildConfirmationHtml({ booking, branch, invoice, bill })
+
+    // 4) Gửi (throw nếu lỗi SMTP → trả 502 để FE báo rõ)
+    try {
+      await sendMail({ to: targetEmail, subject, html, branchId: booking.branchId })
+    } catch (mailErr) {
+      console.error('[sendConfirmationEmail] SMTP error:', mailErr.message)
+      return res.status(502).json({
+        success: false,
+        code: 'MAIL_SEND_FAILED',
+        message: `Không gửi được email: ${mailErr.message}`,
+      })
+    }
+
+    // 5) Lưu lại email nếu khách nhập tay (để lần sau không phải nhập lại)
+    if (usedManualEmail) {
+      try {
+        if (!booking.customerEmail || booking.customerEmail !== targetEmail) {
+          booking.customerEmail = targetEmail
+          await booking.save()
+        }
+      } catch (e) { console.warn('[sendConfirmationEmail] lưu customerEmail vào booking lỗi:', e.message) }
+      try {
+        if (booking.customerId) {
+          const c = customer || await Customer.findById(booking.customerId)
+          if (c && c.email !== targetEmail) {
+            c.email = targetEmail
+            await c.save()
+          }
+        }
+      } catch (e) { console.warn('[sendConfirmationEmail] lưu email vào customer lỗi:', e.message) }
+    }
+
+    // 6) Audit log
+    await logAction({
+      entityType: 'Booking', entityId: booking._id,
+      action: 'send_confirmation_email',
+      description: `Gửi email xác nhận đặt phòng tới ${targetEmail}`,
+      user: req.user, branchId: booking.branchId,
+      metadata: { to: targetEmail, bookingCode: booking.bookingCode, manualEmail: usedManualEmail, billMode: bill?.mode ?? null },
+    })
+
+    return res.json({
+      success: true,
+      message: `Đã gửi email xác nhận tới ${targetEmail}`,
+      data: { to: targetEmail, savedEmail: usedManualEmail },
+    })
+  } catch (err) {
+    console.error('[sendConfirmationEmail] error:', err)
+    next(err)
+  }
+}
+
 module.exports = {
   getAll, getOne, create, update,
   previewPrice, changeDates, changeDatesRoom, moveRoom,
@@ -6147,4 +6419,6 @@ module.exports = {
   mergeGroup,
   splitRoom,
   getMergeCandidates,
+  // ⭐ NEW 30/05/2026: Gửi email xác nhận
+  sendConfirmationEmail,
 }

@@ -127,6 +127,7 @@ app.use('/api/feedback-categories', require('./routes/feedbackCategories'));
 app.use('/api/feedback-blocks',     require('./routes/feedbackBlocks'));
 app.use('/api/public/feedback',     require('./routes/publicFeedback'));
 app.use('/api/stock', require('./routes/stock'));
+app.use('/api/tax-profiles', require('./routes/taxProfiles'))
 
 
 // Static serve folder uploads
