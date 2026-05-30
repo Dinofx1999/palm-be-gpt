@@ -10,7 +10,8 @@ const { logAction }      = require('../utils/auditLogger');
 const { buildPolicySnapshot } = require('../utils/policySnapshot');
 const { computeMoveRoomBreakdown } = require('../utils/moveRoomBreakdown');
 const { rebuildBreakdownFromHistory, buildSegmentsFromHistory } = require('../utils/rebuildBreakdownFromHistory');
-const { sendMail } = require('../utils/mailer');
+const { enqueueEmail } = require('../queues/emailQueue');
+const TaxProfile = require('../models/TaxProfile');
 
 // ⭐ FIX 21/05/2026: Làm tròn giờ checkout khi tính "đến hiện tại" (mode 'now')
 //   theo mốc dayEquivalentHours của branch (vd 20:00).
@@ -615,7 +616,19 @@ const create = async (req, res, next) => {
       policyId,
       status: requestedStatus,
       confirmConvert = false,
+      // ⭐ NEW 30/05/2026: thông tin khách + xuất hoá đơn
+      idNumber       = '',
+      customerEmail  = '',
+      taxCode        = '',
+      companyName    = '',
+      companyAddress = '',
+      invoiceEmail   = '',
     } = req.body
+
+    const idNumberClean      = String(idNumber).trim()
+    const customerEmailClean = String(customerEmail).trim()
+    const taxCodeClean       = String(taxCode).replace(/\s+/g, '').trim()
+    const companyNameClean   = String(companyName).trim()
 
     let customerPhone = (req.body.customerPhone ?? '').toString().trim()
 
@@ -804,12 +817,54 @@ const create = async (req, res, next) => {
       customer = await Customer.create({ name: customerName })
     }
 
+    // ⭐ NEW 30/05/2026: Lưu CCCD/email vào Customer (hồ sơ dùng lại). Phòng thủ:
+    //   chỉ set nếu Customer schema có field tương ứng; bọc try/catch (non-fatal).
+    try {
+      let customerDirty = false
+      if (idNumberClean && customer.idNumber !== idNumberClean) {
+        customer.idNumber = idNumberClean; customerDirty = true
+      }
+      if (customerEmailClean && customer.email !== customerEmailClean) {
+        customer.email = customerEmailClean; customerDirty = true
+      }
+      if (customerDirty) await customer.save()
+    } catch (e) {
+      console.warn('[create] lưu CCCD/email vào customer lỗi (non-fatal):', e.message)
+    }
+
+    // ⭐ NEW 30/05/2026: Upsert hồ sơ thuế (HĐĐT) nếu có MST + tên công ty.
+    //   Lấy lại doc để snapshot vào booking (taxProfileId + các field).
+    let taxProfile = null
+    if (taxCodeClean && companyNameClean) {
+      try {
+        taxProfile = await TaxProfile.findOneAndUpdate(
+          { taxCode: taxCodeClean },
+          {
+            $set: {
+              companyName: companyNameClean,
+              address:     String(companyAddress).trim(),
+              email:       String(invoiceEmail).trim(),
+              lastUsedAt:  new Date(),
+              ...(room.branchId ? { branchId: room.branchId } : {}),
+            },
+            $setOnInsert: { taxCode: taxCodeClean },
+            $inc: { usageCount: 1 },
+          },
+          { new: true, upsert: true, setDefaultsOnInsert: true }
+        )
+      } catch (e) {
+        console.warn('[create] upsert tax profile lỗi (non-fatal):', e.message)
+      }
+    }
+
     const validInitial  = ['reserved', 'confirmed', 'checked_in']
     const initialStatus = validInitial.includes(requestedStatus) ? requestedStatus : 'reserved'
 
     const booking = await Booking.create({
       customerId:   customer._id,
       customerName, customerPhone,
+      customerEmail:  customerEmailClean,
+      idNumber:       idNumberClean,
       roomId:       room._id,
       roomNumber:   room.number,
       roomType:     room.typeName,
@@ -830,6 +885,12 @@ const create = async (req, res, next) => {
       policyId:       policy?._id ?? null,
       policyName:     policy?.name ?? '',
       policySnapshot: policy ? buildPolicySnapshot(policy, room.typeId?.capacity ?? null) : null,
+      // ⭐ NEW: snapshot thông tin xuất hoá đơn (immutable tại thời điểm đặt)
+      taxProfileId:   taxProfile?._id ?? null,
+      taxCode:        taxProfile ? taxProfile.taxCode    : taxCodeClean,
+      companyName:    taxProfile ? taxProfile.companyName : companyNameClean,
+      companyAddress: taxProfile ? (taxProfile.address ?? '') : String(companyAddress).trim(),
+      invoiceEmail:   taxProfile ? (taxProfile.email   ?? '') : String(invoiceEmail).trim(),
       status:         initialStatus,
       actualCheckIn:  initialStatus === 'checked_in' ? new Date() : null,
     })
@@ -872,9 +933,17 @@ const update = async (req, res, next) => {
     const allowed = [
       'customerName', 'customerPhone', 'checkIn', 'checkOut',
       'adults', 'children', 'notes', 'source', 'discount', 'paymentStatus',
+      // ⭐ NEW 30/05/2026: thông tin khách + xuất hoá đơn
+      'customerEmail', 'idNumber',
+      'taxCode', 'companyName', 'companyAddress', 'invoiceEmail',
     ]
     const payload = {}
     allowed.forEach(k => { if (req.body[k] !== undefined) payload[k] = req.body[k] })
+
+    // Chuẩn hoá MST nếu có
+    if (payload.taxCode !== undefined) {
+      payload.taxCode = String(payload.taxCode).replace(/\s+/g, '').trim()
+    }
 
     if (payload.checkIn || payload.checkOut) {
       const booking = await Booking.findById(req.params.id)
@@ -887,8 +956,63 @@ const update = async (req, res, next) => {
       }
     }
 
+    // ⭐ NEW 30/05/2026: Upsert hồ sơ thuế khi sửa MST + tên công ty.
+    if (payload.taxCode && (payload.companyName || req.body.companyName)) {
+      try {
+        const _existing = await Booking.findById(req.params.id).select('branchId companyName companyAddress invoiceEmail')
+        const companyNameFinal = payload.companyName ?? _existing?.companyName ?? ''
+        if (companyNameFinal) {
+          const tp = await TaxProfile.findOneAndUpdate(
+            { taxCode: payload.taxCode },
+            {
+              $set: {
+                companyName: companyNameFinal,
+                address:     payload.companyAddress ?? _existing?.companyAddress ?? '',
+                email:       payload.invoiceEmail ?? _existing?.invoiceEmail ?? '',
+                lastUsedAt:  new Date(),
+                ...(_existing?.branchId ? { branchId: _existing.branchId } : {}),
+              },
+              $setOnInsert: { taxCode: payload.taxCode },
+              $inc: { usageCount: 1 },
+            },
+            { new: true, upsert: true, setDefaultsOnInsert: true }
+          )
+          if (tp?._id) payload.taxProfileId = tp._id
+        }
+      } catch (e) {
+        console.warn('[update] upsert tax profile lỗi (non-fatal):', e.message)
+      }
+    }
+
     const booking = await Booking.findByIdAndUpdate(req.params.id, payload, { new: true })
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+
+    // ⭐ NEW 30/05/2026: Đồng bộ CCCD/email/tên/SĐT sang Customer (hồ sơ dùng lại).
+    if ((payload.idNumber !== undefined || payload.customerEmail !== undefined
+        || payload.customerName !== undefined || payload.customerPhone !== undefined)
+        && booking.customerId) {
+      try {
+        const c = await Customer.findById(booking.customerId)
+        if (c) {
+          let dirty = false
+          if (payload.customerName !== undefined && c.name !== payload.customerName) {
+            c.name = payload.customerName; dirty = true
+          }
+          if (payload.customerPhone !== undefined && c.phone !== payload.customerPhone) {
+            c.phone = payload.customerPhone; dirty = true
+          }
+          if (payload.idNumber !== undefined && c.idNumber !== payload.idNumber) {
+            c.idNumber = payload.idNumber; dirty = true
+          }
+          if (payload.customerEmail !== undefined && c.email !== payload.customerEmail) {
+            c.email = payload.customerEmail; dirty = true
+          }
+          if (dirty) await c.save()
+        }
+      } catch (e) {
+        console.warn('[update] đồng bộ customer lỗi (non-fatal):', e.message)
+      }
+    }
 
     const changedFields = Object.keys(payload).filter(k => !['nights','roomAmount','totalAmount'].includes(k))
     if (changedFields.length > 0) {
@@ -6195,9 +6319,10 @@ function buildConfirmationHtml({ booking, branch, invoice, bill = null }) {
       </div>
     </div>`
 
-  const policyLine = booking.policyName
-    ? `<div style="font-size:12px;color:#64748B;margin-top:4px">Chính sách giá: <b>${escHtml(booking.policyName)}</b></div>`
-    : ''
+  // ⭐ 30/05/2026: Bỏ hiển thị tên chính sách giá; chỉ hiện giờ nhận/trả phòng chuẩn.
+  const ciTime = branch?.checkInTime  || '14:00'
+  const coTime = branch?.checkOutTime || '12:00'
+  const policyLine = `<div style="font-size:12px;color:#64748B;margin-top:6px">Giờ nhận phòng: <b>${escHtml(ciTime)}</b> &nbsp;·&nbsp; Giờ trả phòng: <b>${escHtml(coTime)}</b></div>`
 
   // Nhãn mốc tính tiền — giúp khách hiểu số liệu tương ứng thời điểm nào.
   let billNote = ''
@@ -6207,6 +6332,55 @@ function buildConfirmationHtml({ booking, branch, invoice, bill = null }) {
   } else if (bill?.mode === 'checkout') {
     billNote = `<div style="font-size:12px;color:#64748B;margin-bottom:6px">Tính đến giờ trả phòng dự kiến: <b>${fmtDateTimeVN(bill.effectiveCheckOut || booking.checkOut)}</b></div>`
   }
+
+  // ── ⭐ NEW 30/05/2026: Quy định khách sạn (từ branch.quotePolicy) ──
+  const qp = branch?.quotePolicy || {}
+  // Văn bản nhiều dòng → giữ xuống dòng bằng cách thay \n thành <br/>
+  const nl2br = (s) => escHtml(String(s || '').trim()).replace(/\r?\n/g, '<br/>')
+  const policySection = (title, body) => {
+    const v = nl2br(body)
+    if (!v) return ''
+    return `
+      <div style="margin-top:14px">
+        <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:4px">${escHtml(title)}</div>
+        <div style="font-size:13px;color:#475569;line-height:1.6">${v}</div>
+      </div>`
+  }
+
+  // Dịch vụ kèm theo (includedServices)
+  const services = Array.isArray(qp.includedServices) ? qp.includedServices : []
+  const servicesBlock = services.length ? `
+      <div style="margin-top:14px">
+        <div style="font-size:13px;font-weight:700;color:#0F172A;margin-bottom:6px">Dịch vụ kèm theo</div>
+        <table style="width:100%;border-collapse:collapse">
+          ${services.map(s => {
+            const free = s.isFree !== false
+            const priceTag = free
+              ? `<span style="color:#16A34A;font-weight:600">Miễn phí</span>`
+              : `<span style="color:#0F172A;font-weight:600">${fmtVND(s.price || 0)} đ</span>`
+            return `<tr>
+              <td style="padding:5px 0;font-size:13px;color:#475569;vertical-align:top;width:22px">${escHtml(s.icon || '✓')}</td>
+              <td style="padding:5px 6px;font-size:13px;color:#334155">
+                <b>${escHtml(s.name || '')}</b>${s.description ? `<div style="font-size:12px;color:#94A3B8;margin-top:1px">${escHtml(s.description)}</div>` : ''}
+              </td>
+              <td style="padding:5px 0;font-size:13px;text-align:right;white-space:nowrap;vertical-align:top">${priceTag}</td>
+            </tr>`
+          }).join('')}
+        </table>
+      </div>` : ''
+
+  const policyInner = [
+    servicesBlock,
+    policySection('Nội quy khách sạn', qp.hotelRules),
+    policySection('Giấy tờ cần mang theo', qp.requiredDocuments),
+    policySection('Chính sách huỷ phòng', qp.cancellationPolicy),
+  ].filter(Boolean).join('')
+
+  const policyBlock = policyInner ? `
+        <div style="margin-top:22px;padding:16px;background:#F8FAFC;border:1px solid #EEF2F7;border-radius:8px">
+          <div style="font-size:14px;font-weight:800;color:#0B76EF;margin-bottom:2px">Quy định &amp; thông tin khách sạn</div>
+          ${policyInner}
+        </div>` : ''
 
   return `<!DOCTYPE html>
 <html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -6259,6 +6433,8 @@ function buildConfirmationHtml({ booking, branch, invoice, bill = null }) {
         </div>`}
 
         ${paymentBlock}
+
+        ${policyBlock}
 
         <p style="font-size:13px;color:#64748B;line-height:1.6;margin:20px 0 0">
           Nếu có bất kỳ thay đổi nào về lịch trình, vui lòng liên hệ trực tiếp với chúng tôi.<br/>
@@ -6348,19 +6524,7 @@ const sendConfirmationEmail = async (req, res, next) => {
     const subject = `[${brandName}] Xác nhận đặt phòng${booking.bookingCode ? ` #${booking.bookingCode}` : ''} — Phòng ${booking.roomNumber ?? ''}`.trim()
     const html = buildConfirmationHtml({ booking, branch, invoice, bill })
 
-    // 4) Gửi (throw nếu lỗi SMTP → trả 502 để FE báo rõ)
-    try {
-      await sendMail({ to: targetEmail, subject, html, branchId: booking.branchId })
-    } catch (mailErr) {
-      console.error('[sendConfirmationEmail] SMTP error:', mailErr.message)
-      return res.status(502).json({
-        success: false,
-        code: 'MAIL_SEND_FAILED',
-        message: `Không gửi được email: ${mailErr.message}`,
-      })
-    }
-
-    // 5) Lưu lại email nếu khách nhập tay (để lần sau không phải nhập lại)
+    // 4) Lưu lại email nếu khách nhập tay (làm TRƯỚC khi enqueue — không phụ thuộc SMTP)
     if (usedManualEmail) {
       try {
         if (!booking.customerEmail || booking.customerEmail !== targetEmail) {
@@ -6379,19 +6543,41 @@ const sendConfirmationEmail = async (req, res, next) => {
       } catch (e) { console.warn('[sendConfirmationEmail] lưu email vào customer lỗi:', e.message) }
     }
 
-    // 6) Audit log
+    // 5) Đẩy email vào QUEUE (BullMQ) — trả response ngay, worker gửi nền + tự retry.
+    try {
+      await enqueueEmail({
+        to: targetEmail,
+        subject,
+        html,
+        branchId: booking.branchId,
+        meta: {
+          bookingId:   String(booking._id),
+          bookingCode: booking.bookingCode,
+          type:        'booking_confirmation',
+        },
+      }, 'booking_confirmation')
+    } catch (qErr) {
+      console.error('[sendConfirmationEmail] enqueue lỗi:', qErr.message)
+      return res.status(503).json({
+        success: false,
+        code: 'QUEUE_UNAVAILABLE',
+        message: 'Hệ thống gửi email tạm thời bận. Vui lòng thử lại sau giây lát.',
+      })
+    }
+
+    // 6) Audit log (đã đưa vào hàng đợi)
     await logAction({
       entityType: 'Booking', entityId: booking._id,
       action: 'send_confirmation_email',
-      description: `Gửi email xác nhận đặt phòng tới ${targetEmail}`,
+      description: `Đưa email xác nhận đặt phòng vào hàng đợi gửi tới ${targetEmail}`,
       user: req.user, branchId: booking.branchId,
-      metadata: { to: targetEmail, bookingCode: booking.bookingCode, manualEmail: usedManualEmail, billMode: bill?.mode ?? null },
+      metadata: { to: targetEmail, bookingCode: booking.bookingCode, manualEmail: usedManualEmail, billMode: bill?.mode ?? null, queued: true },
     })
 
     return res.json({
       success: true,
       message: `Đã gửi email xác nhận tới ${targetEmail}`,
-      data: { to: targetEmail, savedEmail: usedManualEmail },
+      data: { to: targetEmail, savedEmail: usedManualEmail, queued: true },
     })
   } catch (err) {
     console.error('[sendConfirmationEmail] error:', err)

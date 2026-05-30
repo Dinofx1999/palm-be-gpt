@@ -17,6 +17,17 @@ const bookingSchema = new mongoose.Schema({
   // ⭐ NEW 30/05/2026: Email khách — cache trên booking để gửi xác nhận đặt phòng.
   //   Không bắt buộc; nếu trống FE sẽ hỏi nhập tay rồi lưu lại vào đây + Customer.
   customerEmail:   { type: String, default: '' },
+  // ⭐ NEW 30/05/2026: CCCD/Hộ chiếu của khách đại diện (gộp CMND + hộ chiếu).
+  idNumber:        { type: String, default: '' },
+  // ⭐ NEW 30/05/2026: Thông tin xuất Hoá Đơn Điện Tử (HĐĐT).
+  //   - taxProfileId: tham chiếu tới hồ sơ thuế dùng lại (collection TaxProfile)
+  //   - các field còn lại = SNAPSHOT tại thời điểm đặt (immutable, không đổi
+  //     theo TaxProfile sau này) để hoá đơn luôn đúng dữ liệu lúc lập.
+  taxProfileId:    { type: mongoose.Schema.Types.ObjectId, ref: 'TaxProfile', default: null },
+  taxCode:         { type: String, default: '' },
+  companyName:     { type: String, default: '' },
+  companyAddress:  { type: String, default: '' },
+  invoiceEmail:    { type: String, default: '' },
   // ⭐ Phòng PRIMARY (giữ tương thích với code cũ — phòng đầu tiên của đoàn)
   roomId:          { type: mongoose.Schema.Types.ObjectId, ref: 'Room', required: true },
   roomNumber:      { type: String, required: true },

@@ -234,7 +234,7 @@ const testTelegram = async (req, res) => {
   }
 };
 
-// POST /api/settings/test-email — gửi mail thử (body: { to, branchId })
+// POST /api/settings/test-email — đưa mail thử vào QUEUE (gửi nền + tự retry). Body: { to, branchId }
 const testEmail = async (req, res) => {
   try {
     const branchId = resolveBranchId(req);
@@ -243,29 +243,40 @@ const testEmail = async (req, res) => {
     const to = String(req.body?.to || '').trim();
     if (!to) return res.status(400).json({ success: false, message: 'Nhập email nhận thử' });
 
-    const { sendMail } = require('../utils/mailer');
-    await sendMail({
-      to, branchId,
-      subject: 'Test email từ LuxHotel PMS',
-      html: `<p>Đây là email kiểm tra cấu hình SMTP của chi nhánh.</p><p>Thời gian: ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</p>`,
-    });
-    res.json({ success: true, message: `Đã gửi email test tới ${to}` });
+    // ⭐ NEW 30/05/2026: đẩy vào queue thay vì gửi trực tiếp.
+    const { enqueueEmail } = require('../queues/emailQueue');
+    try {
+      await enqueueEmail({
+        to, branchId,
+        subject: 'Test email từ LuxHotel PMS',
+        html: `<p>Đây là email kiểm tra cấu hình SMTP của chi nhánh.</p><p>Thời gian: ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</p>`,
+        meta: { type: 'test_email' },
+      }, 'test_email');
+    } catch (qErr) {
+      return res.status(503).json({ success: false, code: 'QUEUE_UNAVAILABLE', message: 'Hệ thống gửi email tạm thời bận. Thử lại sau.' });
+    }
+    res.json({ success: true, message: `Đã đưa email test tới ${to} vào hàng đợi gửi` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message || 'Gửi email thất bại' });
   }
 };
 
-// POST /api/settings/send-report-now — gửi báo cáo ngay (test). Body: { type, branchId }
+// POST /api/settings/send-report-now — đưa báo cáo vào QUEUE (gửi nền). Body: { type, branchId }
 const sendReportNow = async (req, res) => {
   try {
     const branchId = resolveBranchId(req);
     if (!branchId) return res.status(400).json({ success: false, message: 'Thiếu branchId' });
     invalidateCache(branchId);
     const type = req.body?.type === 'monthly' ? 'monthly' : 'daily';
-    const { sendDailyReport, sendMonthlyReport } = require('../utils/reportScheduler');
-    if (type === 'monthly') await sendMonthlyReport(branchId);
-    else await sendDailyReport(branchId, !!req.body?.coversYesterday);
-    res.json({ success: true, message: `Đã gửi báo cáo ${type === 'monthly' ? 'tháng' : 'ngày'}` });
+
+    // ⭐ NEW 30/05/2026: đẩy job báo cáo vào queue thay vì chạy trực tiếp.
+    const { enqueueReport } = require('../queues/emailQueue');
+    try {
+      await enqueueReport({ branchId, type, coversYesterday: !!req.body?.coversYesterday });
+    } catch (qErr) {
+      return res.status(503).json({ success: false, code: 'QUEUE_UNAVAILABLE', message: 'Hệ thống tạm thời bận. Thử lại sau.' });
+    }
+    res.json({ success: true, message: `Đã đưa báo cáo ${type === 'monthly' ? 'tháng' : 'ngày'} vào hàng đợi gửi` });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message || 'Gửi báo cáo thất bại' });
   }

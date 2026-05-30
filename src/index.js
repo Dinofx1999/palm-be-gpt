@@ -100,6 +100,7 @@ app.use('/api/site-config', require('./routes/siteConfig'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/public',      require('./routes/publicContent'));
 app.use('/api/tasks', require('./routes/tasks'));
+require('./queues/emailWorker');
 
 // ─────────────────────────────────────────────────────
 // ⭐ NEW 14/05/2026: Module Tài chính (Thu/Chi + Bàn giao ca + Đối soát)
