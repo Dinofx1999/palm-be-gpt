@@ -15,6 +15,7 @@ const roomSchema = new mongoose.Schema({
   checkOut:         { type: Date, default: null },
   notes:            { type: String, default: null },
   images:           [{ type: String }],
+  lockCode:   { type: String, default: '' },        // ⭐ THÊM DÒNG NÀY
 }, { timestamps: true });
 
 roomSchema.index({ branchId: 1, status: 1 });

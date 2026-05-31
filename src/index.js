@@ -130,7 +130,8 @@ app.use('/api/public/feedback',     require('./routes/publicFeedback'));
 app.use('/api/stock', require('./routes/stock'));
 app.use('/api/tax-profiles', require('./routes/taxProfiles'));
 app.use('/api/cccd', require('./routes/cccd'));
-
+// app.use("/api/lock", require('./routes/lock.routes'));
+app.use('/api/lock', require('./routes/lockRoutes'))
 
 // Static serve folder uploads
 app.use('/uploads', (req, res, next) => {
