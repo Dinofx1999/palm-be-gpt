@@ -87,6 +87,7 @@ exports.getRoomLockCode = async (req, res) => {
       lockEnabled: cfg?.enabled ?? false,
       agentPort: cfg?.agentPort ?? 2000,
       lockType: cfg?.lockType ?? null,
+      isInputCardToCheckout: cfg?.isInputCardToCheckout ?? false,  // bắt quẹt thẻ khi trả phòng
     });
   } catch (e) {
     console.error('[getRoomLockCode]', e);
