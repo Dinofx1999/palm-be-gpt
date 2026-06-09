@@ -23,6 +23,18 @@ const extractBranchId = (val) => {
   return null;
 };
 
+// ⭐ Chuẩn hoá ảnh của 1 step: ưu tiên imageUrls (mảng mới), fallback imageUrl (chuỗi cũ).
+//   Trả mảng string đã trim, loại rỗng, tối đa 20 ảnh.
+const normalizeImageUrls = (s) => {
+  let arr = [];
+  if (Array.isArray(s.imageUrls)) arr = s.imageUrls;
+  else if (s.imageUrl) arr = [s.imageUrl];
+  return arr
+    .map(u => String(u || '').trim())
+    .filter(Boolean)
+    .slice(0, 20);
+};
+
 // ───────────── Position mapping (role → position name) ─────────────
 // Position name TRÙNG với role name → mapping 1:1 trực tiếp
 const VALID_POSITIONS = ['Admin', 'Manager', 'Receptionist', 'Staff'];
@@ -220,7 +232,8 @@ router.post('/', authenticate, requireAdminOrManager, async (req, res, next) => 
           order: i + 1,
           title: String(s.title || '').trim().slice(0, 200),
           content: String(s.content || '').trim().slice(0, 5000),
-          imageUrl: String(s.imageUrl || '').trim(),
+          // ⭐ nhiều ảnh: ưu tiên imageUrls (mảng), fallback imageUrl cũ (1 ảnh)
+          imageUrls: normalizeImageUrls(s),
         })).filter(s => s.title.length > 0)
       : [];
 
@@ -304,7 +317,7 @@ router.put('/:id', authenticate, requireAdminOrManager, async (req, res, next) =
         order: i + 1,
         title: String(s.title || '').trim().slice(0, 200),
         content: String(s.content || '').trim().slice(0, 5000),
-        imageUrl: String(s.imageUrl || '').trim(),
+        imageUrls: normalizeImageUrls(s),
       })).filter(s => s.title.length > 0);
     }
     procedure.updatedBy = req.user.id;
@@ -341,10 +354,17 @@ router.delete('/:id', authenticate, async (req, res, next) => {
 
     if (Array.isArray(procedure.steps)) {
       procedure.steps.forEach(s => {
-        if (s.imageUrl && s.imageUrl.startsWith('/uploads/procedures/')) {
-          const filePath = path.join(uploadDir, path.basename(s.imageUrl));
-          fs.unlink(filePath, () => {});
-        }
+        // gom cả imageUrls (mới) + imageUrl (cũ) để xóa file
+        const urls = [
+          ...(Array.isArray(s.imageUrls) ? s.imageUrls : []),
+          ...(s.imageUrl ? [s.imageUrl] : []),
+        ];
+        urls.forEach(u => {
+          if (u && u.startsWith('/uploads/procedures/')) {
+            const filePath = path.join(uploadDir, path.basename(u));
+            fs.unlink(filePath, () => {});
+          }
+        });
       });
     }
 
@@ -471,7 +491,7 @@ router.post('/:id/copy', authenticate, async (req, res, next) => {
             order: s.order,
             title: s.title,
             content: s.content,
-            imageUrl: s.imageUrl,
+            imageUrls: normalizeImageUrls(s),
           })),
           status: 'active',  // bản copy mặc định active
           createdBy: req.user.id,

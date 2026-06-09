@@ -40,9 +40,12 @@ async function canEdit(requester, targetUserId) {
   return false;
 }
 
-// Helper: tính tổng cố định của NV (từ SalaryConfig.components)
-const getFixedTotal = async (userId) => {
-  const cfg = await SalaryConfig.findOne({ user: userId }).lean();
+// Helper: tính tổng cố định của NV cho 1 KỲ (từ SalaryConfig.components, carry-forward).
+const getFixedTotal = async (userId, year, month) => {
+  const now = new Date();
+  const y = Number(year) || now.getFullYear();
+  const m = Number(month) || (now.getMonth() + 1);
+  const cfg = await SalaryConfig.getConfigForPeriod(userId, y, m);
   if (!cfg || !Array.isArray(cfg.components)) return 0;
   return cfg.components.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
 };
@@ -110,7 +113,7 @@ exports.getLimit = async (req, res) => {
 
     const [maxPercent, fixedTotal, usedAmount] = await Promise.all([
       getBranchAdvancePercent(branchId),
-      getFixedTotal(userId),
+      getFixedTotal(userId, year, month),
       SalaryAdvance.totalForMonth(userId, year, month),
     ]);
 
@@ -171,7 +174,7 @@ exports.create = async (req, res) => {
     // Validate giới hạn %
     const [maxPercent, fixedTotal, usedAmount] = await Promise.all([
       getBranchAdvancePercent(branchId),
-      getFixedTotal(userId),
+      getFixedTotal(userId, year, month),
       SalaryAdvance.totalForMonth(userId, year, month),
     ]);
 
@@ -282,7 +285,7 @@ exports.update = async (req, res) => {
       const branchId = user?.branchId;
       const [maxPercent, fixedTotal] = await Promise.all([
         getBranchAdvancePercent(branchId),
-        getFixedTotal(existing.user),
+        getFixedTotal(existing.user, existing.year, existing.month),
       ]);
 
       // Tổng đã ứng TRỪ bản ghi hiện tại

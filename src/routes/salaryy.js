@@ -125,7 +125,8 @@ async function getDiscountChargesForPeriod(userId, year, month) {
 // Tính snapshot lương cho 1 user ở 1 kỳ (gồm cả phạt + lương ứng + chiết khấu chịu)
 async function computeSnapshot(userId, year, month) {
   const [cfg, user] = await Promise.all([
-    SalaryConfig.findOne({ user: userId }).lean(),
+    // ⭐ đọc cơ cấu lương theo KỲ (carry-forward từ tháng trước nếu kỳ này chưa cấu hình)
+    SalaryConfig.getConfigForPeriod(userId, year, month),
     User.findById(userId).select('branchId role fullName').lean(),
   ]);
   if (!user) throw new Error('Không tìm thấy user');
@@ -144,6 +145,16 @@ async function computeSnapshot(userId, year, month) {
     revenue
   );
 
+  // ⭐ NEW 30/05/2026: Quy tắc "tạm nghỉ" — nếu lương CỐ ĐỊNH = 0 ở kỳ này thì
+  //   coi như NV không làm việc kỳ đó: KPI = 0, mọi khoản = 0 (vẫn hiện, đánh dấu Nghỉ).
+  const isOnLeave = (result.fixedTotal || 0) <= 0;
+  if (isOnLeave) {
+    result.kpiBase = 0;
+    result.kpiExceed = 0;
+    result.penaltyTotal = 0;
+    result.total = 0;
+  }
+
   // ⭐ NEW 11/05/2026: Thêm advance vào snapshot
   const advances = await getAdvancesForPeriod(userId, year, month);
   const advanceTotal = advances.reduce((s, a) => s + (Number(a.amount) || 0), 0);
@@ -152,9 +163,13 @@ async function computeSnapshot(userId, year, month) {
   const discountCharges = await getDiscountChargesForPeriod(userId, year, month);
   const discountChargesTotal = discountCharges.reduce((s, d) => s + (Number(d.amount) || 0), 0);
 
-  // Tổng lương sau khi trừ discount charges = result.total (đã trừ phạt) - discountChargesTotal
-  const totalAfterCharges = Math.max(0, (result.total || 0) - discountChargesTotal);
-  const remainingToPay    = Math.max(0, totalAfterCharges - advanceTotal);
+  // Nếu NV nghỉ kỳ này (fixed=0) → total giữ 0, không trừ thêm gì.
+  const totalAfterCharges = isOnLeave
+    ? 0
+    : Math.max(0, (result.total || 0) - discountChargesTotal);
+  const remainingToPay    = isOnLeave
+    ? 0
+    : Math.max(0, totalAfterCharges - advanceTotal);
 
   // Override total trong result để các nơi khác (POST /calculate, /pay) dùng đúng
   result.total = totalAfterCharges;
@@ -164,6 +179,7 @@ async function computeSnapshot(userId, year, month) {
     advances, advanceTotal,
     discountCharges, discountChargesTotal,
     remainingToPay,
+    isOnLeave,   // ⭐ cờ NV nghỉ kỳ này (lương cố định = 0)
   };
 }
 
@@ -188,7 +204,7 @@ router.get('/employees', authenticate, async (req, res) => {
     }
 
     const users = await User.find(filter)
-      .select('_id fullName email phone role branchId branchName')
+      .select('_id fullName email phone avatar role branchId branchName')
       .sort({ fullName: 1 })
       .lean();
 
@@ -197,6 +213,7 @@ router.get('/employees', authenticate, async (req, res) => {
         _id: u._id,
         name: u.fullName,
         email: u.email,
+        avatar: u.avatar || '',
         role: u.role,
         branchId: u.branchId,
         department: u.branchName || '',
@@ -204,6 +221,102 @@ router.get('/employees', authenticate, async (req, res) => {
     );
   } catch (err) {
     console.error('[GET /salary/employees]', err);
+    res.status(500).json({ message: 'Lỗi server' });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// GET /api/salary/summary?year=&month=&branchId=
+//   ⭐ NEW 30/05/2026: Tóm tắt lương CẢ DANH SÁCH NV cho 1 kỳ (Admin/Manager).
+//   Trả mỗi NV: fixedTotal, kpi(=base+exceed), penaltyTotal, advanceTotal,
+//   remainingToPay (nhận dự kiến), total, paidStatus.
+// ═════════════════════════════════════════════════════════════════════════
+router.get('/summary', authenticate, async (req, res) => {
+  try {
+    const { role, branchId: userBranch } = req.user;
+    const filter = { isActive: true };
+
+    if (role === 'Admin') {
+      const queryBranch = req.query.branchId;
+      if (queryBranch && mongoose.isValidObjectId(queryBranch)) {
+        filter.branchId = queryBranch;
+      }
+    } else if (role === 'Manager') {
+      if (!userBranch) return res.json({ year: null, month: null, rows: [] });
+      filter.branchId = userBranch;
+    } else {
+      filter._id = req.user.id;
+    }
+
+    const year  = parseInt(req.query.year, 10)  || new Date().getFullYear();
+    const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1);
+
+    const users = await User.find(filter)
+      .select('_id fullName username email avatar role branchId branchName createdAt')
+      .sort({ fullName: 1 })
+      .lean();
+
+    // Đã chốt? lấy record; chưa thì computeSnapshot. Bỏ qua kỳ trước khi NV vào làm.
+    const rows = [];
+    for (const u of users) {
+      // ẩn kỳ trước tháng tạo tài khoản
+      if (u.createdAt) {
+        const j = new Date(u.createdAt);
+        const joinYM = j.getFullYear() * 12 + j.getMonth();
+        const periodYM = year * 12 + (month - 1);
+        if (periodYM < joinYM) continue;
+      }
+
+      let data = null;
+      const record = await SalaryRecord.findOne({ user: u._id, year, month }).lean();
+      if (record) {
+        const advanceTotal = record.advanceTotal || 0;
+        data = {
+          fixedTotal: record.fixedTotal || 0,
+          kpi: (record.kpiBase || 0) + (record.kpiExceed || 0),
+          penaltyTotal: record.penaltyTotal || 0,
+          advanceTotal,
+          total: record.total || 0,
+          remainingToPay: record.remainingToPay ?? Math.max(0, (record.total || 0) - advanceTotal),
+          paidStatus: record.paidStatus || 'paid',
+          isFinalized: true,
+          isOnLeave: (record.fixedTotal || 0) <= 0,
+        };
+      } else {
+        try {
+          const { result, advanceTotal, remainingToPay, isOnLeave } = await computeSnapshot(u._id, year, month);
+          data = {
+            fixedTotal: result.fixedTotal || 0,
+            kpi: (result.kpiBase || 0) + (result.kpiExceed || 0),
+            penaltyTotal: result.penaltyTotal || 0,
+            advanceTotal: advanceTotal || 0,
+            total: result.total || 0,
+            remainingToPay: remainingToPay ?? Math.max(0, (result.total || 0) - (advanceTotal || 0)),
+            paidStatus: 'unpaid',
+            isFinalized: false,
+            isOnLeave: !!isOnLeave,
+          };
+        } catch {
+          data = { fixedTotal: 0, kpi: 0, penaltyTotal: 0, advanceTotal: 0, total: 0, remainingToPay: 0, paidStatus: 'unpaid', isFinalized: false, isOnLeave: true };
+        }
+      }
+
+      rows.push({
+        _id: u._id,
+        name: u.fullName,
+        username: u.username || '',
+        email: u.email,
+        avatar: u.avatar || '',
+        role: u.role,
+        branchId: u.branchId,
+        department: u.branchName || '',
+        ...data,
+      });
+    }
+
+    res.json({ year, month, rows });
+  } catch (err) {
+    console.error('[GET /salary/summary]', err);
     res.status(500).json({ message: 'Lỗi server' });
   }
 });
@@ -221,10 +334,31 @@ router.get('/config/:userId', authenticate, async (req, res) => {
       return res.status(403).json({ message: 'Không có quyền' });
     }
 
-    let config = await SalaryConfig.findOne({ user: userId }).lean();
-    if (!config) {
-      config = { user: userId, components: [], currency: 'VND' };
-    }
+    // ⭐ Đọc cơ cấu theo KỲ nếu client truyền year/month; mặc định kỳ hiện tại.
+    const qYear  = parseInt(req.query.year, 10)  || new Date().getFullYear();
+    const qMonth = parseInt(req.query.month, 10) || (new Date().getMonth() + 1);
+
+    // bản đúng kỳ này (để biết kỳ này ĐÃ có cấu hình riêng hay đang kế thừa)
+    const exact = await SalaryConfig.findOne({ user: userId, year: qYear, month: qMonth }).lean();
+    // bản áp dụng (carry-forward) — dùng để hiển thị giá trị mặc định
+    const effective = await SalaryConfig.getConfigForPeriod(userId, qYear, qMonth);
+
+    const base = exact || effective;
+    const config = base
+      ? {
+          user: userId,
+          year: qYear,
+          month: qMonth,
+          components: base.components || [],
+          currency: base.currency || 'VND',
+          // metadata giúp FE biết đang kế thừa từ kỳ nào
+          isInherited: !exact && !!effective,
+          inheritedFrom: !exact && effective && effective.year
+            ? { year: effective.year, month: effective.month }
+            : null,
+        }
+      : { user: userId, year: qYear, month: qMonth, components: [], currency: 'VND', isInherited: false, inheritedFrom: null };
+
     res.json(config);
   } catch (err) {
     console.error('[GET /salary/config]', err);
@@ -248,7 +382,7 @@ router.put('/config/:userId', authenticate, async (req, res) => {
     const targetUser = await User.findById(userId).select('branchId');
     if (!targetUser) return res.status(404).json({ message: 'Không tìm thấy user' });
 
-    const { components = [] } = req.body;
+    const { components = [], year, month } = req.body;
     if (!Array.isArray(components)) {
       return res.status(400).json({ message: 'components phải là array' });
     }
@@ -258,9 +392,16 @@ router.put('/config/:userId', authenticate, async (req, res) => {
       }
     }
 
+    // ⭐ Lưu cơ cấu cho ĐÚNG KỲ. Mặc định kỳ hiện tại nếu client không truyền.
+    const cfgYear  = parseInt(year, 10)  || new Date().getFullYear();
+    const cfgMonth = parseInt(month, 10) || (new Date().getMonth() + 1);
+
     const config = await SalaryConfig.findOneAndUpdate(
-      { user: userId },
-      { $set: { user: userId, branchId: targetUser.branchId, components, updatedBy: req.user.id } },
+      { user: userId, year: cfgYear, month: cfgMonth },
+      { $set: {
+          user: userId, year: cfgYear, month: cfgMonth,
+          branchId: targetUser.branchId, components, updatedBy: req.user.id,
+        } },
       { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
@@ -661,9 +802,20 @@ router.get('/history/:userId', authenticate, async (req, res) => {
     const currentMonth = now.getMonth() + 1;
     const currentYear = now.getFullYear();
 
+    // ⭐ NEW 30/05/2026: chỉ tính lương TỪ tháng nhân viên được tạo tài khoản trở đi.
+    //   Các tháng trước khi NV vào làm không hiển thị.
+    const histUser = await User.findById(userId).select('createdAt').lean();
+    const joinDate = histUser?.createdAt ? new Date(histUser.createdAt) : null;
+    const joinYM = joinDate ? joinDate.getFullYear() * 12 + joinDate.getMonth() : null; // tháng 0-index
+
     const periods = [];
     for (let i = 0; i < months; i++) {
       const d = new Date(currentYear, currentMonth - 1 - i, 1);
+      // Bỏ qua kỳ trước tháng NV vào làm
+      if (joinYM !== null) {
+        const periodYM = d.getFullYear() * 12 + d.getMonth();
+        if (periodYM < joinYM) continue;
+      }
       periods.push({ year: d.getFullYear(), month: d.getMonth() + 1 });
     }
 
@@ -708,10 +860,20 @@ router.get('/history/:userId', authenticate, async (req, res) => {
           isFinalized: true,
           isCurrent: p.year === currentYear && p.month === currentMonth,
         });
-      } else if (p.year === currentYear && p.month === currentMonth) {
+      } else {
+        // ⭐ FIX 30/05/2026: TRƯỚC ĐÂY chỉ tháng hiện tại mới được tính snapshot tạm,
+        //   các tháng quá khứ chưa chốt bị đánh isEmpty → không thể chốt (vd: qua
+        //   tháng 6 nhưng lương tháng 5 chưa tổng kết). NAY: mọi tháng chưa có record
+        //   đều thử computeSnapshot để có số liệu xem + chốt.
+        const isCurrent = p.year === currentYear && p.month === currentMonth;
         try {
           const { result, revenue, kpi, advanceTotal, remainingToPay, discountChargesTotal } =
             await computeSnapshot(userId, p.year, p.month);
+          // Nếu tháng không có cấu hình lương + không phát sinh gì → coi là rỗng thật.
+          const hasData = (result.fixedTotal || 0) > 0
+            || (result.total || 0) > 0
+            || (revenue || 0) > 0
+            || (result.penaltyTotal || 0) > 0;
           history.push({
             year: p.year,
             month: p.month,
@@ -722,51 +884,28 @@ router.get('/history/:userId', authenticate, async (req, res) => {
             total: result.total,
             advanceTotal,
             remainingToPay,
-            discountChargesTotal,    // ⭐ NEW 19/05
+            discountChargesTotal,
             revenue,
             target: kpi?.target || 0,
             paidStatus: 'unpaid',
             isFinalized: false,
-            isCurrent: true,
+            isCurrent,
+            // chỉ đánh rỗng khi thực sự không có gì để chốt
+            isEmpty: !hasData,
           });
         } catch {
           history.push({
             year: p.year,
             month: p.month,
-            fixedTotal: 0,
-            kpiBase: 0,
-            kpiExceed: 0,
-            penaltyTotal: 0,
-            total: 0,
-            advanceTotal: 0,
-            remainingToPay: 0,
-            discountChargesTotal: 0,   // ⭐ NEW 19/05
-            revenue: 0,
-            target: 0,
+            fixedTotal: 0, kpiBase: 0, kpiExceed: 0, penaltyTotal: 0, total: 0,
+            advanceTotal: 0, remainingToPay: 0, discountChargesTotal: 0,
+            revenue: 0, target: 0,
             paidStatus: 'unpaid',
             isFinalized: false,
-            isCurrent: true,
+            isCurrent,
+            isEmpty: true,
           });
         }
-      } else {
-        history.push({
-          year: p.year,
-          month: p.month,
-          fixedTotal: 0,
-          kpiBase: 0,
-          kpiExceed: 0,
-          penaltyTotal: 0,
-          total: 0,
-          advanceTotal: 0,
-          remainingToPay: 0,
-          discountChargesTotal: 0,   // ⭐ NEW 19/05
-          revenue: 0,
-          target: 0,
-          paidStatus: 'unpaid',
-          isFinalized: false,
-          isCurrent: false,
-          isEmpty: true,
-        });
       }
     }
 

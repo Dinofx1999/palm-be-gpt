@@ -115,7 +115,7 @@ app.use('/api/shifts',           require('./routes/shifts'));
 app.use('/api/reconciliations',  require('./routes/reconciliation'));
 app.use('/api', require('./routes/sepay'));
 app.use('/api/customer-display-config', require('./routes/customerDisplayConfig'));
-
+app.use('/api/reports-analytics', require('./routes/reportsAnalytics'));
 // ─────────────────────────────────────────────────────
 // ⭐ NEW 27/05/2026: Hòm thư góp ý của khách
 //   - /api/feedback:             admin xem/sửa/xoá góp ý
