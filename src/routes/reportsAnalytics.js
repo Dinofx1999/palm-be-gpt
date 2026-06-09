@@ -457,4 +457,192 @@ router.get('/profit-series', authenticate, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/reports-analytics/occupancy?from=&to=&branchId=
+//   - Công suất = đêm-phòng bán / (số phòng active × số đêm kỳ)
+//   - Đêm bán: phần giao [checkIn,checkOut] ∩ [from,to]; chỉ booking checked_in/checked_out
+//   - Doanh thu phòng phân bổ theo tỷ lệ đêm-trong-kỳ / tổng đêm booking
+//   - ADR, RevPAR, nguồn khách (source), bảng từng phòng
+// ─────────────────────────────────────────────────────────────────────
+router.get('/occupancy', authenticate, async (req, res) => {
+  try {
+    if (!canViewReports(req.user)) {
+      return res.status(403).json({ success: false, message: 'Không có quyền xem báo cáo' });
+    }
+
+    let branchId = null;
+    if (req.user.role === 'Admin') {
+      if (req.query.branchId && mongoose.isValidObjectId(req.query.branchId)) {
+        branchId = req.query.branchId;
+      }
+    } else {
+      branchId = req.user.branchId ? String(req.user.branchId) : null;
+    }
+    const branchObjId = branchId ? new mongoose.Types.ObjectId(branchId) : null;
+
+    const { from, to } = resolveRange(req.query);
+    const MS_PER_NIGHT = 86400000;
+    const periodNights = Math.max(1, Math.round((to - from) / MS_PER_NIGHT));
+
+    const Booking = require('../models/Booking');
+    const Room = require('../models/Room');
+
+    // Số phòng khả dụng (active)
+    const roomFilter = { roomStatus: 'active' };
+    if (branchObjId) roomFilter.branchId = branchObjId;
+    const totalRooms = await Room.countDocuments(roomFilter);
+    const availableRoomNights = totalRooms * periodNights;
+
+    // Lấy booking có giao với kỳ + đã nhận/trả phòng
+    const match = {
+      status: { $in: ['checked_in', 'checked_out'] },
+      checkIn: { $lt: to },
+      checkOut: { $gt: from },
+    };
+    if (branchObjId) match.branchId = branchObjId;
+
+    const bookings = await Booking.find(match)
+      .select('roomNumber roomType roomAmount checkIn checkOut nights source isGroup rooms status branchId priceType actualCheckIn')
+      .lean();
+
+    // Số đêm giao theo NGÀY LỊCH (bỏ phần giờ), tối thiểu 1 đêm cho mỗi lượt qua đêm.
+    //   - Cắt [s,e] về [from,to]
+    //   - Quy về mốc 0h từng ngày rồi đếm số ngày → không sinh số lẻ do giờ check-in/out
+    const startOfDay = (t) => { const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); };
+    const overlapNights = (s, e) => {
+      if (!s || !e) return 0;
+      const sMs = Math.max(new Date(s).getTime(), from.getTime());
+      const eMs = Math.min(new Date(e).getTime(), to.getTime());
+      if (eMs <= sMs) return 0;
+      const nights = Math.round((startOfDay(eMs) - startOfDay(sMs)) / MS_PER_NIGHT);
+      return Math.max(1, nights); // mỗi lượt qua đêm ≥ 1
+    };
+
+    let soldRoomNights = 0;
+    let roomRevenue = 0;
+    // Khách thuê giờ — chỉ số riêng
+    let hourlyCount = 0;
+    let hourlyRevenue = 0;
+    const checkInByHourNight = new Array(24).fill(0);  // khách qua đêm → giờ nhận phòng
+    const checkInByHourHourly = new Array(24).fill(0);  // khách thuê giờ → giờ nhận phòng
+    const bySource = {};                 // source → { bookings, revenue, nights }
+    const byRoom = {};                   // roomNumber → { roomType, nights, revenue }
+
+    // Booking/đoàn-phòng thuê giờ → tách riêng, không tính đêm
+    const isHourly = (priceType, nights) =>
+      priceType === 'hour' || !(nights && nights > 0);
+
+    const addRoom = (roomNumber, roomType, ci, co, totalNights, amount, source, priceType) => {
+      // Khách giờ → ghi vào chỉ số giờ, bỏ khỏi công suất đêm
+      if (isHourly(priceType, totalNights)) {
+        hourlyCount += 1;
+        hourlyRevenue += Number(amount) || 0;
+        // vẫn cộng doanh thu nguồn khách (để pie phản ánh tổng)
+        const srcH = source || 'Khác';
+        if (!bySource[srcH]) bySource[srcH] = { source: srcH, bookings: 0, revenue: 0, nights: 0 };
+        bySource[srcH].revenue += Number(amount) || 0;
+        return;
+      }
+
+      const ov = overlapNights(ci, co);
+      if (ov <= 0) return;
+      // phân bổ doanh thu theo tỷ lệ đêm-trong-kỳ / tổng đêm booking
+      const tn = totalNights && totalNights > 0 ? totalNights : ov;
+      const rev = (Number(amount) || 0) * (ov / tn);
+
+      soldRoomNights += ov;
+      roomRevenue += rev;
+
+      const rn = roomNumber || '(không rõ)';
+      if (!byRoom[rn]) byRoom[rn] = { roomNumber: rn, roomType: roomType || '', nights: 0, revenue: 0 };
+      byRoom[rn].nights += ov;
+      byRoom[rn].revenue += rev;
+
+      const src = source || 'Khác';
+      if (!bySource[src]) bySource[src] = { source: src, bookings: 0, revenue: 0, nights: 0 };
+      bySource[src].revenue += rev;
+      bySource[src].nights += ov;
+    };
+
+    // Helper: đếm 1 lượt nhận phòng vào khung giờ, nếu actualCheckIn nằm trong kỳ
+    const countCheckInHour = (act, hourly) => {
+      if (!act) return;
+      const t = new Date(act);
+      if (t < from || t >= to) return;   // chỉ tính lượt nhận phòng trong kỳ báo cáo
+      (hourly ? checkInByHourHourly : checkInByHourNight)[t.getHours()] += 1;
+    };
+
+    for (const b of bookings) {
+      const src = b.source || 'Trực tiếp';
+      // đếm booking theo nguồn (mỗi booking 1 lần)
+      if (!bySource[src]) bySource[src] = { source: src, bookings: 0, revenue: 0, nights: 0 };
+      bySource[src].bookings += 1;
+
+      if (b.isGroup && Array.isArray(b.rooms) && b.rooms.length > 0) {
+        for (const r of b.rooms) {
+          if (r.status === 'cancelled') continue;
+          const ci = r.checkIn || b.checkIn;
+          const co = r.checkOut || b.checkOut;
+          const tn = r.nights && r.nights > 0 ? r.nights : b.nights;
+          addRoom(r.roomNumber, r.roomType, ci, co, tn, r.roomAmount, src, r.priceType || b.priceType);
+          countCheckInHour(r.actualCheckIn || b.actualCheckIn, isHourly(r.priceType || b.priceType, tn));
+        }
+      } else {
+        addRoom(b.roomNumber, b.roomType, b.checkIn, b.checkOut, b.nights, b.roomAmount, src, b.priceType);
+        countCheckInHour(b.actualCheckIn, isHourly(b.priceType, b.nights));
+      }
+    }
+
+    // Top 10 khung giờ nhận phòng đông nhất — tách khách ngày vs khách giờ
+    const topHours = (arr) => arr
+      .map((count, hour) => ({ hour, label: `${String(hour).padStart(2, '0')}h`, count }))
+      .filter((h) => h.count > 0)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+    const checkInHoursNight = topHours(checkInByHourNight);
+    const checkInHoursHourly = topHours(checkInByHourHourly);
+
+    const occupancyRate = availableRoomNights > 0
+      ? (soldRoomNights / availableRoomNights) * 100
+      : 0;
+    const adr = soldRoomNights > 0 ? roomRevenue / soldRoomNights : 0;
+    const revpar = availableRoomNights > 0 ? roomRevenue / availableRoomNights : 0;
+
+    const sources = Object.values(bySource).sort((a, b) => b.revenue - a.revenue);
+    const rooms = Object.values(byRoom)
+      .map((r) => ({
+        ...r,
+        nights: Math.round(r.nights),
+        occupancy: periodNights > 0 ? (r.nights / periodNights) * 100 : 0,
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    res.json({
+      success: true,
+      data: {
+        from, to, periodNights,
+        totalRooms,
+        availableRoomNights,
+        soldRoomNights: Math.round(soldRoomNights),
+        roomRevenue: Math.round(roomRevenue),
+        occupancyRate: Math.round(occupancyRate * 10) / 10,
+        adr: Math.round(adr),
+        revpar: Math.round(revpar),
+        // Khách thuê giờ (tách riêng, không tính vào công suất đêm)
+        hourly: {
+          count: hourlyCount,
+          revenue: Math.round(hourlyRevenue),
+        },
+        checkInHoursNight,    // top giờ nhận phòng — khách qua đêm
+        checkInHoursHourly,   // top giờ nhận phòng — khách thuê giờ
+        sources,
+        rooms,
+      },
+    });
+  } catch (err) {
+    console.error('[GET /reports-analytics/occupancy]', err);
+    res.status(500).json({ success: false, message: err.message || 'Lỗi server' });
+  }
+});
+
 module.exports = router;
