@@ -46,6 +46,20 @@ const jobPostingSchema = new mongoose.Schema({
     default: 0,
     min: 0,
   },
+  // ⭐ NEW 30/05/2026: Giới hạn độ tuổi ứng viên (tùy chọn).
+  //   - null = không giới hạn phía đó. Có thể đặt chỉ min, chỉ max, hoặc cả hai.
+  minAge: {
+    type: Number,
+    default: null,
+    min: 0,
+    max: 100,
+  },
+  maxAge: {
+    type: Number,
+    default: null,
+    min: 0,
+    max: 100,
+  },
   workType: {
     type: String,
     enum: ['fulltime', 'parttime', 'shift', 'contract'],

@@ -33,7 +33,6 @@ const checkBranchAccess = (branchId, user) => {
 };
 
 // ── GET /api/job-applications?branchId=...&jobPostingId=...&status=...&search=... ──
-// List ứng viên với filter + search
 router.get('/', authenticate, requireAdminOrManager, async (req, res, next) => {
   try {
     const {
@@ -44,7 +43,6 @@ router.get('/', authenticate, requireAdminOrManager, async (req, res, next) => {
 
     const filter = {};
 
-    // Branch filter (Manager force về branch mình)
     if (req.user.role === 'Manager') {
       filter.branchId = req.user.branchId;
     } else if (branchId) {
@@ -88,6 +86,40 @@ router.get('/', authenticate, requireAdminOrManager, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /api/job-applications/upcoming-interviews?branchId=&days= ──
+//   Lịch phỏng vấn sắp tới (cho tab Lịch phỏng vấn). Mặc định 14 ngày tới + quá khứ gần.
+router.get('/upcoming-interviews', authenticate, requireAdminOrManager, async (req, res, next) => {
+  try {
+    const { branchId } = req.query;
+    const days = Math.min(parseInt(req.query.days, 10) || 30, 90);
+
+    const filter = {
+      status: 'interviewing',
+      interviewAt: { $ne: null },
+    };
+    if (req.user.role === 'Manager') {
+      filter.branchId = req.user.branchId;
+    } else if (branchId) {
+      filter.branchId = branchId;
+    }
+
+    // từ 7 ngày trước → `days` ngày tới (để xem cả lịch vừa qua)
+    const now = new Date();
+    filter.interviewAt = {
+      $gte: new Date(now.getTime() - 7 * 24 * 3600 * 1000),
+      $lte: new Date(now.getTime() + days * 24 * 3600 * 1000),
+    };
+
+    const list = await JobApplication.find(filter)
+      .populate('jobPostingId', 'title position')
+      .populate('branchId', 'name')
+      .sort({ interviewAt: 1 })
+      .lean();
+
+    res.json({ success: true, data: { data: list, total: list.length } });
+  } catch (err) { next(err); }
+});
+
 // ── GET /api/job-applications/:id ────────────────────────
 router.get('/:id', authenticate, requireAdminOrManager, async (req, res, next) => {
   try {
@@ -114,7 +146,7 @@ router.get('/:id', authenticate, requireAdminOrManager, async (req, res, next) =
 });
 
 // ── PATCH /api/job-applications/:id ──────────────────────
-// Update status + reviewNote (Admin/Manager)
+//   Update status + reviewNote + lịch phỏng vấn (interviewAt, interviewLocation)
 router.patch('/:id', authenticate, requireAdminOrManager, async (req, res, next) => {
   try {
     const app = await JobApplication.findById(req.params.id);
@@ -130,7 +162,8 @@ router.patch('/:id', authenticate, requireAdminOrManager, async (req, res, next)
       });
     }
 
-    const { status, reviewNote } = req.body;
+    const { status, reviewNote, interviewAt, interviewLocation,
+            interviewReminderMinutes, interviewNotifyTelegram } = req.body;
 
     if (status !== undefined) {
       if (!['new', 'reviewing', 'interviewing', 'hired', 'rejected'].includes(status)) {
@@ -147,10 +180,69 @@ router.patch('/:id', authenticate, requireAdminOrManager, async (req, res, next)
       app.reviewNote = String(reviewNote).slice(0, 2000);
     }
 
+    // ⭐ Lịch phỏng vấn
+    let interviewChanged = false;
+    if (interviewAt !== undefined) {
+      if (interviewAt === null || interviewAt === '') {
+        app.interviewAt = null;
+      } else {
+        const d = new Date(interviewAt);
+        if (isNaN(d.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: 'Thời gian phỏng vấn không hợp lệ',
+            code: 'INVALID_INTERVIEW_TIME',
+          });
+        }
+        // ⭐ Chặn trùng lịch: cùng chi nhánh, cùng mốc giờ, đang ở trạng thái phỏng vấn,
+        //   trừ chính hồ sơ này. (so khớp chính xác mốc thời gian)
+        const clash = await JobApplication.findOne({
+          _id: { $ne: app._id },
+          branchId: app.branchId,
+          status: 'interviewing',
+          interviewAt: d,
+        }).select('fullName').lean();
+        if (clash) {
+          return res.status(409).json({
+            success: false,
+            message: `Thời gian này đã hẹn phỏng vấn với ${clash.fullName}. Vui lòng chọn giờ khác.`,
+            code: 'INTERVIEW_TIME_CONFLICT',
+          });
+        }
+        app.interviewAt = d;
+        interviewChanged = true;
+      }
+    }
+    if (interviewLocation !== undefined) {
+      app.interviewLocation = String(interviewLocation).slice(0, 500);
+    }
+    if (interviewReminderMinutes !== undefined) {
+      const n = Number(interviewReminderMinutes);
+      app.interviewReminderMinutes = Number.isFinite(n) && n >= 0 ? n : 60;
+    }
+    if (interviewNotifyTelegram !== undefined) {
+      app.interviewNotifyTelegram = !!interviewNotifyTelegram;
+    }
+    // Nếu đổi thời gian hẹn → reset cờ đã-nhắc để được nhắc lại
+    if (interviewChanged) {
+      app.interviewReminderSent = false;
+    }
+
     app.reviewedBy = req.user.id;
     app.reviewedAt = new Date();
 
     await app.save();
+
+    // ⭐ Gửi xác nhận NGAY khi vừa lên/đổi lịch phỏng vấn (non-blocking).
+    if (interviewChanged && app.interviewAt) {
+      try {
+        const { sendInterviewConfirmation } = require('../utils/interviewReminder');
+        sendInterviewConfirmation(app._id);
+      } catch (e) {
+        console.error('[job-applications/patch] gửi xác nhận PV lỗi (non-fatal):', e.message);
+      }
+    }
+
     res.json({ success: true, message: 'Cập nhật hồ sơ thành công', data: { application: app } });
   } catch (err) { next(err); }
 });
@@ -163,7 +255,6 @@ router.delete('/:id', authenticate, requireAdminOrManager, async (req, res, next
       return res.status(404).json({ success: false, message: 'Không tìm thấy hồ sơ' });
     }
 
-    // Chỉ Admin được xoá hẳn (Manager chỉ được sửa status)
     if (req.user.role !== 'Admin') {
       return res.status(403).json({
         success: false,
@@ -172,7 +263,6 @@ router.delete('/:id', authenticate, requireAdminOrManager, async (req, res, next
       });
     }
 
-    // Xoá ảnh trên disk nếu có
     if (app.photoUrl && app.photoUrl.startsWith('/uploads/')) {
       const filePath = path.join(__dirname, '..', app.photoUrl);
       fs.unlink(filePath, (err) => {
@@ -188,7 +278,6 @@ router.delete('/:id', authenticate, requireAdminOrManager, async (req, res, next
 });
 
 // ── GET /api/job-applications/stats/summary ─────────────
-// Thống kê tổng quan (số ứng viên theo status, theo branch)
 router.get('/stats/summary', authenticate, requireAdminOrManager, async (req, res, next) => {
   try {
     const { branchId } = req.query;
@@ -203,10 +292,7 @@ router.get('/stats/summary', authenticate, requireAdminOrManager, async (req, re
 
     const stats = await JobApplication.aggregate([
       { $match: matchFilter },
-      { $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-      }},
+      { $group: { _id: '$status', count: { $sum: 1 } } },
     ]);
 
     const summary = { total: 0, new: 0, reviewing: 0, interviewing: 0, hired: 0, rejected: 0 };

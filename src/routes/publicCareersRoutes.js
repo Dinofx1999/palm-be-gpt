@@ -134,7 +134,7 @@ router.get('/:branchId', async (req, res, next) => {
       branchId,
       status: 'active',
     })
-      .select('title position description requirements benefits salaryMin salaryMax workType createdAt')
+      .select('title position description requirements benefits salaryMin salaryMax workType minAge maxAge createdAt')
       .sort({ createdAt: -1 })
       .lean();
 
@@ -302,7 +302,7 @@ router.post('/apply', (req, res, next) => {
       });
     }
 
-    const job = await JobPosting.findById(jobPostingId).select('branchId status').lean();
+    const job = await JobPosting.findById(jobPostingId).select('branchId status minAge maxAge').lean();
     if (!job) {
       return res.status(404).json({
         success: false,
@@ -343,18 +343,39 @@ router.post('/apply', (req, res, next) => {
     if (birthDate) {
       const d = new Date(birthDate);
       if (!isNaN(d.getTime())) {
+        // Tính tuổi tròn (theo ngày sinh nhật đã qua chưa)
         const now = new Date();
-        const minAge = 16, maxAge = 70;
-        const age = (now - d) / (1000 * 60 * 60 * 24 * 365);
-        if (age >= minAge && age <= maxAge) {
-          parsedBirthDate = d;
-        } else {
+        let age = now.getFullYear() - d.getFullYear();
+        const mDiff = now.getMonth() - d.getMonth();
+        if (mDiff < 0 || (mDiff === 0 && now.getDate() < d.getDate())) age--;
+
+        // Chặn ngày sinh vô lý
+        if (age < 0 || age > 120) {
           return res.status(400).json({
             success: false,
-            message: `Tuổi phải từ ${minAge} đến ${maxAge}`,
-            code: 'INVALID_AGE',
+            message: 'Ngày sinh không hợp lệ',
+            code: 'INVALID_BIRTHDATE',
           });
         }
+
+        // Giới hạn tuổi theo TIN tuyển dụng (tùy chọn — null = không giới hạn)
+        const minAge = (job.minAge != null) ? job.minAge : null;
+        const maxAge = (job.maxAge != null) ? job.maxAge : null;
+        if (minAge != null && age < minAge) {
+          return res.status(400).json({
+            success: false,
+            message: `Vị trí này yêu cầu ứng viên từ ${minAge} tuổi trở lên`,
+            code: 'AGE_BELOW_MIN',
+          });
+        }
+        if (maxAge != null && age > maxAge) {
+          return res.status(400).json({
+            success: false,
+            message: `Vị trí này yêu cầu ứng viên không quá ${maxAge} tuổi`,
+            code: 'AGE_ABOVE_MAX',
+          });
+        }
+        parsedBirthDate = d;
       }
     }
 

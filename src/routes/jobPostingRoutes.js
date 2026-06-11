@@ -126,7 +126,7 @@ router.post('/', authenticate, requireAdminOrManager, async (req, res, next) => 
   try {
     const {
       branchId, title, position, description, requirements, benefits,
-      salaryMin, salaryMax, workType, status,
+      salaryMin, salaryMax, workType, status, minAge, maxAge,
     } = req.body;
 
     if (!branchId || !title || !position) {
@@ -153,6 +153,18 @@ router.post('/', authenticate, requireAdminOrManager, async (req, res, next) => 
       });
     }
 
+    // Chuẩn hóa tuổi: null nếu để trống; validate min ≤ max
+    const normAge = (v) => (v === undefined || v === null || v === '') ? null : Number(v);
+    const nMinAge = normAge(minAge);
+    const nMaxAge = normAge(maxAge);
+    if (nMinAge != null && nMaxAge != null && nMinAge > nMaxAge) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tuổi tối thiểu không được lớn hơn tuổi tối đa',
+        code: 'INVALID_AGE_RANGE',
+      });
+    }
+
     const posting = await JobPosting.create({
       branchId,
       title: title.trim(),
@@ -162,6 +174,8 @@ router.post('/', authenticate, requireAdminOrManager, async (req, res, next) => 
       benefits: benefits ?? '',
       salaryMin: Number(salaryMin) || 0,
       salaryMax: Number(salaryMax) || 0,
+      minAge: nMinAge,
+      maxAge: nMaxAge,
       workType: workType ?? 'fulltime',
       status: status ?? 'active',
       createdBy: req.user.id,
@@ -192,9 +206,17 @@ router.put('/:id', authenticate, requireAdminOrManager, async (req, res, next) =
     }
 
     const allowed = ['title', 'position', 'description', 'requirements', 'benefits',
-                     'salaryMin', 'salaryMax', 'workType', 'status'];
+                     'salaryMin', 'salaryMax', 'workType', 'status', 'minAge', 'maxAge'];
     for (const k of allowed) {
-      if (req.body[k] !== undefined) posting[k] = req.body[k];
+      if (req.body[k] !== undefined) {
+        // tuổi: chuỗi rỗng/null → null (gỡ giới hạn)
+        if ((k === 'minAge' || k === 'maxAge')) {
+          const val = req.body[k];
+          posting[k] = (val === null || val === '') ? null : Number(val);
+        } else {
+          posting[k] = req.body[k];
+        }
+      }
     }
 
     if (posting.salaryMin && posting.salaryMax && posting.salaryMin > posting.salaryMax) {
@@ -202,6 +224,14 @@ router.put('/:id', authenticate, requireAdminOrManager, async (req, res, next) =
         success: false,
         message: 'Lương tối thiểu không được lớn hơn lương tối đa',
         code: 'INVALID_SALARY',
+      });
+    }
+
+    if (posting.minAge != null && posting.maxAge != null && posting.minAge > posting.maxAge) {
+      return res.status(400).json({
+        success: false,
+        message: 'Tuổi tối thiểu không được lớn hơn tuổi tối đa',
+        code: 'INVALID_AGE_RANGE',
       });
     }
 
