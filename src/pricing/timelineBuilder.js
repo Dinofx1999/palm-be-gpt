@@ -96,21 +96,24 @@ const TT = require('./lib/timeUtils')
 function snapUpToNightCheckout(checkIn, now, stay, ctx) {
   const off = ctx.hotelUtcOffsetMinutes
   const coStdMin = TT.parseHHmm(stay.policy.dayCheckOutTime) ?? 720
+  const dayEquivH = ctx.dayEquivalentHours ?? 23
   const ciDay = TT.dayIndex(checkIn, off)
-  const nowDay = TT.dayIndex(now, off)
-  const nowMin = TT.minutesOfDay(now, off)
-  // Đêm đang diễn ra kết thúc vào giờ trả chuẩn của ngày kế tiếp ngày "now" (nếu now đã
-  // qua giờ trả chuẩn) hoặc của chính ngày now (nếu now trước giờ trả chuẩn).
-  let endDay
-  if (nowMin >= coStdMin) {
-    endDay = nowDay + 1
-  } else {
-    endDay = nowDay
-  }
-  // tối thiểu: ngày nhận + 1 (đêm 1 trọn)
-  if (endDay <= ciDay) endDay = ciDay + 1
-  const endDate = TT.atTimeOfDay(TT.addDays(checkIn, endDay - ciDay), coStdMin, off)
-  return endDate
+  const ciMin = TT.minutesOfDay(checkIn, off)
+  // ⭐ FIX (bug check-in rạng sáng tính 2 ngày ở "đến hiện tại"):
+  //   Số "ngày tính giá" tới hiện tại đếm theo MỐC dayEquivalentHours (vd 23h) KỂ TỪ GIỜ
+  //   NHẬN — KHÔNG theo mốc 12:00. Lý do: nhận rạng sáng (vd 00:17) mà đếm theo mốc 12:00
+  //   thì chỉ cần qua 12:00 vài phút là bị đẩy mốc lên 12:00 NGÀY KẾ TIẾP, rồi
+  //   computeDayNights cộng +1 đêm oan (mới ở vài giờ đã ra 2 ngày + đẻ segment tương lai).
+  //   Đếm theo dayEquiv: chỉ +1 NGÀY khi khách thực sự ở đủ 1 "ngày" (23h) — khớp mọi loại
+  //   giờ nhận (chiều / rạng sáng) và không tạo đêm tương lai.
+  const elapsedHours = (now.getTime() - checkIn.getTime()) / 3600000
+  const days = Math.max(1, Math.ceil(elapsedHours / dayEquivH))
+  // Đêm 1 kết thúc tại giờ trả chuẩn NGAY SAU giờ nhận:
+  //   - nhận TRƯỚC giờ trả (rạng sáng) → 12:00 CÙNG ngày nhận
+  //   - nhận TỪ giờ trả trở đi (chiều)  → 12:00 ngày KẾ TIẾP
+  const firstNightEndDay = (ciMin < coStdMin) ? ciDay : ciDay + 1
+  const endDay = firstNightEndDay + (days - 1)
+  return TT.atTimeOfDay(TT.addDays(checkIn, endDay - ciDay), coStdMin, off)
 }
 
 function firstRoomOf(stay) {
