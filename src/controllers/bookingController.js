@@ -2082,6 +2082,127 @@ const changePolicy = async (req, res, next) => {
     const booking = await Booking.findById(req.params.id)
     if (!booking) return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
 
+    // ⭐ FIX 12/06/2026 — ĐOÀN: nếu có roomId & booking là đoàn có sub-room đó → đổi giá
+    //   CHỈ phòng đó trong booking.rooms[]. Không đụng các phòng khác. Tính lại tổng nhóm.
+    const _grpRoomId = req.body.roomId
+    const _grpIdx = _grpRoomId && Array.isArray(booking.rooms)
+      ? booking.rooms.findIndex(sr => String(sr.roomId?._id ?? sr.roomId) === String(_grpRoomId))
+      : -1
+    if (_grpIdx >= 0) {
+      const sr = booking.rooms[_grpIdx]
+      const _srOldAmt = sr.roomAmount ?? 0
+      let srAmount = sr.roomAmount ?? 0
+      let srBreakdown = sr.priceBreakdown ?? []
+
+      const _prefix = (lbl) => {
+        const s = String(lbl ?? '')
+        return /^\[[^\]]+\]\s/.test(s) ? s : `[${sr.roomNumber}] ${s}`
+      }
+
+      if (customRoomAmount !== null && customRoomAmount !== undefined) {
+        srAmount = Number(customRoomAmount) || 0
+        srBreakdown = [{
+          label: `[${sr.roomNumber}] Giá phòng (tự nhập)`,
+          amount: srAmount, type: 'base',
+          meta: { roomNumber: sr.roomNumber, custom: true, customPrice: true },
+        }]
+        sr.policyId = null
+        sr.policyName = 'Giá tự nhập'
+      } else if (Array.isArray(customBreakdown) && customBreakdown.length > 0) {
+        srBreakdown = customBreakdown.map(b => ({
+          label:  _prefix(b.label),
+          amount: Number(b.amount) || 0,
+          type:   b.type === 'surcharge' ? 'surcharge' : 'base',
+          // ⭐ FIX 12/06/2026 (v2): GIỮ meta.roomNumber GỐC của dòng (dòng phòng cũ 201 giữ 201,
+          //   dòng phòng mới 402 giữ 402). Trước đây ép = sr.roomNumber → mất dấu chặng phòng cũ
+          //   khi đổi giá toàn timeline (201→402). Chỉ fallback sr.roomNumber khi dòng chưa có.
+          meta:   { ...(b.meta || {}), customPrice: true, roomNumber: b.meta?.roomNumber ?? sr.roomNumber },
+        }))
+        srAmount = srBreakdown.reduce((s, b) => s + (b.amount ?? 0), 0)
+        if (policyId) {
+          const policy = await PricePolicy.findById(policyId)
+          if (policy) { sr.policyId = policy._id; sr.policyName = policy.name }
+        }
+      } else if (policyId) {
+        const policy = await PricePolicy.findById(policyId)
+        if (!policy) return res.status(404).json({ success: false, message: 'Không tìm thấy chính sách giá' })
+        const room   = await Room.findById(sr.roomId).populate('typeId')
+        const branch = await Branch.findById(booking.branchId)
+        const maxAdults    = room?.typeId?.maxAdults   ?? room?.typeId?.capacity ?? 2
+        const maxChildren  = room?.typeId?.maxChildren ?? 0
+        const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
+        const result = calculatePrice({
+          checkIn:  sr.checkIn ?? booking.checkIn,
+          checkOut: sr.checkOut ?? booking.checkOut,
+          priceType: sr.priceType ?? booking.priceType,
+          policy, branch,
+          adults:   sr.adults   ?? booking.adults,
+          children: sr.children ?? booking.children,
+          maxAdults, maxChildren, maxOccupancy,
+        })
+        if (result.error) {
+          return res.status(400).json({
+            success: false, code: result.error.code, message: result.error.message,
+            data: { finalPriceType: result.error.finalPriceType, policyName: policy?.name ?? '' },
+          })
+        }
+        srAmount = result.roomAmount
+        srBreakdown = (result.breakdown ?? []).map(b => ({ ...b, label: _prefix(b.label), meta: { ...(b.meta || {}), roomNumber: sr.roomNumber } }))
+        sr.policyId = policy._id
+        sr.policyName = policy.name
+      }
+
+      if (isFreeRoom === true) { srAmount = 0 }
+
+      // Chiết khấu của RIÊNG phòng này (gập % vào số tiền trên subtotal phòng)
+      if (discountPercent !== null || discountAmount !== null) {
+        const _pct = Number(discountPercent) || 0
+        const _amt = Number(discountAmount)  || 0
+        const _base = (isFreeRoom === true ? 0 : srAmount) + (sr.servicesAmount ?? 0)
+        booking.rooms[_grpIdx].discountAmount = Math.round(_base * _pct / 100) + _amt
+      }
+
+      booking.rooms[_grpIdx].roomAmount     = srAmount
+      booking.rooms[_grpIdx].priceBreakdown = srBreakdown
+      booking.markModified('rooms')
+
+      // Tính lại tổng nhóm — KHỚP công thức calculate-bill (chiết khấu % ở mức đoàn)
+      const grpRoom = booking.rooms
+        .filter(r => r.status !== 'cancelled')
+        .reduce((s, r) => s + (r.roomAmount ?? 0), 0)
+      const grpServices = booking.servicesAmount ?? 0
+      const grpPctDisc  = Math.round((grpRoom + grpServices) * (booking.discountPercent ?? 0) / 100)
+      booking.roomAmount  = grpRoom
+      booking.discount    = grpPctDisc + (booking.discountAmount ?? 0)
+      booking.totalAmount = Math.max(0, grpRoom + grpServices - grpPctDisc - (booking.discountAmount ?? 0) + (booking.transferFee ?? 0))
+
+      await booking.save()
+
+      try {
+        const invoice = await Invoice.findOne({ bookingId: booking._id })
+        if (invoice) {
+          invoice.roomAmount      = booking.roomAmount
+          invoice.discount        = booking.discount
+          invoice.totalAmount     = booking.totalAmount
+          invoice.remainingAmount = Math.max(0, invoice.totalAmount - (invoice.paidAmount ?? 0))
+          invoice.paymentStatus   = invoice.paidAmount >= invoice.totalAmount ? 'paid' :
+                                    invoice.paidAmount > 0 ? 'partial' : 'unpaid'
+          await invoice.save()
+        }
+      } catch (e) {
+        console.error('[changePolicy/group-room] sync invoice failed (non-fatal):', e.message)
+      }
+
+      await logAction({
+        entityType: 'Booking', entityId: booking._id,
+        action: 'change_policy',
+        description: `Đổi giá phòng ${sr.roomNumber} (đoàn): ${_srOldAmt.toLocaleString('vi-VN')}đ → ${srAmount.toLocaleString('vi-VN')}đ`,
+        user: req.user, branchId: booking.branchId,
+      }).catch(() => {})
+
+      return res.json({ success: true, data: { booking } })
+    }
+
     // ⭐ FIX 23/05/2026: Lưu giá/chính sách CŨ TRƯỚC khi đổi — để audit log ghi "cũ → mới".
     const _oldPolicyName  = booking.policyName
     const _oldRoomAmount  = booking.roomAmount
@@ -4094,7 +4215,21 @@ const calculateBill = async (req, res, next) => {
             (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
           const hasMoveSegments = breakdownItems.some(b => isOldSeg(b?.meta, sr.roomNumber))
 
-          if (hasMoveSegments && mode === 'now' && sr.status === 'checked_in') {
+          // ⭐ FIX 12/06/2026 (v2): Phòng đã SỬA GIÁ TAY (customPrice) — KỂ CẢ phòng ĐÃ CHUYỂN —
+          //   dùng NGUYÊN breakdown đã lưu, KHÔNG reconstruct/tính lại. Nhờ vậy "đổi giá toàn
+          //   timeline" (vd 201→402: sửa cả 2 dòng) được GIỮ, không bị move-segment đè lại.
+          //   PHẢI đặt TRƯỚC nhánh hasMoveSegments (nếu không phòng chuyển luôn bị reconstruct).
+          const _srHasCustomPrice = (sr.priceBreakdown ?? []).some(b => b?.meta?.customPrice === true)
+
+          if (_srHasCustomPrice) {
+            const _plain = (sr.priceBreakdown ?? []).map(b =>
+              (b && typeof b.toObject === 'function') ? b.toObject() : b
+            )
+            subPriceResult = {
+              roomAmount: _plain.reduce((s, b) => s + (b.amount ?? 0), 0),
+              breakdown:  _plain,
+            }
+          } else if (hasMoveSegments && mode === 'now' && sr.status === 'checked_in') {
             // ⭐ FIX 25/05/2026: Sub-room đoàn ĐÃ CHUYỂN — dùng computeMoveRoomBreakdown
             //   (Y HỆT phòng lẻ ở nhánh hasTransferred) thay cho seg1/seg2 + calculatePrice.
             //   Lý do: calculatePrice tính chặng phòng MỚI theo NGUYÊN NGÀY → sai spec, và
@@ -4219,6 +4354,18 @@ const calculateBill = async (req, res, next) => {
               breakdown:  plainItems,
             }
           } else {
+            // ⭐ FIX 12/06/2026: Nếu phòng này đã được SỬA GIÁ TAY (customPrice) → dùng
+            //   breakdown đã lưu, KHÔNG tính lại từ chính sách (kẻo mất giá custom).
+            const _srHasCustom = (sr.priceBreakdown ?? []).some(b => b?.meta?.customPrice === true)
+            if (_srHasCustom) {
+              const _plain = (sr.priceBreakdown ?? []).map(b =>
+                (b && typeof b.toObject === 'function') ? b.toObject() : b
+              )
+              subPriceResult = {
+                roomAmount: _plain.reduce((s, b) => s + (b.amount ?? 0), 0),
+                breakdown:  _plain,
+              }
+            } else {
             const segCheckIn = sr.actualCheckIn ?? booking.checkIn
             const segCheckOut = (mode === 'now' && sr.status === 'checked_in')
               ? effectiveCheckOut
@@ -4233,6 +4380,7 @@ const calculateBill = async (req, res, next) => {
               children:  sr.children ?? booking.children,
               maxAdults, maxChildren, maxOccupancy,
             })
+            }
           }
         }
 
@@ -5035,6 +5183,66 @@ const calculateBill = async (req, res, next) => {
       )
       return stripped === lbl ? b : { ...b, label: stripped }
     })
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ⭐ ENGINE MỚI /pricing — CHẾ ĐỘ SHADOW (an toàn tuyệt đối)
+    //   - Mặc định: CHỈ tính song song + log chênh lệch, KHÔNG đổi hành vi.
+    //   - Bật biến môi trường USE_NEW_PRICING_ENGINE=1 → TRẢ kết quả engine mới.
+    //   - Engine mới lỗi → bắt, log, rơi về engine cũ (không bao giờ vỡ endpoint).
+    //   Xem src/pricing/ (priceBookingDoc / priceBookingToNow).
+    // ════════════════════════════════════════════════════════════════════════
+    try {
+      const { priceBookingDoc, priceBookingToNow } = require('../pricing/pricingAdapter')
+      const _newInv = mode === 'now'
+        ? priceBookingToNow(booking, { branch, now: atTime ? new Date(atTime) : new Date() })
+        : priceBookingDoc(booking, { branch })
+
+      if (_newInv.roomAmount !== priceResult.roomAmount || _newInv.totalAmount !== totalAmount) {
+        console.log(
+          `[PRICING-DIFF] ${booking.bookingCode || booking._id} mode=${mode}` +
+          ` | room cũ=${priceResult.roomAmount} mới=${_newInv.roomAmount}` +
+          ` | total cũ=${totalAmount} mới=${_newInv.totalAmount}`
+        )
+      }
+
+      if (process.env.USE_NEW_PRICING_ENGINE === '1') {
+        // ⭐ Engine mới CHỈ cấp PHẦN GIÁ (roomAmount + breakdown). Mọi thứ còn lại —
+        //   dịch vụ, chiết khấu, phí chuyển phòng, ĐÃ THU (paidAmount từ Invoice) — lấy
+        //   từ logic controller cũ (đã đúng). Tổng & còn lại tính lại với roomAmount mới.
+        const _newRoomPart  = booking.isFreeRoom ? 0 : _newInv.roomAmount
+        const _newTotal     = Math.max(0, _newRoomPart + servicesAmount - recalcDiscount + transferFee)
+        const _newRemaining = Math.max(0, _newTotal - paidAmount)
+        return res.json({
+          success: true,
+          data: {
+            mode,
+            effectiveCheckOut,
+            viewedAt:         viewedAtForDisplay,
+            nights:           _newInv.nights,
+            roomAmount:       _newInv.roomAmount,
+            servicesAmount,
+            discount:         recalcDiscount,
+            transferFee,
+            totalAmount:      _newTotal,
+            paidAmount,
+            remainingAmount:  _newRemaining,
+            breakdown:        (_newInv.breakdown || []).map(b => ({
+              label:  b.label,
+              amount: b.amount,
+              type:   String(b.kind || '').startsWith('surcharge') ? 'surcharge' : 'base',
+              meta:   b.meta || {},
+            })),
+            usedStoredBreakdown: false,
+            finalPriceType:   booking.priceType,
+            converted:        false,
+            notice:           null,
+            _engine:          'new',
+          },
+        })
+      }
+    } catch (e) {
+      console.error('[PRICING-NEW] lỗi engine mới (bỏ qua, dùng engine cũ):', e.message)
+    }
 
     res.json({
       success: true,
