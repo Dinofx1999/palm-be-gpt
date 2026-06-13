@@ -4662,6 +4662,41 @@ const calculateBill = async (req, res, next) => {
           }
         }
 
+        // ⭐ FIX 13/06/2026: Cộng "Trả phòng muộn" khi xem "Đến hiện tại" QUÁ giờ trả.
+        //   Booking sửa-giá-tay trước đây chỉ lọc các đêm đã ở, KHÔNG tính phần dôi sau
+        //   giờ trả chuẩn → thiếu phụ thu trả muộn. Lấy ĐÚNG số từ calculatePrice (ép sức
+        //   chứa cao để CHỈ trích khoản trả muộn, không lẫn phụ thu vượt người — vì giá
+        //   tay đã tự gồm tiền phòng/người rồi).
+        try {
+          const _asOf = effectiveCheckOut   // mode 'now' → giờ đang xem
+          if (_asOf > new Date(booking.checkOut)) {
+            const _latePolicy = policy ?? booking.policySnapshot
+            if (_latePolicy) {
+              const _lr = calculatePrice({
+                checkIn:   booking.actualCheckIn ?? booking.checkIn,
+                checkOut:  _asOf,
+                priceType: booking.priceType,
+                policy:    _latePolicy, branch,
+                adults:    booking.adults, children: booking.children,
+                maxAdults: 9999, maxChildren: 9999, maxOccupancy: 9999,
+              })
+              if (!_lr.error && Array.isArray(_lr.breakdown)) {
+                for (const s of _lr.breakdown) {
+                  if (s.type !== 'surcharge') continue
+                  const _l = String(s.label || '')
+                  if (!(_l.includes('Trả phòng muộn') || _l.includes('Trả phòng trễ') || _l.includes('late_checkout'))) continue
+                  filteredBreakdown.push({
+                    label:  `[${booking.roomNumber}] ${s.label}`,
+                    amount: Number(s.amount) || 0,
+                    type:   'surcharge',
+                    meta:   { ...(s.meta || {}), roomNumber: booking.roomNumber, lateCheckout: true },
+                  })
+                }
+              }
+            }
+          }
+        } catch (_lateErr) { console.warn('[calculateBill custom late-CO]', _lateErr.message) }
+
         const filteredTotal = filteredBreakdown.reduce((s, b) => s + (b.amount ?? 0), 0)
         priceResult = {
           roomAmount:       filteredTotal,
@@ -5182,13 +5217,17 @@ const calculateBill = async (req, res, next) => {
     if (priceResult.breakdown && Array.isArray(priceResult.breakdown)) {
       const roomNumPrefix = booking_view.roomNumber || booking.roomNumber || ''
       priceResult.breakdown = priceResult.breakdown.map(b => {
-        const lbl = String(b.label || '')
+        // ⭐ FIX 13/06/2026: chuyển Mongoose subdoc → plain TRƯỚC khi spread. Nếu không,
+        //   { ...b } chỉ copy _doc/$__ và RỚT amount/type/meta (getter trên prototype) → 0đ.
+        //   (Lộ ra khi guard đẩy booking SỬA GIÁ TAY sang đường cũ — breakdown là subdoc Mongoose.)
+        const plain = (b && typeof b.toObject === 'function') ? b.toObject() : b
+        const lbl = String(plain.label || '')
         // Đã có prefix [...] rồi → giữ nguyên
-        if (lbl.startsWith('[')) return b
+        if (lbl.startsWith('[')) return plain
         // Là dòng giá phòng (Giá ngày / Giá đêm / Giá nghỉ giờ) → thêm prefix [roomNumber]
         const isPriceLine = /^Giá\s+(ngày|đêm|nghỉ giờ|giờ|tuần|tháng)/i.test(lbl)
-        if (!isPriceLine || !roomNumPrefix) return b
-        return { ...b, label: `[${roomNumPrefix}] ${lbl}` }
+        if (!isPriceLine || !roomNumPrefix) return plain
+        return { ...plain, label: `[${roomNumPrefix}] ${lbl}` }
       })
     }
 
@@ -5223,12 +5262,13 @@ const calculateBill = async (req, res, next) => {
     //   → strip thành: "[604] Giá ngày (...)"
     //   Pattern: [XXX] <bất cứ gì> - Giá <type> (...)  →  [XXX] Giá <type> (...)
     const cleanedBreakdown = (priceResult.breakdown || []).map(b => {
-      const lbl = String(b.label || '')
+      const plain = (b && typeof b.toObject === 'function') ? b.toObject() : b
+      const lbl = String(plain.label || '')
       const stripped = lbl.replace(
         /^(\[[^\]]+\])\s+.+?\s+-\s+(Giá\s+(ngày|đêm|nghỉ giờ|giờ|tuần|tháng))/i,
         '$1 $2'
       )
-      return stripped === lbl ? b : { ...b, label: stripped }
+      return stripped === lbl ? plain : { ...plain, label: stripped }
     })
 
     // ════════════════════════════════════════════════════════════════════════
