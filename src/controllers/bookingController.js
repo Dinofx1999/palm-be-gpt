@@ -2067,6 +2067,27 @@ const moveRoom = async (req, res, next) => {
   }
 }
 
+// ⭐ FIX 13/06/2026: Kiểm tra customBreakdown TRƯỚC khi ghi đè — fail-fast, KHÔNG
+//   coerce undefined→0. Chặn ca FE gửi dòng rỗng/0 (vd modal vừa nạp dữ liệu hỏng) làm
+//   "nuốt" breakdown tốt trong DB. Trả mã lỗi để FE hiện thông báo tải lại hoá đơn.
+//   Trả về null nếu hợp lệ, hoặc { code, message, index } nếu lỗi.
+function _validateCustomBreakdownLines(lines) {
+  if (!Array.isArray(lines) || lines.length === 0)
+    return { code: 'EMPTY_BREAKDOWN', message: 'Danh sách dòng giá trống — không thể lưu.' }
+  for (let i = 0; i < lines.length; i++) {
+    const b = lines[i] || {}
+    const lbl = String(b.label ?? '').trim()
+    if (!lbl)
+      return { code: 'INVALID_CUSTOM_LINE', index: i, message: `Dòng giá #${i + 1} thiếu nhãn (label).` }
+    if (b.amount === undefined || b.amount === null)
+      return { code: 'MISSING_AMOUNT', index: i, message: `Dòng giá "${lbl}" thiếu số tiền.` }
+    const n = Number(b.amount)
+    if (!Number.isFinite(n) || n < 0)
+      return { code: 'INVALID_CUSTOM_AMOUNT', index: i, message: `Dòng giá "${lbl}" có số tiền không hợp lệ (phải là số ≥ 0).` }
+  }
+  return null
+}
+
 // ⭐ PATCH /bookings/:id/change-policy
 const changePolicy = async (req, res, next) => {
   try {
@@ -2109,9 +2130,18 @@ const changePolicy = async (req, res, next) => {
         sr.policyId = null
         sr.policyName = 'Giá tự nhập'
       } else if (Array.isArray(customBreakdown) && customBreakdown.length > 0) {
+        // ⭐ FIX 13/06/2026: fail-fast — không cho dòng rỗng/thiếu amount ghi đè giá tốt.
+        const _bdErr = _validateCustomBreakdownLines(customBreakdown)
+        if (_bdErr) {
+          return res.status(400).json({
+            success: false, code: _bdErr.code,
+            message: `${_bdErr.message} Vui lòng tải lại hóa đơn rồi thử lại.`,
+            data: { index: _bdErr.index ?? null, roomNumber: sr.roomNumber },
+          })
+        }
         srBreakdown = customBreakdown.map(b => ({
           label:  _prefix(b.label),
-          amount: Number(b.amount) || 0,
+          amount: Number(b.amount),          // ⭐ đã validate finite ≥ 0; KHÔNG còn || 0
           type:   b.type === 'surcharge' ? 'surcharge' : 'base',
           // ⭐ FIX 12/06/2026 (v2): GIỮ meta.roomNumber GỐC của dòng (dòng phòng cũ 201 giữ 201,
           //   dòng phòng mới 402 giữ 402). Trước đây ép = sr.roomNumber → mất dấu chặng phòng cũ
@@ -2222,9 +2252,18 @@ const changePolicy = async (req, res, next) => {
       booking.policyId   = null
       booking.policyName = 'Giá tự nhập'
     } else if (Array.isArray(customBreakdown) && customBreakdown.length > 0) {
+      // ⭐ FIX 13/06/2026: fail-fast — không cho dòng rỗng/thiếu amount ghi đè giá tốt.
+      const _bdErr = _validateCustomBreakdownLines(customBreakdown)
+      if (_bdErr) {
+        return res.status(400).json({
+          success: false, code: _bdErr.code,
+          message: `${_bdErr.message} Vui lòng tải lại hóa đơn rồi thử lại.`,
+          data: { index: _bdErr.index ?? null },
+        })
+      }
       newPriceBreakdown = customBreakdown.map(b => ({
-        label:  String(b.label ?? ''),
-        amount: Number(b.amount) || 0,
+        label:  String(b.label),
+        amount: Number(b.amount),            // ⭐ đã validate finite ≥ 0; KHÔNG còn || 0
         type:   b.type === 'surcharge' ? 'surcharge' : 'base',
         meta:   { ...(b.meta || {}), customPrice: true },
       }))
@@ -2812,7 +2851,8 @@ const checkout = async (req, res, next) => {
             oldRoom: {
               number: lastTransfer.fromRoomNumber,
               type:   oldRoomType,
-              policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+              policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy),
+                dayCheckInTime: oldPolicy?.dayCheckInTime, dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn },
             },
             newRoom: {
               number: lastTransfer.toRoomNumber,
@@ -4718,7 +4758,12 @@ const calculateBill = async (req, res, next) => {
             actualCheckIn:   new Date(booking.actualCheckIn ?? booking.checkIn),  // ⭐ giờ nhận GỐC (để logic giờ/ngày khớp nhánh 1-transfer)
             plannedCheckOut: plannedForLast,
             transferAt:      new Date(lastT.transferAt),
-            oldRoom: { number: oldRoomNum, type: oldRoomType, policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) } },
+            oldRoom: { number: oldRoomNum, type: oldRoomType, 
+                       policy: { dayPrice: oldPolicy?.dayPrice || 0, 
+                       hourSlots: hourSlotsOf(oldPolicy),
+                       dayCheckInTime:  oldPolicy?.dayCheckInTime,    // ⭐ FIX 13/06: tính "Nhận phòng sớm" phòng cũ
+                      dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn,
+                      } },
             newRoom: { number: newRoomNum, type: newRoomType, policy: {
               dayPrice: newPolicy?.dayPrice || 0, hourSlots: newRoomHourSlots,
               dayCheckInTime: newPolicy?.dayCheckInTime, dayCheckOutTime: newPolicy?.dayCheckOutTime,
@@ -4870,6 +4915,8 @@ const calculateBill = async (req, res, next) => {
             policy: {
               dayPrice:  oldPolicy?.dayPrice || 0,
               hourSlots: hourSlotsOf(oldPolicy),
+              dayCheckInTime:  oldPolicy?.dayCheckInTime,   // ⭐ FIX: tính "Nhận phòng sớm" phòng cũ
+              dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn,
             },
           },
           newRoom: {
@@ -5205,7 +5252,7 @@ const calculateBill = async (req, res, next) => {
         )
       }
 
-      if (process.env.USE_NEW_PRICING_ENGINE === '1') {
+      if (process.env.USE_NEW_PRICING_ENGINE === '1' && !hasCustomPrice && !hasTransferred) {
         // ⭐ Engine mới CHỈ cấp PHẦN GIÁ (roomAmount + breakdown). Mọi thứ còn lại —
         //   dịch vụ, chiết khấu, phí chuyển phòng, ĐÃ THU (paidAmount từ Invoice) — lấy
         //   từ logic controller cũ (đã đúng). Tổng & còn lại tính lại với roomAmount mới.

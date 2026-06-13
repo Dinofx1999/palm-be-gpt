@@ -20,6 +20,50 @@
  */
 
 const { priceStay, priceBooking, DEFAULT_CTX } = require('./index')
+const { buildInvoice } = require('./invoiceBuilder')
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⭐ HỖ TRỢ GIÁ THỦ CÔNG TỪNG ĐÊM (customBreakdown đã lưu ở booking.priceBreakdown
+//    hoặc sub-room.priceBreakdown). Engine thuần chỉ nhận 1 giá customRoomPrice
+//    chung; giá RIÊNG từng đêm phải đọc thẳng breakdown đã lưu (KHÔNG tính lại).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Dòng "tiền phòng" (base) — bỏ phụ thu/dịch vụ/chiết khấu/thuế.
+function _isBaseLine(b) {
+  return b && b.type !== 'surcharge' && b.type !== 'service' && b.type !== 'discount' && b.type !== 'tax'
+}
+
+// Breakdown custom đã lưu của 1 nguồn (booking lẻ / sub-room). null nếu không có custom.
+function _savedCustomBreakdown(src) {
+  const raw = Array.isArray(src && src.priceBreakdown) ? src.priceBreakdown : []
+  // ⭐ FIX 13/06/2026: priceBreakdown là Mongoose DocumentArray → mỗi phần tử là subdoc.
+  //   Dữ liệu thật (label/amount/meta) nằm trong ._doc, KHÔNG phải own-enumerable property
+  //   (chúng là getter trên prototype). Nếu spread {...subdoc} thẳng thì RỚT amount →
+  //   Number(b.amount)||0 = 0 → tính ra 0đ. Phải toObject() về plain object trước khi spread.
+  const bd = raw.map(b => (b && typeof b.toObject === 'function') ? b.toObject() : b)
+  if (!bd.some(b => b && b.meta && b.meta.customPrice === true)) return null
+  return bd.map(b => ({ ...b, type: b.type === 'surcharge' ? 'surcharge' : 'base' }))
+}
+
+// "Đến hiện tại" với custom: cắt số dòng base tới số đêm ĐÃ TRÔI QUA (engine to-now
+//   cho số đêm — KHÔNG dùng số tiền engine, chỉ dùng để biết cắt mấy đêm). Giữ phụ thu.
+function _sliceCustomToNow(customBd, stay, ctx, now) {
+  let nightsNow = 1
+  try {
+    const r = priceStay(stay, { viewMode: 'to-now', now, ctx })
+    nightsNow = Math.max(1, Number(r.nights) || 1)
+  } catch (_) { nightsNow = 1 }
+  const out = []
+  let baseCount = 0
+  for (const b of customBd) {
+    if (_isBaseLine(b)) {
+      if (baseCount < nightsNow) { out.push(b); baseCount++ }
+    } else {
+      out.push(b)
+    }
+  }
+  return out
+}
 
 /**
  * Tạo ctx từ branch config (giờ chuẩn, tolerance...). Mọi quy tắc nghiệp vụ ở đây.
@@ -110,38 +154,75 @@ function staysOf(booking, opts) {
 }
 
 /**
+ * Lõi dùng chung cho cả 2 mode. Nếu booking (hoặc bất kỳ sub-room nào) có breakdown
+ * giá thủ công TỪNG ĐÊM đã lưu → dùng THẲNG breakdown đó cho phòng custom (engine
+ * KHÔNG được tính lại), phòng thường vẫn để engine tính. Không có custom → đường cũ.
+ */
+function _priceBookingMaybeCustom(booking, opts, viewMode, now) {
+  const ctx = ctxFromBranch(opts.branch)
+  const subRooms = booking.rooms && booking.rooms.length > 0 ? booking.rooms : null
+  const sources = (booking.isGroup && subRooms) ? subRooms : [booking]
+
+  const anyCustom = sources.some(src => _savedCustomBreakdown(src) != null)
+  if (!anyCustom) {
+    // ── Đường cũ (không đổi) — engine tính toàn bộ ──
+    const stays = sources.map(src => toStay(src, booking, opts))
+    return priceBooking({
+      isGroup: !!booking.isGroup,
+      stays,
+      servicesAmount:  booking.servicesAmount  || 0,
+      discountPercent: booking.discountPercent || 0,
+      discountAmount:  booking.discountAmount  || 0,
+      transferFee:     booking.transferFee     || 0,
+      paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
+      isFreeRoom:      !!booking.isFreeRoom,
+    }, { viewMode, now, ctx })
+  }
+
+  // ── Có giá thủ công từng đêm ──
+  const allBreakdown = []
+  const perRoom = []
+  let nights = 0
+  for (const src of sources) {
+    const stay = toStay(src, booking, opts)
+    const customBd = _savedCustomBreakdown(src)
+    let lines
+    if (customBd) {
+      // to-checkout → đủ mọi đêm custom; to-now → cắt tới số đêm đã trôi qua
+      lines = (viewMode === 'to-now') ? _sliceCustomToNow(customBd, stay, ctx, now) : customBd
+    } else {
+      const r = priceStay(stay, { viewMode, now, ctx, customRoomPrice: stay.customRoomPrice })
+      lines = r.breakdown
+    }
+    const roomAmount = lines.reduce((s, b) => s + (Number(b.amount) || 0), 0)
+    allBreakdown.push(...lines)
+    perRoom.push({ roomNumber: src.roomNumber, roomAmount, breakdown: lines })
+    nights = Math.max(nights, lines.filter(_isBaseLine).length)
+  }
+
+  const invoice = buildInvoice({
+    breakdown:       allBreakdown,
+    servicesAmount:  booking.servicesAmount  || 0,
+    discountPercent: booking.discountPercent || 0,
+    discountAmount:  booking.discountAmount  || 0,
+    transferFee:     booking.transferFee     || 0,
+    paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
+    isFreeRoom:      !!booking.isFreeRoom,
+  })
+  return { ...invoice, perRoom, nights }
+}
+
+/**
  * HÀM CHÍNH cho controller — hoá đơn "đến khi trả phòng".
  * Trả invoice đầy đủ (đã gồm dịch vụ/chiết khấu/phí/đã trả).
  */
 function priceBookingDoc(booking, opts = {}) {
-  const ctx = ctxFromBranch(opts.branch)
-  const stays = staysOf(booking, opts)
-  return priceBooking({
-    isGroup: !!booking.isGroup,
-    stays,
-    servicesAmount:  booking.servicesAmount  || 0,
-    discountPercent: booking.discountPercent || 0,
-    discountAmount:  booking.discountAmount  || 0,
-    transferFee:     booking.transferFee     || 0,
-    paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
-    isFreeRoom:      !!booking.isFreeRoom,
-  }, { viewMode: 'to-checkout', ctx })
+  return _priceBookingMaybeCustom(booking, opts, 'to-checkout', null)
 }
 
 /** Hoá đơn "đến hiện tại" (tab tính tạm). now mặc định = thời điểm gọi. */
 function priceBookingToNow(booking, opts = {}) {
-  const ctx = ctxFromBranch(opts.branch)
-  const stays = staysOf(booking, opts)
-  return priceBooking({
-    isGroup: !!booking.isGroup,
-    stays,
-    servicesAmount:  booking.servicesAmount  || 0,
-    discountPercent: booking.discountPercent || 0,
-    discountAmount:  booking.discountAmount  || 0,
-    transferFee:     booking.transferFee     || 0,
-    paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
-    isFreeRoom:      !!booking.isFreeRoom,
-  }, { viewMode: 'to-now', now: opts.now || new Date(), ctx })
+  return _priceBookingMaybeCustom(booking, opts, 'to-now', opts.now || new Date())
 }
 
 /**
@@ -151,8 +232,18 @@ function priceBookingToNow(booking, opts = {}) {
 function priceRoomDoc(booking, opts = {}) {
   const ctx = ctxFromBranch(opts.branch)
   const stay = toStay(booking, booking, opts)
+  const viewMode = opts.viewMode || 'to-checkout'
+  // ⭐ Giá thủ công từng đêm đã lưu → dùng thẳng (cắt theo now nếu to-now).
+  const customBd = _savedCustomBreakdown(booking)
+  if (customBd) {
+    const lines = (viewMode === 'to-now')
+      ? _sliceCustomToNow(customBd, stay, ctx, opts.now || new Date())
+      : customBd
+    const roomAmount = lines.reduce((s, b) => s + (Number(b.amount) || 0), 0)
+    return { roomNumber: booking.roomNumber, roomAmount, breakdown: lines, nights: lines.filter(_isBaseLine).length }
+  }
   return priceStay(stay, {
-    viewMode: opts.viewMode || 'to-checkout',
+    viewMode,
     now: opts.now, ctx,
     customRoomPrice: booking.customRoomPrice,
   })
