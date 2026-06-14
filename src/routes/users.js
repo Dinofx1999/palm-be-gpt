@@ -23,6 +23,6 @@ router.patch('/:id/reset-password', authenticate, authorize('Admin'),           
 router.delete('/:id',               authenticate, authorize('Admin'),            ctrl.remove);
 router.get('/activation/verify', ctrl.verifyActivation);
 router.post('/activate',         ctrl.activate);
-router.post('/:id/resend-activation', authorize('Admin'), ctrl.resendActivation);  // ⭐ NEW
+router.post('/:id/resend-activation', authenticate, authorize('Admin'), ctrl.resendActivation);  // ⭐ NEW
 
 module.exports = router;

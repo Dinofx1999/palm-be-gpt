@@ -6,11 +6,15 @@
 // ════════════════════════════════════════════════════════════════════════════
 
 const router = require('express').Router();
-const { authenticate } = require('../middleware/auth');
+const { authenticate, authorize } = require('../middleware/auth');
 const { getStaffDiscountCharges } = require('../controllers/staffDiscountReport.controller');
 
 // GET /api/reports/staff-discount-charges
 // Query: branchId (required), from, to, staffId (optional)
-router.get('/staff-discount-charges', authenticate, getStaffDiscountCharges);
+router.get('/staff-discount-charges',
+  authenticate,
+  authorize('Admin', 'Manager'),
+  getStaffDiscountCharges,
+);
 
 module.exports = router;
