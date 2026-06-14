@@ -209,7 +209,49 @@ function isEarlyMorningTransferOfFirstNight({ actualCheckIn, transferAt, earlyCh
 // ════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════════════════
+// ⭐ FIX 14/06/2026 (v2 — theo spec đổi phòng): Wrapper áp quy tắc "đổi phòng TRƯỚC mốc trả
+//   chuẩn (12:00) ĐẦU TIÊN → phòng CŨ chưa ngủ đêm nào → KHÔNG có dòng base tính tiền".
+//   Engine lõi vẫn tính đêm/giá giờ/phụ thu như cũ — phụ thu nhận sớm ĐÃ nằm đúng trên phòng
+//   ĐẦU (501) theo policy phòng đầu. Wrapper chỉ BỎ dòng BASE của phòng cũ (đêm/giá-ngày ảo)
+//   trong đúng case này. Các case khác (đổi SAU 12:00, đổi nhiều đêm) giữ NGUYÊN.
+//   Lưu ý: phụ thu nhận sớm vẫn theo phòng ĐẦU; phụ thu trả trễ vẫn theo phòng CUỐI (không đổi).
 function computeMoveRoomBreakdown(input) {
+  const items = _computeMoveRoomBreakdownCore(input);
+  try {
+    const oldNum = String(input.oldRoom?.number ?? '');
+    const newNum = String(input.newRoom?.number ?? '');
+    if (!oldNum || oldNum === newNum) return items;          // không phải đổi phòng thật
+    if (input.changeRate === false) return items;            // giữ-giá (gộp 1 segment) — bỏ qua
+
+    const ci  = new Date(input.actualCheckIn);
+    const tAt = new Date(input.transferAt);
+    const earlyUntil = input.branchConfig?.earlyCheckinUntil ?? DEFAULT_CONFIG.EARLY_CHECKIN_UNTIL;
+    if (ci.getHours() <= earlyUntil) return items;           // nhận RẠNG SÁNG → đêm hôm trước thuộc phòng cũ → giữ
+
+    // Mốc trả chuẩn (12:00) ĐẦU TIÊN tại/sau giờ nhận.
+    const coStr = input.oldRoom?.policy?.dayCheckOutTime
+      ?? input.branchConfig?.checkOutTime ?? '12:00';
+    const [coH, coM] = String(coStr).split(':').map(Number);
+    const firstBoundary = new Date(ci);
+    firstBoundary.setHours(coH || 12, coM || 0, 0, 0);
+    if (firstBoundary <= ci) firstBoundary.setDate(firstBoundary.getDate() + 1);
+
+    // Đổi TRƯỚC mốc đầu tiên → phòng cũ chưa "ngủ" đêm nào → BỎ mọi dòng BASE phòng cũ.
+    //   (giữ surcharge nhận sớm [501], giữ base/giờ phòng mới + trả trễ phòng cuối)
+    if (tAt < firstBoundary) {
+      return items.filter(it => {
+        if (it.type !== 'base') return true;
+        const itRoom  = String(it.meta?.roomNumber ?? '');
+        const labelHit = String(it.label ?? '').startsWith(`[${oldNum}]`);
+        const isOldRoomBase = itRoom === oldNum || labelHit;
+        return !isOldRoomBase;
+      });
+    }
+  } catch (_e) { /* an toàn: trả nguyên kết quả lõi */ }
+  return items;
+}
+
+function _computeMoveRoomBreakdownCore(input) {
   let {
     actualCheckIn,
     plannedCheckOut,

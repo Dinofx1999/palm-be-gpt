@@ -13,6 +13,63 @@ const { rebuildBreakdownFromHistory, buildSegmentsFromHistory } = require('../ut
 const { enqueueEmail } = require('../queues/emailQueue');
 const TaxProfile = require('../models/TaxProfile');
 
+// ⭐ HELPER 14/06/2026: Cộng phụ thu "Nhận phòng sớm" / "Trả phòng muộn" cho phòng SỬA GIÁ TAY.
+//   Khi "đổi giá", customBreakdown CHỈ gồm dòng tiền phòng → 2 khoản phụ thu này bị RỚT khỏi
+//   breakdown đã lưu. Hàm này tính lại qua calculatePrice (ép sức chứa cao để KHÔNG lẫn phụ thu
+//   vượt người — vì giá tay đã tự gồm) rồi THÊM nếu breakdown CHƯA có. Dùng chung cho calculate-bill
+//   + checkout + checkoutRoom để 3 nơi RA CÙNG TỔNG.
+//   • Phòng ĐÃ CHUYỂN: dùng policy phòng CŨ (oldPolicyId trong transferHistory) — nơi khách THỰC
+//     nhận phòng — để ra ĐÚNG mức phụ thu như lúc check-in (không lấy nhầm policy phòng mới).
+//   Trả về mảng breakdown (đã .toObject) đã thêm phụ thu.
+async function _addCustomRoomSurcharges(srLike, currentPolicy, booking, branch, asOf) {
+  const _plain = (srLike.priceBreakdown ?? []).map(b =>
+    (b && typeof b.toObject === 'function') ? b.toObject() : b
+  )
+  try {
+    const _hasEarly = _plain.some(b => b.type === 'surcharge' &&
+      /Nhận phòng sớm|early_checkin/.test(String(b.label || '')))
+    const _hasLate  = _plain.some(b => b.type === 'surcharge' &&
+      /Trả phòng (muộn|trễ)|late_checkout/.test(String(b.label || '')))
+    if (_hasEarly && _hasLate) return _plain
+
+    let _surPolicy = currentPolicy
+    const _t = (booking.transferHistory || []).find(t =>
+      String(t?.toRoomNumber) === String(srLike.roomNumber) ||
+      String(t?.toRoomId?._id ?? t?.toRoomId ?? '') === String(srLike.roomId?._id ?? srLike.roomId ?? ''))
+    if (_t?.oldPolicyId) {
+      try { const _op = await PricePolicy.findById(_t.oldPolicyId); if (_op) _surPolicy = _op } catch (_pe) {}
+    }
+    if (!_surPolicy && booking.policySnapshot?.dayPrice) _surPolicy = booking.policySnapshot
+
+    const _ci = srLike.actualCheckIn ?? srLike.checkIn ?? booking.actualCheckIn ?? booking.checkIn
+    if (!_surPolicy || !_ci || !asOf) return _plain
+
+    const _r = calculatePrice({
+      checkIn: _ci, checkOut: asOf,
+      priceType: srLike.priceType ?? booking.priceType,
+      policy: _surPolicy, branch,
+      adults: srLike.adults ?? booking.adults, children: srLike.children ?? booking.children,
+      maxAdults: 9999, maxChildren: 9999, maxOccupancy: 9999,
+    })
+    if (!_r.error && Array.isArray(_r.breakdown)) {
+      for (const s of _r.breakdown) {
+        if (s.type !== 'surcharge') continue
+        const _l = String(s.label || '')
+        const _isEarly = /Nhận phòng sớm|early_checkin/.test(_l)
+        const _isLate  = /Trả phòng (muộn|trễ)|late_checkout/.test(_l)
+        if (_isEarly && !_hasEarly) {
+          _plain.push({ label: `[${srLike.roomNumber}] ${s.label}`, amount: Number(s.amount) || 0,
+            type: 'surcharge', meta: { ...(s.meta || {}), roomNumber: srLike.roomNumber, earlyCheckin: true } })
+        } else if (_isLate && !_hasLate) {
+          _plain.push({ label: `[${srLike.roomNumber}] ${s.label}`, amount: Number(s.amount) || 0,
+            type: 'surcharge', meta: { ...(s.meta || {}), roomNumber: srLike.roomNumber, lateCheckout: true } })
+        }
+      }
+    }
+  } catch (_e) { console.warn('[_addCustomRoomSurcharges]', _e.message) }
+  return _plain
+}
+
 // ⭐ FIX 21/05/2026: Làm tròn giờ checkout khi tính "đến hiện tại" (mode 'now')
 //   theo mốc dayEquivalentHours của branch (vd 20:00).
 //   Quy tắc: khi đang xem live và giờ hiện tại đã VƯỢT mốc (vd 23:29 > 20:00),
@@ -3003,9 +3060,19 @@ const checkout = async (req, res, next) => {
             meta?.segment === 'oldNights' ||
             (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
           const hasMoveSegments = existingItems.some(b => isOldSeg(b?.meta, sub.roomNumber))
+          const _subHasCustom = existingItems.some(b => b?.meta?.customPrice === true)
 
           let subPriceResult
-          if (hasMoveSegments) {
+          if (_subHasCustom) {
+            // ⭐ FIX 14/06/2026: phòng đoàn SỬA GIÁ TAY — checkout phải GIỮ giá tay (KHÔNG recompute
+            //   làm mất giá) và THÊM phụ thu nhận sớm/trả muộn, ĐỒNG BỘ với calculate-bill (cùng tổng).
+            const _plain = await _addCustomRoomSurcharges(sub, policy, booking, branch, actualCO)
+            subPriceResult = {
+              roomAmount: _plain.reduce((s, b) => s + (b.amount || 0), 0),
+              nights:     sub.nights,
+              breakdown:  _plain,
+            }
+          } else if (hasMoveSegments) {
             const hist = (booking.transferHistory || [])
               .filter(t => t?.transferAt && t?.toRoomNumber)
               .filter(t => String(t.toRoomNumber) === String(sub.roomNumber) ||
@@ -3347,8 +3414,15 @@ const checkoutRoom = async (req, res, next) => {
           meta?.segment === 1 || meta?.policy === 'old' || meta?.segment === 'oldNights' ||
           (meta?.roomNumber && String(meta.roomNumber) !== String(srRoomNumber))
         const hasMoveSegments = existingItems.some(b => isOldSeg(b?.meta, sub.roomNumber))
+        const _subHasCustom = existingItems.some(b => b?.meta?.customPrice === true)
 
-        if (hasMoveSegments) {
+        if (_subHasCustom) {
+          // ⭐ FIX 14/06/2026: phòng SỬA GIÁ TAY — checkoutRoom GIỮ giá tay + THÊM phụ thu nhận
+          //   sớm/trả muộn (đồng bộ calculate-bill). KHÔNG recompute để khỏi mất giá tay.
+          const _plain = await _addCustomRoomSurcharges(sub, policy, booking, branch, actualCO)
+          sub.roomAmount     = _plain.reduce((s, b) => s + (b.amount || 0), 0)
+          sub.priceBreakdown = _plain
+        } else if (hasMoveSegments) {
           const hist = (booking.transferHistory || [])
             .filter(t => t?.transferAt && t?.toRoomNumber)
             .filter(t => String(t.toRoomNumber) === String(sub.roomNumber) ||
@@ -4262,9 +4336,12 @@ const calculateBill = async (req, res, next) => {
           const _srHasCustomPrice = (sr.priceBreakdown ?? []).some(b => b?.meta?.customPrice === true)
 
           if (_srHasCustomPrice) {
-            const _plain = (sr.priceBreakdown ?? []).map(b =>
-              (b && typeof b.toObject === 'function') ? b.toObject() : b
-            )
+            // ⭐ FIX 14/06/2026: phòng đoàn SỬA GIÁ TAY — GIỮ nguyên giá tay nhưng THÊM phụ thu
+            //   nhận sớm / trả muộn (bị rớt lúc "đổi giá"). Dùng helper CHUNG với checkout → cùng tổng.
+            const _asOf = (mode === 'now' && sr.status === 'checked_in')
+              ? effectiveCheckOut
+              : (sr.checkOut ?? booking.checkOut)
+            const _plain = await _addCustomRoomSurcharges(sr, policy, booking, branch, _asOf)
             subPriceResult = {
               roomAmount: _plain.reduce((s, b) => s + (b.amount ?? 0), 0),
               breakdown:  _plain,
