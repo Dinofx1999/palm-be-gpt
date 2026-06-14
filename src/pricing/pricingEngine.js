@@ -170,7 +170,10 @@ function priceDaySegment(seg, ctx) {
   const ciStdMin = T.parseHHmm(policy.dayCheckInTime) ?? 840 // 14:00
   const startDayIdx = T.dayIndex(seg.startAt, off)
   const endDayIdx = T.dayIndex(seg.endAt, off)
-  for (let i = 0; i < effectiveNights; i++) {
+  // ⭐ Rule 3: phòng ĐẦU của "đổi xong trả trong ngày" chỉ tính phụ thu nhận sớm,
+  //   KHÔNG có dòng base ngày nào (đêm đó đã thuộc phòng cuối, tính giá giờ).
+  const baseNights = seg.forceEarlyOnly ? 0 : effectiveNights
+  for (let i = 0; i < baseNights; i++) {
     let segStart, segEnd
     if (effectiveNights === 1) {
       segStart = seg.startAt
@@ -347,7 +350,7 @@ function priceSegment(seg, ctx) {
   // Grace period: ở ≤ tolerance → miễn phí (CHỈ khi KHÔNG phải chặng đã hoàn tất do đổi phòng;
   //   chặng phòng cũ ≤ tolerance được xử lý ở segmentBuilder = drop hẳn, không vào đây).
   const tol = ctx.toleranceMinutes
-  if (durMin <= tol && !seg.isTransferLeg) {
+  if (durMin <= tol && !seg.isTransferLeg && !seg.forceEarlyOnly) {
     const line = {
       kind: KIND.GRACE, roomNumber: seg.roomNumber,
       label: `[${seg.roomNumber}] Mới ${Math.max(0, Math.floor(durMin))} phút (Linh hoạt ${tol} phút — Miễn phí)`,

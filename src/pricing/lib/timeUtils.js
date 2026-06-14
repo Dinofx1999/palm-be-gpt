@@ -72,7 +72,13 @@ function addDays(date, n) {
  */
 function roundHoursWithTolerance(totalMinutes, toleranceMin) {
   if (totalMinutes <= toleranceMin) return 0
-  return Math.ceil((totalMinutes - toleranceMin) / 60)
+  // ⭐ Rule 1 (14/06/2026): làm tròn theo tolerance trên PHẦN DƯ phút lẻ.
+  //   fullHours = floor(total/60); remainder = total%60
+  //   remainder ≤ tolerance → giữ fullHours; ngược lại → +1 giờ.
+  //   KHÔNG floor cứng, KHÔNG ceil cứng. Vd tol=15: 3h00→3, 3h15→3, 3h16→4, 3h26→4.
+  const fullHours = Math.floor(totalMinutes / 60)
+  const remainder = totalMinutes % 60
+  return remainder <= toleranceMin ? fullHours : fullHours + 1
 }
 
 /** Làm tròn tiền VND về đơn vị đồng (số nguyên). Tập trung 1 chỗ để tránh rounding bug. */

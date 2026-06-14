@@ -84,6 +84,46 @@ function buildDayTransferSegments(stay, timeline, ctx, transfers) {
   }
   transfers = effTransfers
 
+  // ⭐ Rule 3 (14/06/2026): ĐỔI PHÒNG XONG TRẢ LUÔN TRONG NGÀY (mục XIII).
+  //   Nếu cả kỳ ở (sau khi nuốt tolerance) nằm GỌN trong 1 ngày-lịch KS và có transfer
+  //   thật → phòng đầu chỉ tính phụ thu nhận sớm (không base), phòng CUỐI tính GIÁ GIỜ:
+  //     - transferAt < giờ trả chuẩn (12:00) → giờ từ transferAt → checkout
+  //     - transferAt ≥ 12:00                 → giờ từ 12:00      → checkout
+  //   KHÔNG tính nguyên giá ngày cho phòng mới.
+  {
+    const ciDay = T.dayIndex(effCheckIn, off)
+    const coDay = T.dayIndex(anchorCheckOut, off)
+    if (ciDay === coDay) {
+      const coStd = T.parseHHmm(policy0.dayCheckOutTime) ?? 720
+      const lastT = transfers[transfers.length - 1]
+      const transferMin = T.minutesOfDay(lastT.at, off)
+      const hourStart = transferMin < coStd
+        ? lastT.at
+        : T.atTimeOfDay(anchorCheckOut, coStd, off)
+      const out = []
+      // Phòng ĐẦU: chỉ giữ để tính phụ thu nhận sớm (segment độ dài 0 → engine bỏ base,
+      //   vẫn chạy nhánh early). isLast=false để suppress trả muộn phòng đầu.
+      const firstRoom = transfers[0].fromRoomNumber
+      const firstPol = transfers[0].fromPolicy || policy0
+      out.push(makeSegment({
+        stay, ctx, roomNumber: firstRoom, policy: firstPol,
+        startAt: effCheckIn, endAt: effCheckIn,           // độ dài 0 → không base ngày
+        isFirst: true, isLast: false, isTransferLeg: true,
+        forceEarlyOnly: true,
+      }))
+      // Phòng CUỐI: giá GIỜ từ hourStart → checkout.
+      const lastRoom = lastT.toRoomNumber
+      const lastPol = lastT.toPolicy || policy0
+      out.push(makeSegment({
+        stay, ctx, roomNumber: lastRoom, policy: lastPol,
+        startAt: hourStart, endAt: anchorCheckOut,
+        isFirst: false, isLast: true, isTransferLeg: false,
+        forcePriceType: 'hour',
+      }))
+      return out
+    }
+  }
+
   const ciStdMin = T.parseHHmm(policy0.dayCheckInTime) ?? 840
   const coStdMin = T.parseHHmm(policy0.dayCheckOutTime) ?? 720
   const earlyUntilMin = (ctx.earlyCheckinUntilHour ?? 5) * 60
@@ -183,10 +223,10 @@ function buildSimpleTransferSegments(stay, timeline, ctx, transfers) {
   }))
 }
 
-function makeSegment({ stay, ctx, roomNumber, policy, startAt, endAt, isFirst, isLast, isTransferLeg, forcedNights }) {
+function makeSegment({ stay, ctx, roomNumber, policy, startAt, endAt, isFirst, isLast, isTransferLeg, forcedNights, forcePriceType, forceEarlyOnly }) {
   return {
     roomNumber,
-    priceType: stay.priceType || 'day',
+    priceType: forcePriceType || stay.priceType || 'day',
     policy,
     occupancy: stay.occupancy || { adults: 2, children: 0 },
     capacity: stay.capacity || { maxAdults: 2, maxChildren: 0, maxOccupancy: 2 },
@@ -196,6 +236,7 @@ function makeSegment({ stay, ctx, roomNumber, policy, startAt, endAt, isFirst, i
     suppressLateCheckOut: !isLast,
     isTransferLeg,
     forcedNights,
+    forceEarlyOnly: !!forceEarlyOnly,
   }
 }
 
