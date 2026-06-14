@@ -73,10 +73,25 @@ function _surchargeIdentity(line) {
   return `${roomNumber}|${category}|${Number(line.amount) || 0}`
 }
 
+function _timeSurchargeCategory(line) {
+  const label = String(line?.label || '')
+  if (/Nhận phòng sớm|early_checkin/i.test(label)) return 'early'
+  if (/Trả phòng (muộn|trễ)|late_checkout/i.test(label)) return 'late'
+  return null
+}
+
 function _mergePreservedSurcharges(lines, src) {
-  const out = [...(lines || [])]
+  const preserved = _savedPreservedSurcharges(src)
+  const preservedTimeCategories = new Set(preserved.map(_timeSurchargeCategory).filter(Boolean))
+  // Một stay chỉ có một sự kiện check-in/check-out thật. Nếu phụ thu thời gian của
+  // phòng cũ đã được preserve sau chuyển phòng, nó thay thế dòng engine sinh lại
+  // cho phòng mới; nếu giữ cả hai sẽ tính cùng một sự kiện hai lần.
+  const out = [...(lines || [])].filter(line => {
+    const category = _timeSurchargeCategory(line)
+    return !category || !preservedTimeCategories.has(category) || line?.meta?.preserved === true
+  })
   const identities = new Set(out.map(_surchargeIdentity).filter(Boolean))
-  for (const line of _savedPreservedSurcharges(src)) {
+  for (const line of preserved) {
     const identity = _surchargeIdentity(line)
     if (identity && identities.has(identity)) continue
     out.push(line)

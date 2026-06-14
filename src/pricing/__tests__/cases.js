@@ -458,7 +458,10 @@ C('REAL6', 'Giá tay to-now tính lại phụ thu trả muộn theo giờ đang 
 C('REAL7', 'BK_GNTE43: chuyển 205→303 ngay vẫn giữ phụ thu nhận sớm phòng 205', () => {
   const early30k = [{ time: '01:00', price: 30000 }, { time: '02:00', price: 60000 }]
   const oldPolicy = dayPolicy({ dayPrice: 270000, dayCheckInTime: '14:00', dayEarlyCheckIn: early30k })
-  const newPolicy = dayPolicy({ dayPrice: 500000, dayCheckInTime: '12:00' })
+  const newPolicy = dayPolicy({
+    dayPrice: 500000, dayCheckInTime: '14:00',
+    dayEarlyCheckIn: [{ time: '01:00', price: 40000 }],
+  })
   const mediumPolicy = dayPolicy({ dayPrice: 300000, dayCheckInTime: '14:00', dayEarlyCheckIn: early30k })
   const checkIn = vn(2026, 6, 14, 13, 45)
   const actualCheckIn = vn(2026, 6, 14, 13, 46)
