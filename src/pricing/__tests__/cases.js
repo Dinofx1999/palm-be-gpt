@@ -455,6 +455,43 @@ C('REAL6', 'Giá tay to-now tính lại phụ thu trả muộn theo giờ đang 
   return { total: inv.totalAmount, breakdown: inv.breakdown }
 }, 800000, [600000, 200000])
 
+C('REAL7', 'BK_GNTE43: chuyển 205→303 ngay vẫn giữ phụ thu nhận sớm phòng 205', () => {
+  const early30k = [{ time: '01:00', price: 30000 }, { time: '02:00', price: 60000 }]
+  const oldPolicy = dayPolicy({ dayPrice: 270000, dayCheckInTime: '14:00', dayEarlyCheckIn: early30k })
+  const newPolicy = dayPolicy({ dayPrice: 500000, dayCheckInTime: '12:00' })
+  const mediumPolicy = dayPolicy({ dayPrice: 300000, dayCheckInTime: '14:00', dayEarlyCheckIn: early30k })
+  const checkIn = vn(2026, 6, 14, 13, 45)
+  const actualCheckIn = vn(2026, 6, 14, 13, 46)
+  const checkOut = vn(2026, 6, 15, 12, 0)
+  const booking = {
+    isGroup: true,
+    checkIn, checkOut, actualCheckIn,
+    policySnapshot: oldPolicy,
+    transferHistory: [{
+      fromRoomNumber: '205', toRoomNumber: '303',
+      transferAt: vn(2026, 6, 14, 13, 46),
+      oldPolicyId: 'old', newPolicyId: 'new',
+    }],
+    rooms: [
+      {
+        roomNumber: '303', status: 'checked_in', priceType: 'day', policyId: 'new',
+        actualCheckIn, priceBreakdown: [{
+          label: '[205] Nhận phòng sớm (15 phút)', amount: 30000, type: 'surcharge',
+          meta: { roomNumber: '205', preserved: true },
+        }],
+      },
+      { roomNumber: '207', status: 'checked_in', priceType: 'day', policyId: 'old', actualCheckIn },
+      { roomNumber: '208', status: 'checked_in', priceType: 'day', policyId: 'medium', actualCheckIn },
+    ],
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingDoc(booking, {
+    branch: { toleranceMinutes: 0, dayEquivalentHours: 23 },
+    policyMap: { old: oldPolicy, new: newPolicy, medium: mediumPolicy },
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 1160000, [500000, 30000, 270000, 30000, 300000, 30000])
+
 // ── Chạy tất cả ──
 R.report('PRICING ENGINE — 100+ TEST CASES')
 for (const tc of cases) R.runCase(tc)

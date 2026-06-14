@@ -55,6 +55,36 @@ function _isTimeSurchargeLine(line) {
     || /Nhận phòng sớm|Trả phòng (muộn|trễ)|early_checkin|late_checkout/i.test(label)
 }
 
+function _savedPreservedSurcharges(src) {
+  const raw = Array.isArray(src?.priceBreakdown) ? src.priceBreakdown : []
+  return raw
+    .map(line => (line && typeof line.toObject === 'function') ? line.toObject() : line)
+    .filter(line => line?.type === 'surcharge' && line?.meta?.preserved === true)
+    .map(line => ({ ...line, type: 'surcharge', meta: line.meta || {} }))
+}
+
+function _surchargeIdentity(line) {
+  if (!line || line.type !== 'surcharge' && !String(line.kind || '').startsWith('surcharge')) return null
+  const label = String(line.label || '')
+  const category = /Nhận phòng sớm|early_checkin/i.test(label)
+    ? 'early'
+    : (/Trả phòng (muộn|trễ)|late_checkout/i.test(label) ? 'late' : label)
+  const roomNumber = line.meta?.roomNumber ?? line.roomNumber ?? ''
+  return `${roomNumber}|${category}|${Number(line.amount) || 0}`
+}
+
+function _mergePreservedSurcharges(lines, src) {
+  const out = [...(lines || [])]
+  const identities = new Set(out.map(_surchargeIdentity).filter(Boolean))
+  for (const line of _savedPreservedSurcharges(src)) {
+    const identity = _surchargeIdentity(line)
+    if (identity && identities.has(identity)) continue
+    out.push(line)
+    if (identity) identities.add(identity)
+  }
+  return out
+}
+
 // "Đến hiện tại" với custom: cắt số dòng base tới số đêm ĐÃ TRÔI QUA (engine to-now
 //   cho số đêm — KHÔNG dùng giá base của engine). Phụ thu nhận sớm/trả muộn phải
 //   lấy theo mốc đang xem để không giữ nhầm phụ thu tương lai từ breakdown đã lưu.
@@ -75,12 +105,12 @@ function _sliceCustomToNow(customBd, stay, ctx, now) {
   for (const b of customBd) {
     if (_isBaseLine(b)) {
       if (baseCount < nightsNow) { out.push(b); baseCount++ }
-    } else if (!_isTimeSurchargeLine(b)) {
+    } else if (!_isTimeSurchargeLine(b) || b?.meta?.preserved === true) {
       out.push(b)
     }
   }
   out.push(...live.breakdown.filter(_isTimeSurchargeLine))
-  return out
+  return _mergePreservedSurcharges(out, { priceBreakdown: customBd })
 }
 
 /**
@@ -227,18 +257,46 @@ function _priceBookingMaybeCustom(booking, opts, viewMode, now) {
 
   const anyCustom = sources.some(src => _savedCustomBreakdown(src) != null)
   if (!anyCustom) {
-    // ── Đường cũ (không đổi) — engine tính toàn bộ ──
-    const stays = sources.map(src => toStay(src, booking, opts))
-    return priceBooking({
-      isGroup: !!booking.isGroup,
-      stays,
-      servicesAmount:  booking.servicesAmount  || 0,
+    const hasPreservedSurcharge = sources.some(src => _savedPreservedSurcharges(src).length > 0)
+    if (!hasPreservedSurcharge) {
+      // ── Đường cũ (không đổi) — engine tính toàn bộ ──
+      const stays = sources.map(src => toStay(src, booking, opts))
+      return priceBooking({
+        isGroup: !!booking.isGroup,
+        stays,
+        servicesAmount:  booking.servicesAmount  || 0,
+        discountPercent: booking.discountPercent || 0,
+        discountAmount:  booking.discountAmount  || 0,
+        transferFee:     booking.transferFee     || 0,
+        paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
+        isFreeRoom:      !!booking.isFreeRoom,
+      }, { viewMode, now, ctx })
+    }
+
+    // Phụ thu lịch sử đã phát sinh (ví dụ nhận sớm ở phòng cũ rồi chuyển ngay)
+    // không được mất khi engine nuốt chặng phòng cũ trong tolerance.
+    const allBreakdown = []
+    const perRoom = []
+    let nights = 0
+    for (const src of sources) {
+      const stay = toStay(src, booking, opts)
+      const result = priceStay(stay, { viewMode, now, ctx, customRoomPrice: stay.customRoomPrice })
+      const lines = _mergePreservedSurcharges(result.breakdown, src)
+      const roomAmount = lines.reduce((sum, line) => sum + (Number(line.amount) || 0), 0)
+      allBreakdown.push(...lines)
+      perRoom.push({ roomNumber: src.roomNumber, roomAmount, breakdown: lines })
+      nights = Math.max(nights, result.nights)
+    }
+    const invoice = buildInvoice({
+      breakdown: allBreakdown,
+      servicesAmount: booking.servicesAmount || 0,
       discountPercent: booking.discountPercent || 0,
-      discountAmount:  booking.discountAmount  || 0,
-      transferFee:     booking.transferFee     || 0,
-      paidAmount:      booking.paidAmount       || booking.depositAmount || 0,
-      isFreeRoom:      !!booking.isFreeRoom,
-    }, { viewMode, now, ctx })
+      discountAmount: booking.discountAmount || 0,
+      transferFee: booking.transferFee || 0,
+      paidAmount: booking.paidAmount || booking.depositAmount || 0,
+      isFreeRoom: !!booking.isFreeRoom,
+    })
+    return { ...invoice, perRoom, nights }
   }
 
   // ── Có giá thủ công từng đêm ──
