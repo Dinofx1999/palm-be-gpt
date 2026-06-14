@@ -3119,7 +3119,9 @@ const checkout = async (req, res, next) => {
                 transferAt:      new Date(lastT.transferAt),
                 oldRoom: {
                   number: oldRoomNum, type: oldRoomType,
-                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy),
+                    dayCheckInTime: oldPolicy?.dayCheckInTime, dayCheckOutTime: oldPolicy?.dayCheckOutTime,   // ⭐ FIX 14/06: phụ thu nhận sớm phòng ĐOÀN đã chuyển
+                    dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn, dayLateCheckOut: oldPolicy?.dayLateCheckOut },
                 },
                 newRoom: {
                   number: newRoomNum, type: newRoomType,
@@ -3462,7 +3464,9 @@ const checkoutRoom = async (req, res, next) => {
               transferAt:      new Date(lastT.transferAt),
               oldRoom: {
                 number: oldRoomNum, type: oldRoomType,
-                policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+                policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy),
+                  dayCheckInTime: oldPolicy?.dayCheckInTime, dayCheckOutTime: oldPolicy?.dayCheckOutTime,   // ⭐ FIX 14/06: phụ thu nhận sớm phòng ĐOÀN đã chuyển
+                  dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn, dayLateCheckOut: oldPolicy?.dayLateCheckOut },
               },
               newRoom: {
                 number: newRoomNum, type: newRoomType,
@@ -4415,7 +4419,9 @@ const calculateBill = async (req, res, next) => {
                 transferAt:      new Date(lastT.transferAt),
                 oldRoom: {
                   number: oldRoomNum, type: oldRoomType,
-                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy) },
+                  policy: { dayPrice: oldPolicy?.dayPrice || 0, hourSlots: hourSlotsOf(oldPolicy),
+                    dayCheckInTime: oldPolicy?.dayCheckInTime, dayCheckOutTime: oldPolicy?.dayCheckOutTime,   // ⭐ FIX 14/06: phụ thu nhận sớm phòng ĐOÀN đã chuyển
+                    dayEarlyCheckIn: oldPolicy?.dayEarlyCheckIn, dayLateCheckOut: oldPolicy?.dayLateCheckOut },
                 },
                 newRoom: {
                   number: newRoomNum, type: newRoomType,
