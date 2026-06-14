@@ -43,7 +43,12 @@ function buildTimeline(stay, { viewMode = 'to-checkout', now, ctx } = {}) {
   if (stay.actualCheckOut) {
     anchorCheckOut = stay.actualCheckOut
   } else if (notCheckedIn) {
-    anchorCheckOut = stay.plannedCheckOut
+    // "Đến hiện tại" của booking chưa nhận phòng không được tính toàn bộ kỳ đặt.
+    // Dùng một đoạn rất ngắn để engine trả dòng grace 0đ, đồng thời vẫn giữ
+    // to-checkout là giá dự kiến đầy đủ.
+    anchorCheckOut = viewMode === 'to-now'
+      ? new Date(anchorCheckIn.getTime() + 60000)
+      : stay.plannedCheckOut
   } else if (viewMode === 'to-now') {
     const ref = now || stay.plannedCheckOut
     let co = ref < anchorCheckIn ? new Date(anchorCheckIn.getTime() + 60000) : ref
@@ -56,8 +61,20 @@ function buildTimeline(stay, { viewMode = 'to-checkout', now, ctx } = {}) {
       const tol = ctx.toleranceMinutes ?? 15
       const elapsedMin = (co.getTime() - anchorCheckIn.getTime()) / 60000
       if (elapsedMin > tol) {
-        co = snapUpToNightCheckout(anchorCheckIn, co, stay, ctx)
-        if (co.getTime() > stay.plannedCheckOut.getTime()) co = stay.plannedCheckOut
+        const off = ctx.hotelUtcOffsetMinutes
+        const coStdMin = TT.parseHHmm(stay.policy?.dayCheckOutTime) ?? 720
+        const viewingFinalLateWindow =
+          TT.dayIndex(co, off) === TT.dayIndex(stay.plannedCheckOut, off)
+          && TT.minutesOfDay(co, off) > coStdMin
+
+        // Trong kỳ đặt: snap lên giờ trả chuẩn của đêm đang ở để tính trọn đêm.
+        // Quá giờ trả dự kiến: giữ giờ thực để engine tính phụ thu trả muộn hoặc
+        // cộng thêm đêm khi vượt dayEquivalentHours. Riêng cửa sổ trả muộn của
+        // ngày cuối phải giữ giờ đang xem, không nhảy tới giờ trả dự kiến tương lai.
+        if (co.getTime() <= stay.plannedCheckOut.getTime() && !viewingFinalLateWindow) {
+          co = snapUpToNightCheckout(anchorCheckIn, co, stay, ctx)
+          if (co.getTime() > stay.plannedCheckOut.getTime()) co = stay.plannedCheckOut
+        }
       }
       // else: giữ co = now (đoạn ≤ tolerance) → engine trả grace 0đ
     }

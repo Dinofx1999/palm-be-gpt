@@ -6,6 +6,7 @@
  */
 const path = require('path')
 const { priceStay, priceBooking } = require('../index')
+const { priceBookingDoc, priceBookingToNow } = require('../pricingAdapter')
 const R = require('./runner')
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -281,6 +282,13 @@ C('NOW1b', 'Giá ngày to-now: 20 phút > tolerance → tính đêm 1', () => ru
 C('NOW2', 'Booking 3 đêm, xem giữa đêm 2 → tính 2 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 1100000)
 C('NOW3', 'Booking 3 đêm, xem đêm 3 → tính 3 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 14, 20, 0) }), 1650000)
 C('NOW4', 'Nghỉ giờ to-now: mới 8 phút → grace 0', () => runStay(stay({ priceType: 'hour', actualCheckIn: vn(2026, 6, 12, 10, 0), plannedCheckOut: vn(2026, 6, 12, 15, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 10, 8) }), 0, [0])
+C('NOW5', 'Booking chưa check-in: to-now = 0đ, không tính hết kỳ đặt', () => runStay(stay({
+  status: 'reserved', actualCheckIn: null,
+  plannedCheckIn: vn(2026, 6, 15, 14, 0), plannedCheckOut: vn(2026, 6, 18, 12, 0),
+}), { viewMode: 'to-now', now: vn(2026, 6, 14, 10, 0) }), 0, [0])
+C('NOW6', 'Ngày cuối trả dự kiến 18:00, xem lúc 15:00 chỉ tính trả muộn 3h', () => runStay(stay({
+  plannedCheckOut: vn(2026, 6, 13, 18, 0),
+}), { viewMode: 'to-now', now: vn(2026, 6, 13, 15, 0) }), 750000, [550000, 200000])
 
 // ══ EXTRA: CHƯA NHẬN PHÒNG + ĐỔI PHÒNG (reserved) ══
 C('RES1', 'Chưa nhận, đổi 101→102 → chỉ 102', () => runStay(stay({
@@ -318,7 +326,8 @@ C('X20', 'Phí chuyển phòng 50k cộng vào tổng', () => { const r = priceB
 C('X21', 'to-now: cuối đêm 1 (23:00) → 1 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 23, 0) }), 550000, [550000])
 C('X22', 'to-now: sáng ngày 2 trước 12:00 → đêm 1', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 10, 0) }), 550000, [550000])
 C('X23', 'to-now: chiều ngày 2 (15:00) → 2 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 15, 0) }), 1100000)
-C('X24', 'to-now: quá giờ trả dự kiến → tới hết kỳ', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 13, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 550000, [550000])
+C('X24', 'to-now: quá giờ trả dự kiến 6h → cộng phụ thu trả muộn', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 13, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 900000, [550000, 350000])
+C('X24b', 'to-now: quá giờ trả dự kiến tới 23:30 → cộng thêm 1 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 13, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 23, 30) }), 1100000, [550000, 550000])
 C('X25', 'Custom price 480k', () => runStay(stay(), { customRoomPrice: 480000 }), 480000, [480000])
 C('X26', 'Nghỉ giờ 4h', () => runStay(stay({ priceType: 'hour', actualCheckIn: vn(2026, 6, 12, 9, 0), plannedCheckOut: vn(2026, 6, 12, 13, 0) })), 140000, [140000])
 C('X27', 'Giá đêm rạng sáng 22:00→11:00', () => runStay(stay({ priceType: 'night', actualCheckIn: vn(2026, 6, 11, 22, 0), plannedCheckOut: vn(2026, 6, 12, 11, 0) })), 400000, [400000])
@@ -330,7 +339,6 @@ C('X30', 'Trả muộn 4h (16:00)', () => runStay(stay({ plannedCheckOut: vn(202
 
 
 // ══ REGRESSION: booking THẬT BK_7YDJVS (DB lưu sai 2.350.000 → đúng 1.800.000) ══
-const { priceBookingDoc } = require('../pricingAdapter')
 C('REAL1', 'BK_7YDJVS thật: đổi 602→203 sau 14p ≤ tol → 1.8M (không phải 2.35M)', () => {
   const booking = {
     roomNumber: '203', priceType: 'day', adults: 2, children: 0, isFreeRoom: false, status: 'checked_in',
@@ -360,6 +368,92 @@ C('REAL2', 'BK_3HBN7U: đổi 601→203 lúc 19:57 (giữa đêm, buổi tối) 
   if (room0 !== '203') throw new Error('Đêm phải tính cho phòng 203 (khách ngủ ở 203), nhận: ' + room0)
   return { total: inv.totalAmount, breakdown: inv.breakdown }
 }, 600000, [600000])
+
+C('REAL3', 'Đoàn có giá tay không được cộng phòng đã huỷ', () => {
+  const customLine = (roomNumber, amount) => ({
+    label: `[${roomNumber}] Giá ngày tùy chỉnh`,
+    amount,
+    type: 'base',
+    meta: { roomNumber, customPrice: true },
+  })
+  const booking = {
+    isGroup: true,
+    rooms: [
+      {
+        roomNumber: '201', status: 'checked_in', priceType: 'day',
+        checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 13, 12, 0),
+        actualCheckIn: vn(2026, 6, 12, 14, 0),
+        priceBreakdown: [customLine('201', 600000)],
+      },
+      {
+        roomNumber: '202', status: 'cancelled', priceType: 'day',
+        checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 13, 12, 0),
+        priceBreakdown: [customLine('202', 900000)],
+      },
+    ],
+    policySnapshot: dayPolicy(),
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingDoc(booking, { branch: { toleranceMinutes: 15, dayEquivalentHours: 23 } })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 600000, [600000])
+
+C('REAL4', 'Giá tay to-now trong tolerance phải là 0đ', () => {
+  const booking = {
+    roomNumber: '201', status: 'checked_in', priceType: 'day',
+    checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 13, 18, 0),
+    actualCheckIn: vn(2026, 6, 12, 14, 0),
+    policySnapshot: dayPolicy(),
+    priceBreakdown: [
+      { label: '[201] Giá ngày tùy chỉnh', amount: 600000, type: 'base', meta: { customPrice: true } },
+      { label: '[201] Trả phòng muộn (6h)', amount: 350000, type: 'surcharge', meta: { lateCheckout: true } },
+    ],
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingToNow(booking, {
+    branch: { toleranceMinutes: 15, dayEquivalentHours: 23 },
+    now: vn(2026, 6, 12, 14, 8),
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 0, [0])
+
+C('REAL5', 'Giá tay to-now không giữ phụ thu trả muộn tương lai', () => {
+  const booking = {
+    roomNumber: '201', status: 'checked_in', priceType: 'day',
+    checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 13, 18, 0),
+    actualCheckIn: vn(2026, 6, 12, 14, 0),
+    policySnapshot: dayPolicy(),
+    priceBreakdown: [
+      { label: '[201] Giá ngày tùy chỉnh', amount: 600000, type: 'base', meta: { customPrice: true } },
+      { label: '[201] Trả phòng muộn (6h)', amount: 350000, type: 'surcharge', meta: { lateCheckout: true } },
+    ],
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingToNow(booking, {
+    branch: { toleranceMinutes: 15, dayEquivalentHours: 23 },
+    now: vn(2026, 6, 13, 11, 0),
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 600000, [600000])
+
+C('REAL6', 'Giá tay to-now tính lại phụ thu trả muộn theo giờ đang xem', () => {
+  const booking = {
+    roomNumber: '201', status: 'checked_in', priceType: 'day',
+    checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 13, 18, 0),
+    actualCheckIn: vn(2026, 6, 12, 14, 0),
+    policySnapshot: dayPolicy(),
+    priceBreakdown: [
+      { label: '[201] Giá ngày tùy chỉnh', amount: 600000, type: 'base', meta: { customPrice: true } },
+      { label: '[201] Trả phòng muộn (6h)', amount: 350000, type: 'surcharge', meta: { lateCheckout: true } },
+    ],
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingToNow(booking, {
+    branch: { toleranceMinutes: 15, dayEquivalentHours: 23 },
+    now: vn(2026, 6, 13, 15, 0),
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 800000, [600000, 200000])
 
 // ── Chạy tất cả ──
 R.report('PRICING ENGINE — 100+ TEST CASES')

@@ -45,23 +45,41 @@ function _savedCustomBreakdown(src) {
   return bd.map(b => ({ ...b, type: b.type === 'surcharge' ? 'surcharge' : 'base' }))
 }
 
+function _isTimeSurchargeLine(line) {
+  const kind = String(line?.kind || '')
+  const label = String(line?.label || '')
+  return kind === 'surcharge-early'
+    || kind === 'surcharge-late'
+    || line?.meta?.earlyCheckin === true
+    || line?.meta?.lateCheckout === true
+    || /Nhận phòng sớm|Trả phòng (muộn|trễ)|early_checkin|late_checkout/i.test(label)
+}
+
 // "Đến hiện tại" với custom: cắt số dòng base tới số đêm ĐÃ TRÔI QUA (engine to-now
-//   cho số đêm — KHÔNG dùng số tiền engine, chỉ dùng để biết cắt mấy đêm). Giữ phụ thu.
+//   cho số đêm — KHÔNG dùng giá base của engine). Phụ thu nhận sớm/trả muộn phải
+//   lấy theo mốc đang xem để không giữ nhầm phụ thu tương lai từ breakdown đã lưu.
 function _sliceCustomToNow(customBd, stay, ctx, now) {
-  let nightsNow = 1
+  let live
   try {
-    const r = priceStay(stay, { viewMode: 'to-now', now, ctx })
-    nightsNow = Math.max(1, Number(r.nights) || 1)
-  } catch (_) { nightsNow = 1 }
+    live = priceStay(stay, { viewMode: 'to-now', now, ctx })
+  } catch (_) {
+    live = null
+  }
+
+  if (!live) return customBd
+  if (live.notCheckedIn || Number(live.nights) <= 0) return live.breakdown
+
+  const nightsNow = Number(live.nights)
   const out = []
   let baseCount = 0
   for (const b of customBd) {
     if (_isBaseLine(b)) {
       if (baseCount < nightsNow) { out.push(b); baseCount++ }
-    } else {
+    } else if (!_isTimeSurchargeLine(b)) {
       out.push(b)
     }
   }
+  out.push(...live.breakdown.filter(_isTimeSurchargeLine))
   return out
 }
 
@@ -204,7 +222,8 @@ function staysOf(booking, opts) {
 function _priceBookingMaybeCustom(booking, opts, viewMode, now) {
   const ctx = ctxFromBranch(opts.branch)
   const subRooms = booking.rooms && booking.rooms.length > 0 ? booking.rooms : null
-  const sources = (booking.isGroup && subRooms) ? subRooms : [booking]
+  const sources = ((booking.isGroup && subRooms) ? subRooms : [booking])
+    .filter(src => src && src.status !== 'cancelled')
 
   const anyCustom = sources.some(src => _savedCustomBreakdown(src) != null)
   if (!anyCustom) {

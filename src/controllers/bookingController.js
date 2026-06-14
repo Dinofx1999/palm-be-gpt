@@ -4209,7 +4209,7 @@ const applyDiscount = async (req, res, next) => {
   } catch (err) { next(err) }
 }
 
-const calculateBill = async (req, res, next) => {
+const calculateBillLegacy = async (req, res, next) => {
   try {
     const { mode = 'checkout', roomId: filterRoomId = null, atTime = null } = req.body
     if (!['now', 'checkout'].includes(mode))
@@ -5462,6 +5462,229 @@ const calculateBill = async (req, res, next) => {
   } catch (err) {
     console.error('[calculateBill] error:', err)
     res.status(500).json({ success: false, message: err.message })
+  }
+}
+
+// Tính tiền phòng qua pricing engine duy nhất. Controller chỉ chuẩn hóa dữ liệu DB,
+// quyền xem mốc quá khứ và số tiền đã thu; không tự dựng/cộng breakdown.
+const _plainObject = (value) => {
+  if (!value) return value
+  return typeof value.toObject === 'function' ? value.toObject() : value
+}
+
+const _policySnapshotWithCapacity = (policy) => {
+  if (!policy) return null
+  const roomType = _plainObject(policy.roomTypeId)
+  const maxAdults = roomType?.maxAdults ?? roomType?.capacity ?? 2
+  const maxChildren = roomType?.maxChildren ?? 0
+  const maxOccupancy = roomType?.maxOccupancy ?? (maxAdults + maxChildren)
+  return {
+    ...buildPolicySnapshot(policy, maxAdults + maxChildren),
+    maxAdults,
+    maxChildren,
+    maxOccupancy,
+  }
+}
+
+const _buildBillPricingContext = async (booking) => {
+  const policyIds = new Set()
+  const addPolicyId = (id) => {
+    if (id) policyIds.add(String(id._id ?? id))
+  }
+  addPolicyId(booking.policyId)
+  for (const room of (booking.rooms ?? [])) addPolicyId(room.policyId)
+  for (const transfer of (booking.transferHistory ?? [])) {
+    addPolicyId(transfer.oldPolicyId)
+    addPolicyId(transfer.newPolicyId)
+  }
+
+  const policies = policyIds.size > 0
+    ? await PricePolicy.find({ _id: { $in: [...policyIds] } }).populate('roomTypeId')
+    : []
+  const policyMap = {}
+  const policyDocs = new Map()
+  for (const policy of policies) {
+    const key = String(policy._id)
+    policyMap[key] = _policySnapshotWithCapacity(policy)
+    policyDocs.set(key, policy)
+  }
+
+  return { policyMap, policyDocs }
+}
+
+const _normalizeBreakdownForResponse = (breakdown) => (breakdown ?? []).map((line) => {
+  const plain = _plainObject(line) ?? {}
+  const kind = String(plain.kind ?? '')
+  return {
+    ...plain,
+    type: plain.type === 'surcharge' || kind.startsWith('surcharge') ? 'surcharge' : 'base',
+    meta: plain.meta ?? {},
+  }
+})
+
+const _invoicePaidForRoom = (booking, room, invoicePaid) => {
+  const otherPaid = (booking.rooms ?? [])
+    .filter(r => r !== room && r.status !== 'cancelled')
+    .reduce((sum, r) => {
+      const total = Math.max(0,
+        Number(r.roomAmount ?? 0) + Number(r.servicesAmount ?? 0) - Number(r.discountAmount ?? 0)
+      )
+      return sum + Math.min(Number(r.paidAmount ?? 0), total)
+    }, 0)
+  return Math.max(Number(room.paidAmount ?? 0), Math.max(0, invoicePaid - otherPaid))
+}
+
+const calculateBill = async (req, res, next) => {
+  try {
+    const { mode = 'checkout', roomId: filterRoomId = null, atTime = null } = req.body ?? {}
+    if (!['now', 'checkout'].includes(mode)) {
+      return res.status(400).json({ success: false, message: 'mode phải là "now" hoặc "checkout"' })
+    }
+
+    const bookingDoc = await Booking.findById(req.params.id)
+    if (!bookingDoc) {
+      return res.status(404).json({ success: false, message: 'Không tìm thấy đặt phòng' })
+    }
+
+    const requestedAt = atTime ? new Date(atTime) : new Date()
+    if (Number.isNaN(requestedAt.getTime())) {
+      return res.status(400).json({ success: false, message: 'atTime không hợp lệ' })
+    }
+
+    let targetRoomDoc = null
+    if (filterRoomId) {
+      targetRoomDoc = (bookingDoc.rooms ?? []).find(room =>
+        String(room.roomId?._id ?? room.roomId) === String(filterRoomId)
+      )
+      if (!targetRoomDoc) {
+        return res.status(404).json({ success: false, message: 'Không tìm thấy phòng trong đoàn' })
+      }
+    }
+
+    if (atTime && requestedAt.getTime() < Date.now() - 60000) {
+      const permission = await canSetPastTime(req.user, bookingDoc._id, targetRoomDoc?.roomNumber ?? null)
+      if (!permission.canSetPast) {
+        return res.status(403).json({
+          success: false,
+          code: 'FORBIDDEN_PAST_CHECKOUT',
+          message: permission.reason,
+          data: {
+            userRole: req.user?.role ?? null,
+            atTime,
+            roomNumber: targetRoomDoc?.roomNumber ?? null,
+          },
+        })
+      }
+    }
+
+    const [branch, invoice, pricingContext] = await Promise.all([
+      Branch.findById(bookingDoc.branchId),
+      Invoice.findOne({ bookingId: bookingDoc._id }),
+      _buildBillPricingContext(bookingDoc),
+    ])
+
+    const booking = bookingDoc.toObject()
+    booking.isGroup = Array.isArray(booking.rooms) && booking.rooms.length > 0
+    booking.transferFee = Math.max(
+      Number(booking.transferFee ?? 0),
+      (booking.transferHistory ?? []).reduce((sum, transfer) => sum + Number(transfer?.fee ?? 0), 0)
+    )
+
+    if (booking.policyId && pricingContext.policyMap[String(booking.policyId)]) {
+      booking.policySnapshot = pricingContext.policyMap[String(booking.policyId)]
+    }
+    for (const room of (booking.rooms ?? [])) {
+      if (room.policyId && pricingContext.policyMap[String(room.policyId)]) {
+        room.policySnapshot = pricingContext.policyMap[String(room.policyId)]
+      }
+    }
+
+    const customSources = booking.isGroup ? booking.rooms : [booking]
+    for (const source of customSources) {
+      if (!(source.priceBreakdown ?? []).some(line => line?.meta?.customPrice === true)) continue
+      const policyDoc = source.policyId
+        ? pricingContext.policyDocs.get(String(source.policyId))
+        : (booking.policyId ? pricingContext.policyDocs.get(String(booking.policyId)) : null)
+      const asOf = source.actualCheckOut
+        ?? (mode === 'now' ? requestedAt : (source.checkOut ?? booking.checkOut))
+      source.priceBreakdown = await _addCustomRoomSurcharges(source, policyDoc, bookingDoc, branch, asOf)
+    }
+
+    const fullBookingForPricing = booking.isGroup
+      ? { ...booking, rooms: booking.rooms.slice() }
+      : null
+
+    let room = null
+    if (filterRoomId) {
+      room = booking.rooms.find(r => String(r.roomId?._id ?? r.roomId) === String(filterRoomId))
+      booking.rooms = [room]
+      booking.isGroup = true
+      booking.servicesAmount = Number(room.servicesAmount ?? 0)
+      booking.discountPercent = 0
+      booking.discountAmount = Number(room.discountAmount ?? 0)
+      booking.transferFee = 0
+      booking.isFreeRoom = !!room.isFreeRoom
+    }
+
+    const { priceBookingDoc, priceBookingToNow } = require('../pricing/pricingAdapter')
+    const options = { branch, policyMap: pricingContext.policyMap }
+    const priced = mode === 'now'
+      ? priceBookingToNow(booking, { ...options, now: requestedAt })
+      : priceBookingDoc(booking, options)
+
+    const invoicePaid = Number(invoice?.paidAmount ?? 0)
+    const paidAmount = room
+      ? Math.min(_invoicePaidForRoom(bookingDoc, targetRoomDoc, invoicePaid), priced.totalAmount)
+      : invoicePaid
+    const remainingAmount = Math.max(0, priced.totalAmount - paidAmount)
+    const effectiveCheckOut = room?.actualCheckOut
+      ?? booking.actualCheckOut
+      ?? (mode === 'now' ? requestedAt : (room?.checkOut ?? booking.checkOut))
+
+    const data = {
+      mode,
+      effectiveCheckOut,
+      viewedAt: mode === 'now' ? requestedAt : null,
+      nights: priced.nights,
+      roomAmount: priced.roomAmount,
+      servicesAmount: priced.servicesAmount,
+      discount: priced.discount,
+      transferFee: priced.transferFee,
+      totalAmount: priced.totalAmount,
+      paidAmount,
+      remainingAmount,
+      breakdown: _normalizeBreakdownForResponse(priced.breakdown),
+      usedStoredBreakdown: false,
+      finalPriceType: room?.priceType ?? booking.priceType,
+      converted: false,
+      notice: null,
+      _engine: 'pricing-v2',
+    }
+
+    if (room) {
+      const groupPriced = mode === 'now'
+        ? priceBookingToNow(fullBookingForPricing, { ...options, now: requestedAt })
+        : priceBookingDoc(fullBookingForPricing, options)
+      Object.assign(data, {
+        isGroup: true,
+        isSingleRoomMode: true,
+        roomId: String(room.roomId?._id ?? room.roomId),
+        roomNumber: room.roomNumber,
+        groupTotalAmount: groupPriced.totalAmount,
+        groupPaidAmount: invoicePaid,
+        groupRemaining: Math.max(0, groupPriced.totalAmount - invoicePaid),
+        groupRoomCount: fullBookingForPricing.rooms.filter(r => r.status !== 'cancelled').length,
+      })
+    } else if (booking.isGroup) {
+      data.isGroup = true
+      data.isSingleRoomMode = false
+      data.groupRoomCount = booking.rooms.filter(r => r.status !== 'cancelled').length
+    }
+
+    return res.json({ success: true, data })
+  } catch (err) {
+    console.error('[calculateBill v2] error:', err)
+    return res.status(500).json({ success: false, message: err.message })
   }
 }
 
