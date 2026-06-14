@@ -4346,7 +4346,11 @@ const calculateBill = async (req, res, next) => {
               roomAmount: _plain.reduce((s, b) => s + (b.amount ?? 0), 0),
               breakdown:  _plain,
             }
-          } else if (hasMoveSegments && mode === 'now' && sr.status === 'checked_in') {
+          } else if (hasMoveSegments) {
+            // ⭐ FIX 14/06/2026: ÁP CHO CẢ 'now' LẪN 'checkout' (trước chỉ 'now'). Sub-room đoàn
+            //   ĐÃ CHUYỂN → LUÔN tính lại qua computeMoveRoomBreakdown (engine đã có wrapper bỏ
+            //   base phòng cũ khi đổi TRƯỚC mốc 12:00). Trước đây 'checkout' dùng breakdown ĐÃ LƯU
+            //   (tạo lúc chuyển bằng module CŨ) nên còn dòng [phòng cũ] giá ngày ảo (vd [205] 270k).
             // ⭐ FIX 25/05/2026: Sub-room đoàn ĐÃ CHUYỂN — dùng computeMoveRoomBreakdown
             //   (Y HỆT phòng lẻ ở nhánh hasTransferred) thay cho seg1/seg2 + calculatePrice.
             //   Lý do: calculatePrice tính chặng phòng MỚI theo NGUYÊN NGÀY → sai spec, và
@@ -4461,14 +4465,6 @@ const calculateBill = async (req, res, next) => {
                 roomAmount: moveItems.reduce((s, b) => s + (b.amount || 0), 0),
                 breakdown:  moveItems,
               }
-            }
-          } else if (hasMoveSegments && mode === 'checkout') {
-            const plainItems = breakdownItems.map(b =>
-              (b && typeof b.toObject === 'function') ? b.toObject() : b
-            )
-            subPriceResult = {
-              roomAmount: sr.roomAmount ?? 0,
-              breakdown:  plainItems,
             }
           } else {
             // ⭐ FIX 12/06/2026: Nếu phòng này đã được SỬA GIÁ TAY (customPrice) → dùng
