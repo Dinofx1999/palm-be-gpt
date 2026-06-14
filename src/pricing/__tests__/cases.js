@@ -478,6 +478,49 @@ C('REAL6', 'Giá tay to-now tính lại phụ thu trả muộn theo giờ đang 
   return { total: inv.totalAmount, breakdown: inv.breakdown }
 }, 800000, [600000, 200000])
 
+C('REAL6b', 'Phòng lẻ đặt tới 18/06 nhưng trả thực tế 14/06 sau 12:00 vẫn tính phụ thu', () => {
+  const booking = {
+    roomNumber: '304', status: 'checked_in', priceType: 'day',
+    checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 18, 12, 0),
+    actualCheckIn: vn(2026, 6, 12, 14, 0),
+    policySnapshot: dayPolicy({ dayPrice: 650000 }),
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingToNow(booking, {
+    branch: { toleranceMinutes: 15, dayEquivalentHours: 23 },
+    now: vn(2026, 6, 14, 15, 18),
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 1550000, [650000, 650000, 250000])
+
+C('REAL6c', 'Phòng đoàn giá tay đặt tới 18/06, trả 14/06 sau 12:00 vẫn tính phụ thu', () => {
+  const customLine = (index) => ({
+    label: `[304] Giá ngày tùy chỉnh ${index}`,
+    amount: 650000,
+    type: 'base',
+    meta: { roomNumber: '304', customPrice: true },
+  })
+  const room = {
+    roomNumber: '304', status: 'checked_in', priceType: 'day',
+    checkIn: vn(2026, 6, 12, 14, 0), checkOut: vn(2026, 6, 18, 12, 0),
+    actualCheckIn: vn(2026, 6, 12, 14, 0),
+    policySnapshot: dayPolicy({ dayPrice: 650000 }),
+    priceBreakdown: [1, 2, 3, 4, 5, 6].map(customLine),
+  }
+  const booking = {
+    isGroup: true,
+    checkIn: room.checkIn, checkOut: room.checkOut,
+    policySnapshot: room.policySnapshot,
+    rooms: [room],
+    servicesAmount: 0, discountPercent: 0, discountAmount: 0, transferFee: 0,
+  }
+  const inv = priceBookingToNow(booking, {
+    branch: { toleranceMinutes: 15, dayEquivalentHours: 23 },
+    now: vn(2026, 6, 14, 15, 18),
+  })
+  return { total: inv.totalAmount, breakdown: inv.breakdown }
+}, 1550000, [650000, 650000, 250000])
+
 C('REAL7', 'BK_GNTE43: chuyển 205→303 ngay vẫn giữ phụ thu nhận sớm phòng 205', () => {
   const early30k = [{ time: '01:00', price: 30000 }, { time: '02:00', price: 60000 }]
   const oldPolicy = dayPolicy({ dayPrice: 270000, dayCheckInTime: '14:00', dayEarlyCheckIn: early30k })
