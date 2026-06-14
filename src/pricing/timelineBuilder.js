@@ -63,15 +63,18 @@ function buildTimeline(stay, { viewMode = 'to-checkout', now, ctx } = {}) {
       if (elapsedMin > tol) {
         const off = ctx.hotelUtcOffsetMinutes
         const coStdMin = TT.parseHHmm(stay.policy?.dayCheckOutTime) ?? 720
-        const viewingFinalLateWindow =
-          TT.dayIndex(co, off) === TT.dayIndex(stay.plannedCheckOut, off)
-          && TT.minutesOfDay(co, off) > coStdMin
+        const coMin = TT.minutesOfDay(co, off)
+        const dayEquivMin = (ctx.dayEquivalentHours ?? 23) * 60
+        // "Đến hiện tại" mô phỏng trả phòng ngay tại thời điểm đang xem. Sau giờ trả
+        // chuẩn của BẤT KỲ ngày nào, phải giữ giờ thật để engine tính phụ thu trả muộn.
+        // Chỉ khi qua mốc quy đổi ngày mới để engine cộng thêm một đêm.
+        const viewingLateWindow = coMin > coStdMin && coMin < dayEquivMin
 
         // Trong kỳ đặt: snap lên giờ trả chuẩn của đêm đang ở để tính trọn đêm.
         // Quá giờ trả dự kiến: giữ giờ thực để engine tính phụ thu trả muộn hoặc
         // cộng thêm đêm khi vượt dayEquivalentHours. Riêng cửa sổ trả muộn của
         // ngày cuối phải giữ giờ đang xem, không nhảy tới giờ trả dự kiến tương lai.
-        if (co.getTime() <= stay.plannedCheckOut.getTime() && !viewingFinalLateWindow) {
+        if (co.getTime() <= stay.plannedCheckOut.getTime() && !viewingLateWindow) {
           co = snapUpToNightCheckout(anchorCheckIn, co, stay, ctx)
           if (co.getTime() > stay.plannedCheckOut.getTime()) co = stay.plannedCheckOut
         }

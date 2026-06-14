@@ -279,8 +279,8 @@ C('D4', 'Đoàn giảm 20%', () => { const r = priceBooking(groupBk({ discountPe
 // ══ EXTRA: TÍNH ĐẾN HIỆN TẠI (to-now) ══
 C('NOW1', 'Giá ngày to-now: mới 8 phút ≤ tolerance → grace 0đ (áp dụng mọi loại giá)', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 14, 8) }), 0, [0])
 C('NOW1b', 'Giá ngày to-now: 20 phút > tolerance → tính đêm 1', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 14, 20) }), 550000, [550000])
-C('NOW2', 'Booking 3 đêm, xem giữa đêm 2 → tính 2 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 1100000)
-C('NOW3', 'Booking 3 đêm, xem đêm 3 → tính 3 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 14, 20, 0) }), 1650000)
+C('NOW2', 'Booking 3 đêm, xem 18:00 ngày 2 → 1 đêm + phụ thu trả muộn', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 900000, [550000, 350000])
+C('NOW3', 'Booking 3 đêm, xem 20:00 ngày 3 → 2 đêm + phụ thu trả muộn', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 14, 20, 0) }), 1550000, [550000, 550000, 450000])
 C('NOW4', 'Nghỉ giờ to-now: mới 8 phút → grace 0', () => runStay(stay({ priceType: 'hour', actualCheckIn: vn(2026, 6, 12, 10, 0), plannedCheckOut: vn(2026, 6, 12, 15, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 10, 8) }), 0, [0])
 C('NOW5', 'Booking chưa check-in: to-now = 0đ, không tính hết kỳ đặt', () => runStay(stay({
   status: 'reserved', actualCheckIn: null,
@@ -289,6 +289,29 @@ C('NOW5', 'Booking chưa check-in: to-now = 0đ, không tính hết kỳ đặt'
 C('NOW6', 'Ngày cuối trả dự kiến 18:00, xem lúc 15:00 chỉ tính trả muộn 3h', () => runStay(stay({
   plannedCheckOut: vn(2026, 6, 13, 18, 0),
 }), { viewMode: 'to-now', now: vn(2026, 6, 13, 15, 0) }), 750000, [550000, 200000])
+C('NOW7', 'Ở dài ngày nhận rạng sáng, xem 15:07 → giữ số đêm + phụ thu ngay', () => runStay(stay({
+  actualCheckIn: vn(2026, 6, 2, 1, 21),
+  plannedCheckIn: vn(2026, 6, 2, 1, 21),
+  plannedCheckOut: vn(2026, 6, 15, 12, 0),
+  policy: dayPolicy({ dayPrice: 650000 }),
+}), { viewMode: 'to-now', now: vn(2026, 6, 14, 15, 7) }), 8650000, [
+  650000, 650000, 650000, 650000, 650000, 650000, 650000,
+  650000, 650000, 650000, 650000, 650000, 650000, 200000,
+])
+C('NOW8', 'Ở dài ngày 15:07→15:08 không được đổi từ đêm sang phụ thu', () => {
+  const s = stay({
+    actualCheckIn: vn(2026, 6, 2, 1, 21),
+    plannedCheckIn: vn(2026, 6, 2, 1, 21),
+    plannedCheckOut: vn(2026, 6, 15, 12, 0),
+    policy: dayPolicy({ dayPrice: 650000 }),
+  })
+  const a = runStay(s, { viewMode: 'to-now', now: vn(2026, 6, 14, 15, 7) })
+  const b = runStay(s, { viewMode: 'to-now', now: vn(2026, 6, 14, 15, 8) })
+  return { total: b.total, breakdown: b.total === a.total ? b.breakdown : [] }
+}, 8650000, [
+  650000, 650000, 650000, 650000, 650000, 650000, 650000,
+  650000, 650000, 650000, 650000, 650000, 650000, 200000,
+])
 
 // ══ EXTRA: CHƯA NHẬN PHÒNG + ĐỔI PHÒNG (reserved) ══
 C('RES1', 'Chưa nhận, đổi 101→102 → chỉ 102', () => runStay(stay({
@@ -325,7 +348,7 @@ C('X19', 'Giảm 100%', () => { const r = priceBooking({ stays: [stay()], discou
 C('X20', 'Phí chuyển phòng 50k cộng vào tổng', () => { const r = priceBooking({ stays: [stay()], transferFee: 50000 }, { ctx: CTX }); return { total: r.totalAmount, breakdown: r.breakdown } }, 600000)
 C('X21', 'to-now: cuối đêm 1 (23:00) → 1 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 12, 23, 0) }), 550000, [550000])
 C('X22', 'to-now: sáng ngày 2 trước 12:00 → đêm 1', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 10, 0) }), 550000, [550000])
-C('X23', 'to-now: chiều ngày 2 (15:00) → 2 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 15, 0) }), 1100000)
+C('X23', 'to-now: chiều ngày 2 (15:00) → 1 đêm + phụ thu trả muộn', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 15, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 15, 0) }), 750000, [550000, 200000])
 C('X24', 'to-now: quá giờ trả dự kiến 6h → cộng phụ thu trả muộn', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 13, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 18, 0) }), 900000, [550000, 350000])
 C('X24b', 'to-now: quá giờ trả dự kiến tới 23:30 → cộng thêm 1 đêm', () => runStay(stay({ plannedCheckOut: vn(2026, 6, 13, 12, 0) }), { viewMode: 'to-now', now: vn(2026, 6, 13, 23, 30) }), 1100000, [550000, 550000])
 C('X25', 'Custom price 480k', () => runStay(stay(), { customRoomPrice: 480000 }), 480000, [480000])

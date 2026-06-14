@@ -5769,11 +5769,12 @@ const getAvailableByType = async (req, res, next) => {
       const maxAdults   = room.typeId?.maxAdults   ?? room.typeId?.capacity ?? 2
       const maxChildren = room.typeId?.maxChildren ?? 0
       const maxOccupancy = room?.typeId?.maxOccupancy ?? (maxAdults + maxChildren)
+      const beds = room.typeId?.beds ?? 1
       const isAvailable = !bookedRoomIds.has(String(room._id))
 
       if (!typeMap.has(typeId)) {
         typeMap.set(typeId, {
-          typeId, typeName, maxAdults, maxChildren,
+          typeId, typeName, maxAdults, maxChildren, maxOccupancy, beds,
           totalRooms:     0,
           availableRooms: 0,
           rooms: [],
@@ -5787,7 +5788,7 @@ const getAvailableByType = async (req, res, next) => {
         number:    room.number,
         typeName,
         typeId,
-        maxAdults, maxChildren,
+        maxAdults, maxChildren, maxOccupancy, beds,
         available: isAvailable,
       })
     })
