@@ -101,13 +101,56 @@ function asDate(v) {
  * @param base booking cha (để lấy field chung khi src là sub-room)
  * @param opts { resolvePolicy?: (policyId) => policySnapshot }  // để đổi-giá qua nhiều chặng
  */
+function _buildResolver(opts) {
+  // Ưu tiên hàm resolvePolicy nếu controller truyền; nếu không, build từ policyMap
+  //   (Map hoặc object: policyId(string) → policySnapshot). Trả null nếu không có gì.
+  if (typeof opts.resolvePolicy === 'function') return opts.resolvePolicy
+  const m = opts.policyMap
+  if (!m) return null
+  const get = (m instanceof Map) ? (k) => m.get(k) : (k) => m[k]
+  return (policyId) => {
+    if (!policyId) return null
+    const key = String(policyId._id || policyId)
+    return get(key) || null
+  }
+}
+
 function toStay(src, base, opts = {}) {
   base = base || src
-  const policySnapshot = src.policySnapshot || base.policySnapshot
-  const resolve = typeof opts.resolvePolicy === 'function' ? opts.resolvePolicy : null
+  const resolve = _buildResolver(opts)
+  // ⭐ FIX 14/06/2026 (đổi giá đoàn): sub-room có policyId RIÊNG nhưng KHÔNG có
+  //   policySnapshot riêng (chỉ booking cha có). Phải resolve policy hiện tại của
+  //   ĐÚNG phòng này theo src.policyId → nếu không, phòng đổi giá bị tính theo giá
+  //   gốc của đoàn (vd 270k thay vì 400k). Fallback: snapshot booking cha.
+  const ownPolicy = (resolve && src.policyId && resolve(src.policyId)) || null
+  const policySnapshot = ownPolicy || src.policySnapshot || base.policySnapshot
 
-  const transfers = (src.transferHistory || base.transferHistory || [])
-    .filter(t => t && (t.transferAt))
+  // ⭐ FIX 14/06/2026 (đoàn): transferHistory nằm ở booking CHA, dùng chung cho cả đoàn.
+  //   Mỗi sub-room chỉ được nhận các transfer thuộc CHUỖI PHÒNG của chính nó, nếu không
+  //   mọi phòng đều bị "settle" về phòng của transfer cuối đoàn (vd cả 3 phòng → 302).
+  //   Lần ngược từ phòng hiện tại: toRoom == current → nhận, rồi current = fromRoom, lặp.
+  const rawHist = (src.transferHistory || base.transferHistory || [])
+    .filter(t => t && t.transferAt && t.fromRoomNumber && t.toRoomNumber)
+    .slice()
+    .sort((a, b) => asDate(a.transferAt) - asDate(b.transferAt))
+  // Chỉ lọc theo chuỗi khi src là 1 phòng của đoàn (base có rooms[] và src≠base).
+  //   Booking lẻ: src===base → giữ nguyên toàn bộ (chuỗi là chính nó).
+  const isGroupRoom = base && base !== src && Array.isArray(base.rooms) && base.rooms.length > 0
+  let myHist = rawHist
+  if (isGroupRoom) {
+    const chain = []
+    let current = src.roomNumber
+    for (let i = rawHist.length - 1; i >= 0; i--) {
+      const t = rawHist[i]
+      if (String(t.toRoomNumber) === String(current)) {
+        chain.unshift(t)
+        current = t.fromRoomNumber
+      }
+    }
+    myHist = chain
+  }
+
+  const transfers = myHist
     .map(t => {
       // policy của phòng đi/đến từng chặng:
       //  - ưu tiên snapshot lưu kèm transfer (nếu bạn đã lưu fromPolicySnapshot/toPolicySnapshot)

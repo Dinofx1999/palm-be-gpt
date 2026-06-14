@@ -5359,9 +5359,34 @@ const calculateBill = async (req, res, next) => {
     // ════════════════════════════════════════════════════════════════════════
     try {
       const { priceBookingDoc, priceBookingToNow } = require('../pricing/pricingAdapter')
+
+      // ⭐ NEW 14/06/2026: Build policyMap (policyId → snapshot) cho ca ĐỔI GIÁ / đoàn.
+      //   Engine thuần không query DB, nên controller gom sẵn mọi PricePolicy liên quan:
+      //   - policy hiện tại từng sub-room (rooms[].policyId)
+      //   - old/newPolicyId trong transferHistory (đổi giá qua từng chặng)
+      //   Mỗi policy → buildPolicySnapshot để engine tính đúng giá từng phòng/chặng.
+      const _policyMap = {}
+      try {
+        const _ids = new Set()
+        const _add = (id) => { if (id) _ids.add(String(id._id || id)) }
+        _add(booking.policyId)
+        for (const r of (booking.rooms || [])) _add(r.policyId)
+        for (const t of (booking.transferHistory || [])) { _add(t.oldPolicyId); _add(t.newPolicyId) }
+        if (_ids.size > 0) {
+          const _pols = await PricePolicy.find({ _id: { $in: [..._ids] } })
+          for (const p of _pols) {
+            // capacity: ưu tiên từ roomType nếu cần; ở đây dùng capacity của policy (đủ cho giá)
+            _policyMap[String(p._id)] = buildPolicySnapshot(p, p.capacity ?? null)
+          }
+        }
+      } catch (e) {
+        console.warn('[PRICING-NEW] build policyMap lỗi (bỏ qua, dùng snapshot gốc):', e.message)
+      }
+
+      const _newOpts = { branch, policyMap: _policyMap }
       const _newInv = mode === 'now'
-        ? priceBookingToNow(booking, { branch, now: atTime ? new Date(atTime) : new Date() })
-        : priceBookingDoc(booking, { branch })
+        ? priceBookingToNow(booking, { ..._newOpts, now: atTime ? new Date(atTime) : new Date() })
+        : priceBookingDoc(booking, _newOpts)
 
       if (_newInv.roomAmount !== priceResult.roomAmount || _newInv.totalAmount !== totalAmount) {
         console.log(
@@ -5371,7 +5396,10 @@ const calculateBill = async (req, res, next) => {
         )
       }
 
-      if (process.env.USE_NEW_PRICING_ENGINE === '1' && !hasCustomPrice && !hasTransferred) {
+      // ⭐ NEW 14/06/2026: BỎ chặn !hasTransferred. Engine mới đã xử lý đúng đổi phòng
+      //   (gồm đoàn nhiều phòng + đổi giá — đã test trên BK_ZM4REZ ra đúng phụ thu từng
+      //   phòng). Vẫn giữ chặn hasCustomPrice (giá thủ công từng đêm xử lý đường riêng).
+      if (process.env.USE_NEW_PRICING_ENGINE === '1' && !hasCustomPrice) {
         // ⭐ Engine mới CHỈ cấp PHẦN GIÁ (roomAmount + breakdown). Mọi thứ còn lại —
         //   dịch vụ, chiết khấu, phí chuyển phòng, ĐÃ THU (paidAmount từ Invoice) — lấy
         //   từ logic controller cũ (đã đúng). Tổng & còn lại tính lại với roomAmount mới.
